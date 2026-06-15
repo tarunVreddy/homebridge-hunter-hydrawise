@@ -338,9 +338,9 @@ export class HydrawiseController {
               valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
               valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
               irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
-                ("PROGRAM_SCHEDULED_MANUAL_MODE" in this.hap.Characteristic.ProgramMode) ? this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE as number :
-                  (("PROGRAM_SCHEDULED_MANUAL_MODE_" in this.hap.Characteristic.ProgramMode) ?
-                    this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE_ as number : 2));
+                ("PROGRAM_SCHEDULED_MANUAL_MODE" in (this.hap.Characteristic.ProgramMode as any)) ? (this.hap.Characteristic.ProgramMode as any).PROGRAM_SCHEDULED_MANUAL_MODE as number :
+                  (("PROGRAM_SCHEDULED_MANUAL_MODE_" in (this.hap.Characteristic.ProgramMode as any)) ?
+                    (this.hap.Characteristic.ProgramMode as any).PROGRAM_SCHEDULED_MANUAL_MODE_ as number : 2));
               irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
 
               // Mark this zone as manually activated.

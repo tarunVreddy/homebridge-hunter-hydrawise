@@ -2,7 +2,7 @@
  *
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { API, DynamicPlatformPlugin, HAP, Logging, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
 import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
 import { type Dispatcher, Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { FeatureOptions, retry } from "homebridge-plugin-utils";
@@ -11,18 +11,21 @@ import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "
 import { MqttClient, type Nullable } from "homebridge-plugin-utils";
 import { APIEvent } from "homebridge";
 import { HydrawiseController } from "./hydrawise-controller.js";
+import { HydrawiseMatterController } from "./hydrawise-matter-controller.js";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   private readonly accessories: PlatformAccessory[];
+  private readonly matterAccessories: Map<string, MatterAccessory>;
   private account: CustomerDetailsResponse;
   public readonly api: API;
   private dispatcher?: Dispatcher;
   public readonly featureOptions: FeatureOptions;
   public config: HydrawiseOptions;
   public readonly configuredDevices: { [index: string]: HydrawiseController | undefined };
+  public readonly configuredMatterDevices: { [index: string]: HydrawiseMatterController | undefined };
   public readonly hap: HAP;
   public readonly log: Logging;
   public readonly mqtt: Nullable<MqttClient>;
@@ -30,9 +33,11 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
     this.accessories = [];
+    this.matterAccessories = new Map();
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
     this.configuredDevices = {};
+    this.configuredMatterDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, config?.options ?? []);
     this.hap = api.hap;
     this.log = log;
@@ -80,6 +85,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.accessories.push(accessory);
   }
 
+  // Restore cached Matter accessories from disk on startup.
+  public configureMatterAccessory(accessory: MatterAccessory): void {
+
+    this.log.debug("Loading cached Matter accessory: %s", accessory.displayName);
+    this.matterAccessories.set(accessory.UUID, accessory);
+  }
+
   // Configure and connect to the Hydrawise API.
   private async configureHydrawise(): Promise<void> {
 
@@ -119,62 +131,148 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         this.configureController(controller);
       }
 
-      // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
-      this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
-        .map(accessory => this.removeAccessory(accessory));
+      if(this.api.isMatterEnabled?.()) {
+
+
+        // Cleanup HAP accessories if present
+        if(this.accessories.length > 0) {
+
+
+          this.log.info("Matter is enabled. Unregistering existing HAP accessories to avoid duplicates.");
+          this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, this.accessories);
+          this.accessories.length = 0;
+        }
+
+        // Cleanup orphaned Matter accessories
+        const matterUUIDs = this.account.controllers.map(x => this.api.matter!.uuid.generate(x.controller_id.toString()));
+        const orphanedMatter = Array.from(this.matterAccessories.values()).filter(x => !matterUUIDs.includes(x.UUID));
+
+        if(orphanedMatter.length > 0) {
+
+
+          this.log.info("Removing orphaned Matter accessories from cache: %s", orphanedMatter.map(x => x.displayName).join(", "));
+          void this.api.matter!.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, orphanedMatter);
+
+          for(const acc of orphanedMatter) {
+
+
+            this.matterAccessories.delete(acc.UUID);
+          }
+        }
+      } else {
+
+
+        // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
+        this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
+          .map(accessory => this.removeAccessory(accessory));
+      }
 
       return true;
     }, HYDRAWISE_API_RETRY_INTERVAL * 1000);
   }
 
   // Configure a discovered irrigation controller.
-  private configureController(controller: HydrawiseControllerConfig): Nullable<HydrawiseController> {
+  private configureController(controller: HydrawiseControllerConfig): Nullable<HydrawiseController | HydrawiseMatterController> {
 
-    // Generate this controller's unique identifier.
-    const uuid = this.hap.uuid.generate(controller.controller_id.toString());
-
-    // See if we already know about this accessory or if it's truly new.
-    let accessory = this.accessories.find(x => x.UUID === uuid);
+    const isMatter = this.api.isMatterEnabled?.() === true;
+    const uuid = isMatter ?
+      this.api.matter!.uuid.generate(controller.controller_id.toString()) :
+      this.hap.uuid.generate(controller.controller_id.toString());
 
     // Check to see if the user has disabled the device.
     if(!this.featureOptions.test("Device", controller.controller_id.toString())) {
 
-      // If the accessory already exists, let's remove it.
-      if(accessory) {
+      if(isMatter) {
 
-        this.removeAccessory(accessory);
+
+        const acc = this.matterAccessories.get(uuid);
+
+        if(acc) {
+
+
+          void this.api.matter!.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
+          this.matterAccessories.delete(uuid);
+        }
+      } else {
+
+
+        const acc = this.accessories.find(x => x.UUID === uuid);
+
+        if(acc) {
+
+
+          this.removeAccessory(acc);
+        }
       }
 
       // We're done.
       return null;
     }
 
-    // If we've already configured this device before, we're done.
-    if(this.configuredDevices[uuid]) {
+    if(isMatter) {
 
-      return null;
+
+      if(this.configuredMatterDevices[uuid]) {
+
+
+        return null;
+      }
+
+      let accessory = this.matterAccessories.get(uuid);
+
+      if(!accessory) {
+
+
+        const controllerDevice = new HydrawiseMatterController(this, controller, uuid);
+
+        accessory = controllerDevice.toAccessory();
+        void this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.matterAccessories.set(uuid, accessory);
+        this.configuredMatterDevices[uuid] = controllerDevice;
+      } else {
+
+
+        const controllerDevice = new HydrawiseMatterController(this, controller, uuid, accessory);
+
+        this.configuredMatterDevices[uuid] = controllerDevice;
+      }
+
+      this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
+
+      return this.configuredMatterDevices[uuid]!;
+    } else {
+
+
+      // If we've already configured this device before, we're done.
+      if(this.configuredDevices[uuid]) {
+
+        return null;
+      }
+
+      // See if we already know about this accessory or if it's truly new.
+      let accessory = this.accessories.find(x => x.UUID === uuid);
+
+      // It's a new device - let's add it to HomeKit.
+      if(!accessory) {
+
+        accessory = new this.api.platformAccessory(controller.name, uuid);
+
+        // Register this accessory with Homebridge and add it to the accessory array so we can track it.
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.push(accessory);
+      }
+
+      // Inform the user.
+      this.log.info("Configuring HAP irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
+
+      // Add it to our list of configured devices.
+      this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller);
+
+      // Refresh the accessory cache.
+      this.api.updatePlatformAccessories([accessory]);
+
+      return this.configuredDevices[uuid];
     }
-
-    // It's a new device - let's add it to HomeKit.
-    if(!accessory) {
-
-      accessory = new this.api.platformAccessory(controller.name, uuid);
-
-      // Register this accessory with Homebridge and add it to the accessory array so we can track it.
-      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      this.accessories.push(accessory);
-    }
-
-    // Inform the user.
-    this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
-
-    // Add it to our list of configured devices.
-    this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller);
-
-    // Refresh the accessory cache.
-    this.api.updatePlatformAccessories([accessory]);
-
-    return this.configuredDevices[uuid];
   }
 
   // Remove the accessory from HomeKit.

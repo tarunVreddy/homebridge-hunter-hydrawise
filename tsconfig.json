@@ -2,7 +2,9 @@
   "compilerOptions": {
 
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext"
   },
 
   "extends": "./node_modules/homebridge-plugin-utils/build/tsconfig.json",
