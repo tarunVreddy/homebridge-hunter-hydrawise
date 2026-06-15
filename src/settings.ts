@@ -4,7 +4,7 @@
  */
 
 // Hydrawise API response timeout, in seconds.
-export const HYDRAWISE_API_TIMEOUT = 7;
+export const HYDRAWISE_API_TIMEOUT = 25;
 
 // How often, in seconds, should we retry Hydrawise API calls when they fail.
 export const HYDRAWISE_API_RETRY_INTERVAL = 60;
