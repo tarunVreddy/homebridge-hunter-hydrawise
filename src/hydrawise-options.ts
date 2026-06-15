@@ -19,7 +19,8 @@ export type HydrawiseOptions = {
 export const featureOptionCategories = [
 
   { description: "Device feature options.", name: "Device" },
-  { description: "Logging feature options.", name: "Log" }
+  { description: "Logging feature options.", name: "Log" },
+  { description: "Matter integration feature options.", name: "Matter" }
 ];
 
 // Individual feature options, broken out by category.
@@ -36,5 +37,11 @@ export const featureOptions: { [index: string]: FeatureOptionEntry[] } = {
   "Log": [
 
     { default: true, description: "Log zone start and stop events in Homebridge.", name: "Zone" }
+  ],
+
+  // Matter options.
+  "Matter": [
+
+    { default: false, description: "Map zone valves to On/Off switches/outlets for compatibility.", name: "Valve.AsSwitch" }
   ]
 };
