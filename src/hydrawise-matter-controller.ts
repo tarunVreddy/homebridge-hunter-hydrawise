@@ -101,38 +101,50 @@ export class HydrawiseMatterController {
 
     const matter = this.api.matter!;
 
+    const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+
     if(!this.accessory) {
 
 
       // Build valve endpoints (parts) dynamically from discovered relays.
-      const parts: any[] = this.status.relays.map(zone => ({
-
-
-        id: `zone-${zone.relay_id}`,
-        displayName: zone.name,
-        deviceType: matter.deviceTypes.WaterValve,
-        clusters: {
-
-
-          valveConfigurationAndControl: {
-
-
-            currentState: 0,
-            targetState: 0,
-            defaultOpenDuration: 300
-          }
-        },
-        handlers: {
-
-
-          valveConfigurationAndControl: {
-
-
-            open: async (args: any, context: any) => this.handleOpen(context?.partId || `zone-${zone.relay_id}`, args?.openDuration),
-            close: async (_args: any, context: any) => this.handleClose(context?.partId || `zone-${zone.relay_id}`)
-          }
+      const parts: any[] = this.status.relays.map(zone => {
+        const id = `zone-${zone.relay_id}`;
+        if(useSwitch) {
+          return {
+            id,
+            displayName: zone.name,
+            deviceType: matter.deviceTypes.OnOffOutlet,
+            clusters: {
+              onOff: { onOff: zone.time === 1 }
+            },
+            handlers: {
+              onOff: {
+                on: async () => this.handleOpen(id),
+                off: async () => this.handleClose(id)
+              }
+            }
+          };
+        } else {
+          return {
+            id,
+            displayName: zone.name,
+            deviceType: matter.deviceTypes.WaterValve,
+            clusters: {
+              valveConfigurationAndControl: {
+                currentState: 0,
+                targetState: 0,
+                defaultOpenDuration: 300
+              }
+            },
+            handlers: {
+              valveConfigurationAndControl: {
+                open: async (args: any, context: any) => this.handleOpen(context?.partId || id, args?.openDuration),
+                close: async (_args: any, context: any) => this.handleClose(context?.partId || id)
+              }
+            }
+          };
         }
-      }));
+      });
 
       // Add suspend switch part if enabled.
       if(this.hasFeature("Device.Suspend")) {
@@ -188,17 +200,25 @@ export class HydrawiseMatterController {
 
           if(part.id.startsWith("zone-")) {
 
+            if(useSwitch) {
+              part.handlers = {
+                onOff: {
+                  on: async () => this.handleOpen(part.id),
+                  off: async () => this.handleClose(part.id)
+                }
+              };
+            } else {
+              part.handlers = {
 
-            part.handlers = {
+
+                valveConfigurationAndControl: {
 
 
-              valveConfigurationAndControl: {
-
-
-                open: async (args: any, context: any) => this.handleOpen(context?.partId || part.id, args?.openDuration),
-                close: async (_args: any, context: any) => this.handleClose(context?.partId || part.id)
-              }
-            };
+                  open: async (args: any, context: any) => this.handleOpen(context?.partId || part.id, args?.openDuration),
+                  close: async (_args: any, context: any) => this.handleClose(context?.partId || part.id)
+                }
+              };
+            }
           } else if(part.id === "suspend") {
 
 
@@ -301,19 +321,29 @@ export class HydrawiseMatterController {
     }
 
     // Optimistically update Matter state.
-    await this.api.matter!.updateAccessoryState(
-      this.uuid,
-      "valveConfigurationAndControl",
-      {
+    const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+    if(useSwitch) {
+      await this.api.matter!.updateAccessoryState(
+        this.uuid,
+        "onOff",
+        { onOff: true },
+        partId
+      );
+    } else {
+      await this.api.matter!.updateAccessoryState(
+        this.uuid,
+        "valveConfigurationAndControl",
+        {
 
 
-        currentState: 1,
-        targetState: 1,
-        remainingDuration: runDuration,
-        openDuration: runDuration
-      },
-      partId
-    );
+          currentState: 1,
+          targetState: 1,
+          remainingDuration: runDuration,
+          openDuration: runDuration
+        },
+        partId
+      );
+    }
   }
 
   // Handle command to close (stop watering) a zone.
@@ -344,19 +374,29 @@ export class HydrawiseMatterController {
     }
 
     // Optimistically update Matter state.
-    await this.api.matter!.updateAccessoryState(
-      this.uuid,
-      "valveConfigurationAndControl",
-      {
+    const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+    if(useSwitch) {
+      await this.api.matter!.updateAccessoryState(
+        this.uuid,
+        "onOff",
+        { onOff: false },
+        partId
+      );
+    } else {
+      await this.api.matter!.updateAccessoryState(
+        this.uuid,
+        "valveConfigurationAndControl",
+        {
 
 
-        currentState: 0,
-        targetState: 0,
-        remainingDuration: null,
-        openDuration: null
-      },
-      partId
-    );
+          currentState: 0,
+          targetState: 0,
+          remainingDuration: null,
+          openDuration: null
+        },
+        partId
+      );
+    }
   }
 
   // Handle command to suspend/resume watering for all zones.
@@ -426,19 +466,29 @@ export class HydrawiseMatterController {
         const remainingDuration = isOn ? parseInt(zone.run) : null;
         const openDuration = isOn ? parseInt(zone.run) : null;
 
-        await this.api.matter!.updateAccessoryState(
-          this.uuid,
-          "valveConfigurationAndControl",
-          {
+        const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+        if(useSwitch) {
+          await this.api.matter!.updateAccessoryState(
+            this.uuid,
+            "onOff",
+            { onOff: isOn },
+            partId
+          );
+        } else {
+          await this.api.matter!.updateAccessoryState(
+            this.uuid,
+            "valveConfigurationAndControl",
+            {
 
 
-            currentState,
-            targetState,
-            remainingDuration,
-            openDuration
-          },
-          partId
-        );
+              currentState,
+              targetState,
+              remainingDuration,
+              openDuration
+            },
+            partId
+          );
+        }
       }
 
       // Synchronize suspend state.
