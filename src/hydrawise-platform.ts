@@ -128,7 +128,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         this.log.info("Discovered irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-        this.configureController(controller);
+        await this.configureController(controller);
       }
 
       if(this.api.isMatterEnabled?.()) {
@@ -172,7 +172,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   // Configure a discovered irrigation controller.
-  private configureController(controller: HydrawiseControllerConfig): Nullable<HydrawiseController | HydrawiseMatterController> {
+  private async configureController(controller: HydrawiseControllerConfig): Promise<Nullable<HydrawiseController | HydrawiseMatterController>> {
 
     const isMatter = this.api.isMatterEnabled?.() === true;
     const uuid = isMatter ?
@@ -224,6 +224,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
 
         const controllerDevice = new HydrawiseMatterController(this, controller, uuid);
+        await controllerDevice.init();
 
         accessory = controllerDevice.toAccessory();
         void this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
@@ -233,6 +234,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
 
         const controllerDevice = new HydrawiseMatterController(this, controller, uuid, accessory);
+        await controllerDevice.init();
 
         this.configuredMatterDevices[uuid] = controllerDevice;
       }
