@@ -131,19 +131,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         await this.configureController(controller);
       }
 
+      // Cleanup orphaned HAP accessories that aren't in the authoritative list provided by Hydrawise for this account.
+      this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
+        .map(accessory => this.removeAccessory(accessory));
+
+      // Cleanup orphaned Matter accessories if Matter is enabled.
       if(this.api.isMatterEnabled?.()) {
 
-
-        // Cleanup HAP accessories if present
-        if(this.accessories.length > 0) {
-
-
-          this.log.info("Matter is enabled. Unregistering existing HAP accessories to avoid duplicates.");
-          this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, this.accessories);
-          this.accessories.length = 0;
-        }
-
-        // Cleanup orphaned Matter accessories
         const validUUIDs: string[] = [];
 
         for(const device of Object.values(this.configuredMatterDevices)) {
@@ -153,26 +147,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
             validUUIDs.push(...device.getAllAccessories().map(y => y.UUID));
           }
         }
+
         const orphanedMatter = Array.from(this.matterAccessories.values()).filter(x => !validUUIDs.includes(x.UUID));
 
         if(orphanedMatter.length > 0) {
-
 
           this.log.info("Removing orphaned Matter accessories from cache: %s", orphanedMatter.map(x => x.displayName).join(", "));
           void this.api.matter!.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, orphanedMatter);
 
           for(const acc of orphanedMatter) {
 
-
             this.matterAccessories.delete(acc.UUID);
           }
         }
-      } else {
-
-
-        // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
-        this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
-          .map(accessory => this.removeAccessory(accessory));
       }
 
       return true;
@@ -180,110 +167,36 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   // Configure a discovered irrigation controller.
-  private async configureController(controller: HydrawiseControllerConfig): Promise<Nullable<HydrawiseController | HydrawiseMatterController>> {
+  private async configureController(controller: HydrawiseControllerConfig): Promise<void> {
 
     const isMatter = this.api.isMatterEnabled?.() === true;
-    const uuid = isMatter ?
-      this.api.matter!.uuid.generate(controller.controller_id.toString()) :
-      this.hap.uuid.generate(controller.controller_id.toString());
+    const hapUuid = this.hap.uuid.generate(controller.controller_id.toString());
 
     // Check to see if the user has disabled the device.
     if(!this.featureOptions.test("Device", controller.controller_id.toString())) {
 
-      if(isMatter) {
+      // Remove HAP accessory if it exists.
+      const hapAcc = this.accessories.find(x => x.UUID === hapUuid);
 
+      if(hapAcc) {
 
-        const acc = this.matterAccessories.get(uuid);
-
-        if(acc) {
-
-
-          void this.api.matter!.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
-          this.matterAccessories.delete(uuid);
-        }
-      } else {
-
-
-        const acc = this.accessories.find(x => x.UUID === uuid);
-
-        if(acc) {
-
-
-          this.removeAccessory(acc);
-        }
+        this.removeAccessory(hapAcc);
       }
 
-      // We're done.
-      return null;
+      // Matter accessories for disabled devices will be cleaned up by orphan removal.
+      return;
     }
 
-    if(isMatter) {
-
-
-      if(this.configuredMatterDevices[uuid]) {
-
-
-        return null;
-      }
-
-      const controllerDevice = new HydrawiseMatterController(this, controller, uuid);
-
-      await controllerDevice.init();
-
-      const newAccessories = controllerDevice.getNewAccessories();
-      const allAccessories = controllerDevice.getAllAccessories();
-
-      if(newAccessories.length > 0) {
-
-        try {
-
-          await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessories);
-
-          for(const acc of newAccessories) {
-
-            this.matterAccessories.set(acc.UUID, acc);
-          }
-        } catch(error) {
-
-          this.log.error("Failed to register Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-          return null;
-        }
-      }
-
-      if(allAccessories.length > 0) {
-
-        try {
-
-          await this.api.matter!.updatePlatformAccessories(allAccessories);
-        } catch(error) {
-
-          this.log.error("Failed to update Matter accessory handlers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-        }
-      }
-
-      this.configuredMatterDevices[uuid] = controllerDevice;
-      controllerDevice.startPolling();
-
-      this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
-
-      return this.configuredMatterDevices[uuid]!;
-    } else {
-
-
-      // If we've already configured this device before, we're done.
-      if(this.configuredDevices[uuid]) {
-
-        return null;
-      }
+    // Always configure the HAP accessory.
+    if(!this.configuredDevices[hapUuid]) {
 
       // See if we already know about this accessory or if it's truly new.
-      let accessory = this.accessories.find(x => x.UUID === uuid);
+      let accessory = this.accessories.find(x => x.UUID === hapUuid);
 
       // It's a new device - let's add it to HomeKit.
       if(!accessory) {
 
-        accessory = new this.api.platformAccessory(controller.name, uuid);
+        accessory = new this.api.platformAccessory(controller.name, hapUuid);
 
         // Register this accessory with Homebridge and add it to the accessory array so we can track it.
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
@@ -294,12 +207,60 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.info("Configuring HAP irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
       // Add it to our list of configured devices.
-      this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller);
+      this.configuredDevices[hapUuid] = new HydrawiseController(this, accessory, controller);
 
       // Refresh the accessory cache.
       this.api.updatePlatformAccessories([accessory]);
+    }
 
-      return this.configuredDevices[uuid];
+    // Additionally configure Matter accessories if Matter is enabled.
+    if(isMatter) {
+
+      const matterUuid = this.api.matter!.uuid.generate(controller.controller_id.toString());
+
+      if(!this.configuredMatterDevices[matterUuid]) {
+
+        const controllerDevice = new HydrawiseMatterController(this, controller, matterUuid);
+
+        await controllerDevice.init();
+
+        const newAccessories = controllerDevice.getNewAccessories();
+        const allAccessories = controllerDevice.getAllAccessories();
+
+        if(newAccessories.length > 0) {
+
+          try {
+
+            await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessories);
+
+            for(const acc of newAccessories) {
+
+              this.matterAccessories.set(acc.UUID, acc);
+            }
+          } catch(error) {
+
+            this.log.error("Failed to register Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+            return;
+          }
+        }
+
+        if(allAccessories.length > 0) {
+
+          try {
+
+            await this.api.matter!.updatePlatformAccessories(allAccessories);
+          } catch(error) {
+
+            this.log.error("Failed to update Matter accessory handlers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+          }
+        }
+
+        this.configuredMatterDevices[matterUuid] = controllerDevice;
+        controllerDevice.startPolling();
+
+        this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
+      }
     }
   }
 

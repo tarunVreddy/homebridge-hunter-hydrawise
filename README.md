@@ -66,15 +66,15 @@ The following feature options are available for customizing Matter behavior. The
 > If your zones are not appearing or not controllable in **Amazon Alexa**, try enabling `Matter.Valve.AsSwitch`. Alexa's Matter support currently has better compatibility with On/Off switch device types than with valve device types.
 
 ### How It Works
-When Matter is enabled, the plugin registers each irrigation zone as an independent Matter accessory on the Homebridge Matter bridge. This means:
+When Matter is enabled, the plugin registers each irrigation zone as an independent Matter accessory on the Homebridge Matter bridge **in addition to** the existing HAP (HomeKit) accessories. Both protocols run simultaneously:
 
-  * Each zone appears as a **separate, individually named device** in your smart home app.
-  * Zone names come directly from your Hydrawise configuration (e.g. "Zone 1", "Zone 2", "Berm 21").
-  * Zone state (on/off, running/idle) is synchronized with the Hydrawise API in real-time.
-  * Commands issued from any Matter controller (Alexa, Google Home, HomeKit) are sent to the Hydrawise API to start or stop watering.
+  * **HAP (HomeKit)**: Your irrigation controller appears as a native HomeKit `IrrigationSystem` accessory with individual `Valve` services — the same rich integration you've always had.
+  * **Matter**: Each zone is also exposed as a **separate, individually named device** that can be discovered by Alexa, Google Home, SmartThings, and other Matter-compatible platforms.
+  * Zone state (on/off, running/idle) is synchronized across both protocols via the Hydrawise API in real-time.
+  * Commands issued from any controller (Apple Home via HAP, or Alexa/Google Home via Matter) are sent to the Hydrawise API to start or stop watering.
 
-> [!NOTE]
-> When Matter is enabled, the traditional HAP (HomeKit Accessory Protocol) accessories are automatically removed to avoid duplicate devices. Your zones will only be accessible through the Matter bridge.
+> [!WARNING]
+> **Avoid commissioning the Matter bridge into Apple Home.** Since HAP already provides native HomeKit integration, adding the Matter bridge to Apple Home would create duplicate devices. Commission the Matter bridge only into non-HomeKit ecosystems like **Amazon Alexa** or **Google Home**.
 
 ## <A NAME="plugin-configuration"></A>Installation
 To get started with `homebridge-hunter-hydrawise`:
