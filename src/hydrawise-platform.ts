@@ -18,7 +18,7 @@ import util from "node:util";
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   private readonly accessories: PlatformAccessory[];
-  private readonly matterAccessories: Map<string, MatterAccessory>;
+  public readonly matterAccessories: Map<string, MatterAccessory>;
   private account: CustomerDetailsResponse;
   public readonly api: API;
   private dispatcher?: Dispatcher;
@@ -144,8 +144,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         }
 
         // Cleanup orphaned Matter accessories
-        const matterUUIDs = this.account.controllers.map(x => this.api.matter!.uuid.generate(x.controller_id.toString()));
-        const orphanedMatter = Array.from(this.matterAccessories.values()).filter(x => !matterUUIDs.includes(x.UUID));
+        const validUUIDs: string[] = [];
+
+        for(const device of Object.values(this.configuredMatterDevices)) {
+
+          if(device) {
+
+            validUUIDs.push(...device.getAllAccessories().map(y => y.UUID));
+          }
+        }
+        const orphanedMatter = Array.from(this.matterAccessories.values()).filter(x => !validUUIDs.includes(x.UUID));
 
         if(orphanedMatter.length > 0) {
 
@@ -218,26 +226,44 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         return null;
       }
 
-      let accessory = this.matterAccessories.get(uuid);
+      const controllerDevice = new HydrawiseMatterController(this, controller, uuid);
 
-      if(!accessory) {
+      await controllerDevice.init();
 
+      const newAccessories = controllerDevice.getNewAccessories();
+      const allAccessories = controllerDevice.getAllAccessories();
 
-        const controllerDevice = new HydrawiseMatterController(this, controller, uuid);
-        await controllerDevice.init();
+      if(newAccessories.length > 0) {
 
-        accessory = controllerDevice.toAccessory();
-        void this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.matterAccessories.set(uuid, accessory);
-        this.configuredMatterDevices[uuid] = controllerDevice;
-      } else {
+        try {
 
+          await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessories);
 
-        const controllerDevice = new HydrawiseMatterController(this, controller, uuid, accessory);
-        await controllerDevice.init();
+          for(const acc of newAccessories) {
 
-        this.configuredMatterDevices[uuid] = controllerDevice;
+            this.matterAccessories.set(acc.UUID, acc);
+          }
+        } catch(error) {
+
+          this.log.error("Failed to register Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+          return null;
+        }
       }
+
+      if(allAccessories.length > 0) {
+
+        try {
+
+          await this.api.matter!.updatePlatformAccessories(allAccessories);
+        } catch(error) {
+
+          this.log.error("Failed to update Matter accessory handlers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+        }
+      }
+
+      this.configuredMatterDevices[uuid] = controllerDevice;
+      controllerDevice.startPolling();
 
       this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
@@ -379,7 +405,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if((error instanceof DOMException) && (error.name === "AbortError")) {
 
         this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
-        this.log.debug("Original request was: %s", url);
+        this.log.debug("Original request was: %s", url.replace(/api_key=[^&]+/g, "api_key=REDACTED"));
 
         // Reset our network stack, just in case.
         this.initNetworking();

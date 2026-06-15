@@ -11,27 +11,30 @@ import util from "node:util";
 
 export class HydrawiseMatterController {
 
-
   private readonly platform: HydrawisePlatform;
   private readonly api: API;
   private readonly controller: HydrawiseControllerConfig;
   private readonly uuid: string;
-  private accessory?: MatterAccessory;
   private status: StatusScheduleResponse;
   public readonly log: HomebridgePluginLogging;
 
-  constructor(platform: HydrawisePlatform, controller: HydrawiseControllerConfig, uuid: string, accessory?: MatterAccessory) {
+  // Collection of accessories managed by this controller device
+  private readonly accessories: Map<string, MatterAccessory> = new Map();
+  private readonly zoneUuids: Map<number, string> = new Map();
+  private suspendUuid?: string;
 
+  private accessoriesToRegister: MatterAccessory[] = [];
+  private allAccessories: MatterAccessory[] = [];
+
+  constructor(platform: HydrawisePlatform, controller: HydrawiseControllerConfig, uuid: string) {
 
     this.platform = platform;
     this.api = platform.api;
     this.controller = controller;
     this.uuid = uuid;
-    this.accessory = accessory;
     this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
 
     this.log = {
-
 
       debug: (message: string, ...parameters: unknown[]): void => platform.debug(util.format(this.controller.name + ": " + message, ...parameters)),
       error: (message: string, ...parameters: unknown[]): void => platform.log.error(util.format(this.controller.name + ": " + message, ...parameters)),
@@ -40,50 +43,45 @@ export class HydrawiseMatterController {
     };
   }
 
-  // Resolves the restored or new MatterAccessory representation.
-  public toAccessory(): MatterAccessory {
+  // Retrieve the list of new accessories that need to be registered with the Matter bridge.
+  public getNewAccessories(): MatterAccessory[] {
 
 
-    if(!this.accessory) {
-
-
-      throw new Error("Matter accessory not initialized yet.");
-    }
-
-    return this.accessory;
+    return this.accessoriesToRegister;
   }
 
-  // Initialization: Fetches status, registers accessory parts if needed, and starts loop.
-  public async init(): Promise<void> {
+  // Retrieve the list of all accessories (both cached and new) to update handlers.
+  public getAllAccessories(): MatterAccessory[] {
 
+
+    return this.allAccessories;
+  }
+
+  // Initialization: Fetches status, registers accessories, and starts loop.
+  public async init(): Promise<void> {
 
     let initialized = false;
 
     // Fetch initial status to discover zones/relays.
     await retry(async (): Promise<boolean> => {
 
-
       const response = await this.platform.retrieve("statusschedule.php", {
-
 
         controller_id: this.controller.controller_id.toString()
       });
 
       if(!response) {
 
-
         return false;
       }
 
       try {
-
 
         this.status = await response.body.json() as StatusScheduleResponse;
         initialized = true;
 
         return true;
       } catch(error) {
-
 
         this.log.error("Unable to retrieve the initial status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
 
@@ -93,164 +91,176 @@ export class HydrawiseMatterController {
 
     if(!initialized) {
 
-
       this.log.error("Failed to fetch initial Hydrawise status during Matter initialization.");
 
       return;
     }
 
     const matter = this.api.matter!;
-
     const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
 
-    if(!this.accessory) {
+    this.accessoriesToRegister = [];
+    this.allAccessories = [];
+
+    // Configure each discovered relay (zone) as a separate accessory.
+    for(const zone of this.status.relays) {
 
 
-      // Build valve endpoints (parts) dynamically from discovered relays.
-      const parts: any[] = this.status.relays.map(zone => {
-        const id = `zone-${zone.relay_id}`;
-        if(useSwitch) {
-          return {
-            id,
-            displayName: zone.name,
-            deviceType: matter.deviceTypes.OnOffOutlet,
-            clusters: {
-              onOff: { onOff: zone.time === 1 }
-            },
-            handlers: {
-              onOff: {
-                on: async () => this.handleOpen(id),
-                off: async () => this.handleClose(id)
-              }
+      const zoneUuid = this.api.hap.uuid.generate(this.controller.serial_number + "-zone-" + zone.relay_id);
+
+      this.zoneUuids.set(zone.relay_id, zoneUuid);
+
+      let zoneAccessory = this.platform.matterAccessories.get(zoneUuid);
+      let isNew = false;
+
+      if(!zoneAccessory) {
+
+
+        isNew = true;
+
+        zoneAccessory = {
+
+
+          UUID: zoneUuid,
+          displayName: zone.name,
+          deviceType: useSwitch ? matter.deviceTypes.OnOffOutlet : matter.deviceTypes.WaterValve,
+          serialNumber: `${this.controller.serial_number}-${zone.relay_id}`,
+          manufacturer: "Hunter",
+          model: "Hydrawise Zone",
+          firmwareRevision: "2.0.0",
+          hardwareRevision: "1.0.0",
+          context: { serialNumber: this.controller.serial_number, relayId: zone.relay_id },
+          clusters: useSwitch ? {
+
+
+            onOff: { onOff: zone.time === 1 }
+          } : {
+
+
+            valveConfigurationAndControl: {
+
+
+              currentState: 0,
+              targetState: 0,
+              defaultOpenDuration: 300
             }
-          };
-        } else {
-          return {
-            id,
-            displayName: zone.name,
-            deviceType: matter.deviceTypes.WaterValve,
-            clusters: {
-              valveConfigurationAndControl: {
-                currentState: 0,
-                targetState: 0,
-                defaultOpenDuration: 300
-              }
-            },
-            handlers: {
-              valveConfigurationAndControl: {
-                open: async (args: any, context: any) => this.handleOpen(context?.partId || id, args?.openDuration),
-                close: async (_args: any, context: any) => this.handleClose(context?.partId || id)
-              }
-            }
-          };
-        }
-      });
+          }
+        };
+      }
 
-      // Add suspend switch part if enabled.
-      if(this.hasFeature("Device.Suspend")) {
+      // Bind callback handlers to the zone accessory.
+      if(useSwitch) {
 
 
-        parts.push({
+        zoneAccessory.handlers = {
 
 
-          id: "suspend",
+          onOff: {
+
+
+            on: async () => this.handleOpen(zone.relay_id.toString(), undefined, true),
+            off: async () => this.handleClose(zone.relay_id.toString(), true)
+          }
+        };
+      } else {
+
+
+        zoneAccessory.handlers = {
+
+
+          valveConfigurationAndControl: {
+
+
+            open: async (args: any) => this.handleOpen(zone.relay_id.toString(), args?.openDuration, true),
+            close: async () => this.handleClose(zone.relay_id.toString(), true)
+          }
+        };
+      }
+
+      this.accessories.set(zoneUuid, zoneAccessory);
+      this.allAccessories.push(zoneAccessory);
+
+      if(isNew) {
+
+
+        this.accessoriesToRegister.push(zoneAccessory);
+      }
+    }
+
+    // Configure suspend switch if enabled.
+    if(this.hasFeature("Device.Suspend")) {
+
+
+      const suspendUuid = this.api.hap.uuid.generate(this.controller.serial_number + "-suspend");
+
+      this.suspendUuid = suspendUuid;
+
+      let suspendAccessory = this.platform.matterAccessories.get(suspendUuid);
+      let isNew = false;
+
+      if(!suspendAccessory) {
+
+
+        isNew = true;
+
+        suspendAccessory = {
+
+
+          UUID: suspendUuid,
           displayName: this.controller.name + " Suspend All Zones",
           deviceType: matter.deviceTypes.OnOffOutlet,
+          serialNumber: `${this.controller.serial_number}-suspend`,
+          manufacturer: "Hunter",
+          model: "Hydrawise Suspend Switch",
+          firmwareRevision: "2.0.0",
+          hardwareRevision: "1.0.0",
+          context: { serialNumber: this.controller.serial_number },
           clusters: {
 
 
             onOff: { onOff: this.isAllSuspended }
-          },
-          handlers: {
-
-
-            onOff: {
-
-
-              on: async () => this.handleSuspend(true),
-              off: async () => this.handleSuspend(false)
-            }
           }
-        });
+        };
       }
 
-      this.accessory = {
+      suspendAccessory.handlers = {
 
 
-        UUID: this.uuid,
-        displayName: this.controller.name,
-        deviceType: matter.deviceTypes.BridgedNode,
-        serialNumber: this.controller.serial_number,
-        manufacturer: "Hunter",
-        model: "Hydrawise",
-        firmwareRevision: "2.0.0",
-        hardwareRevision: "1.0.0",
-        context: { serialNumber: this.controller.serial_number },
-        parts
-      };
-    } else {
+        onOff: {
 
 
-      // Re-bind callbacks to the restored parts.
-      if(this.accessory.parts) {
-
-
-        for(const part of this.accessory.parts) {
-
-
-          if(part.id.startsWith("zone-")) {
-
-            if(useSwitch) {
-              part.handlers = {
-                onOff: {
-                  on: async () => this.handleOpen(part.id),
-                  off: async () => this.handleClose(part.id)
-                }
-              };
-            } else {
-              part.handlers = {
-
-
-                valveConfigurationAndControl: {
-
-
-                  open: async (args: any, context: any) => this.handleOpen(context?.partId || part.id, args?.openDuration),
-                  close: async (_args: any, context: any) => this.handleClose(context?.partId || part.id)
-                }
-              };
-            }
-          } else if(part.id === "suspend") {
-
-
-            part.handlers = {
-
-
-              onOff: {
-
-
-                on: async () => this.handleSuspend(true),
-                off: async () => this.handleSuspend(false)
-              }
-            };
-          }
+          on: async () => this.handleSuspend(true, true),
+          off: async () => this.handleSuspend(false, true)
         }
+      };
+
+      this.accessories.set(suspendUuid, suspendAccessory);
+      this.allAccessories.push(suspendAccessory);
+
+      if(isNew) {
+
+
+        this.accessoriesToRegister.push(suspendAccessory);
       }
     }
 
     // Configure MQTT.
     this.configureMqtt();
 
-    // Start state synchronization loop.
+    // Note: The state synchronization loop is started externally via startPolling() after Matter registration completes.
+  }
+
+  // Start the state synchronization polling loop. Called by the platform after Matter registration is complete.
+  public startPolling(): void {
+
     void this.updateStateLoop();
   }
 
   // Configure MQTT services.
   private configureMqtt(): boolean {
 
-
     // Return our irrigation controller state.
     this.platform.mqtt?.subscribeGet(this.controller.serial_number, "controller", "Irrigation controller", () => {
-
 
       return this.statusJson;
     }, this.log);
@@ -258,13 +268,11 @@ export class HydrawiseMatterController {
     // Set the state of a given irrigation zone.
     this.platform.mqtt?.subscribeSet(this.controller.serial_number, "controller", "Irrigiation controller", async (value: string) => {
 
-
       const action = value.split(" ");
       const zoneValue = parseInt(action[1]);
       const zone = this.status.relays.find(x => x.relay === zoneValue);
 
       if(!zone) {
-
 
         this.log.error("MQTT: Invalid zone specified.");
 
@@ -291,16 +299,14 @@ export class HydrawiseMatterController {
   }
 
   // Handle command to open (start watering) a zone.
-  private async handleOpen(partId: string, duration?: number): Promise<void> {
+  private async handleOpen(id: string, duration?: number, isMatterCommand: boolean = false): Promise<void> {
 
-
-    const relayId = this.getRelayId(partId);
+    const relayId = this.getRelayId(id);
     const zone = this.status.relays.find(x => x.relay_id === relayId);
 
     if(!zone) {
 
-
-      this.log.error("Unable to find zone for part ID: %s", partId);
+      this.log.error("Unable to find zone for ID: %s", id);
 
       return;
     }
@@ -314,49 +320,58 @@ export class HydrawiseMatterController {
 
     if(!response) {
 
-
       this.log.error("Failed to send run command for zone %s.", zone.name);
 
       return;
     }
 
-    // Optimistically update Matter state.
-    const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
-    if(useSwitch) {
-      await this.api.matter!.updateAccessoryState(
-        this.uuid,
-        "onOff",
-        { onOff: true },
-        partId
-      );
-    } else {
-      await this.api.matter!.updateAccessoryState(
-        this.uuid,
-        "valveConfigurationAndControl",
-        {
+    // Update Matter state only for non-Matter triggers (e.g., MQTT).
+    if(!isMatterCommand) {
 
 
-          currentState: 1,
-          targetState: 1,
-          remainingDuration: runDuration,
-          openDuration: runDuration
-        },
-        partId
-      );
+      const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+      const zoneUuid = this.zoneUuids.get(relayId);
+
+      if(zoneUuid) {
+
+
+        if(useSwitch) {
+
+
+          await this.api.matter!.updateAccessoryState(
+            zoneUuid,
+            "onOff",
+            { onOff: true }
+          );
+        } else {
+
+
+          await this.api.matter!.updateAccessoryState(
+            zoneUuid,
+            "valveConfigurationAndControl",
+            {
+
+
+              currentState: 1,
+              targetState: 1,
+              remainingDuration: runDuration,
+              openDuration: runDuration
+            }
+          );
+        }
+      }
     }
   }
 
   // Handle command to close (stop watering) a zone.
-  private async handleClose(partId: string): Promise<void> {
+  private async handleClose(id: string, isMatterCommand: boolean = false): Promise<void> {
 
-
-    const relayId = this.getRelayId(partId);
+    const relayId = this.getRelayId(id);
     const zone = this.status.relays.find(x => x.relay_id === relayId);
 
     if(!zone) {
 
-
-      this.log.error("Unable to find zone for part ID: %s", partId);
+      this.log.error("Unable to find zone for ID: %s", id);
 
       return;
     }
@@ -367,41 +382,51 @@ export class HydrawiseMatterController {
 
     if(!response) {
 
-
       this.log.error("Failed to send stop command for zone %s.", zone.name);
 
       return;
     }
 
-    // Optimistically update Matter state.
-    const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
-    if(useSwitch) {
-      await this.api.matter!.updateAccessoryState(
-        this.uuid,
-        "onOff",
-        { onOff: false },
-        partId
-      );
-    } else {
-      await this.api.matter!.updateAccessoryState(
-        this.uuid,
-        "valveConfigurationAndControl",
-        {
+    // Update Matter state only for non-Matter triggers (e.g., MQTT).
+    if(!isMatterCommand) {
 
 
-          currentState: 0,
-          targetState: 0,
-          remainingDuration: null,
-          openDuration: null
-        },
-        partId
-      );
+      const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+      const zoneUuid = this.zoneUuids.get(relayId);
+
+      if(zoneUuid) {
+
+
+        if(useSwitch) {
+
+
+          await this.api.matter!.updateAccessoryState(
+            zoneUuid,
+            "onOff",
+            { onOff: false }
+          );
+        } else {
+
+
+          await this.api.matter!.updateAccessoryState(
+            zoneUuid,
+            "valveConfigurationAndControl",
+            {
+
+
+              currentState: 0,
+              targetState: 0,
+              remainingDuration: null,
+              openDuration: null
+            }
+          );
+        }
+      }
     }
   }
 
   // Handle command to suspend/resume watering for all zones.
-  private async handleSuspend(suspend: boolean): Promise<void> {
-
+  private async handleSuspend(suspend: boolean, isMatterCommand: boolean = false): Promise<void> {
 
     this.log.info("%s scheduled watering for all zones.", suspend ? "Suspending" : "Resuming");
 
@@ -413,31 +438,26 @@ export class HydrawiseMatterController {
 
     try {
 
-
       status = await response?.body.json() as SetZoneResponse;
     } catch(error) {
-
 
       this.log.error("Unable to retrieve the result of the suspend/resume request.");
     }
 
     if(!status || status.message_type === "error") {
 
-
       this.log.error("Unable to complete the suspend/resume request.");
 
       return;
     }
 
-    // Update Matter state.
-    if(this.hasFeature("Device.Suspend")) {
-
+    // Update Matter state only for non-Matter triggers.
+    if(!isMatterCommand && this.hasFeature("Device.Suspend") && this.suspendUuid) {
 
       await this.api.matter!.updateAccessoryState(
-        this.uuid,
+        this.suspendUuid,
         "onOff",
-        { onOff: suspend },
-        "suspend"
+        { onOff: suspend }
       );
     }
   }
@@ -445,9 +465,7 @@ export class HydrawiseMatterController {
   // Synchronization loop.
   private async updateStateLoop(): Promise<void> {
 
-
     for(;;) {
-
 
       const isFirstRun = this.status.nextpoll === -1;
 
@@ -458,7 +476,14 @@ export class HydrawiseMatterController {
       for(const zone of this.status.relays) {
 
 
-        const partId = `zone-${zone.relay_id}`;
+        const zoneUuid = this.zoneUuids.get(zone.relay_id);
+
+        if(!zoneUuid) {
+
+
+          continue;
+        }
+
         const isOn = zone.time === 1;
 
         const currentState = isOn ? 1 : 0;
@@ -467,16 +492,20 @@ export class HydrawiseMatterController {
         const openDuration = isOn ? parseInt(zone.run) : null;
 
         const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
+
         if(useSwitch) {
+
+
           await this.api.matter!.updateAccessoryState(
-            this.uuid,
+            zoneUuid,
             "onOff",
-            { onOff: isOn },
-            partId
+            { onOff: isOn }
           );
         } else {
+
+
           await this.api.matter!.updateAccessoryState(
-            this.uuid,
+            zoneUuid,
             "valveConfigurationAndControl",
             {
 
@@ -485,21 +514,18 @@ export class HydrawiseMatterController {
               targetState,
               remainingDuration,
               openDuration
-            },
-            partId
+            }
           );
         }
       }
 
       // Synchronize suspend state.
-      if(this.hasFeature("Device.Suspend")) {
-
+      if(this.hasFeature("Device.Suspend") && this.suspendUuid) {
 
         await this.api.matter!.updateAccessoryState(
-          this.uuid,
+          this.suspendUuid,
           "onOff",
-          { onOff: this.isAllSuspended },
-          "suspend"
+          { onOff: this.isAllSuspended }
         );
       }
 
@@ -514,26 +540,21 @@ export class HydrawiseMatterController {
   // Retrieve current status from Hydrawise.
   private async getStatus(): Promise<boolean> {
 
-
     const response = await this.platform.retrieve("statusschedule.php", {
-
 
       controller_id: this.controller.controller_id.toString()
     });
 
     if(!response) {
 
-
       return false;
     }
 
     try {
 
-
       this.status = await response.body.json() as StatusScheduleResponse;
       this.log.debug("Status updated.");
     } catch(error) {
-
 
       this.log.error("Unable to retrieve status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
 
@@ -549,17 +570,14 @@ export class HydrawiseMatterController {
   private async sendCommand(command: "suspendall", duration: number): Promise<Nullable<any>>;
   private async sendCommand(zoneOrCmd: HydrawiseZoneConfig | "suspendall", cmdOrDur: (number | "run" | "stop"), duration?: number): Promise<Nullable<any>> {
 
-
     let command;
     let zone;
 
     if(typeof zoneOrCmd === "string") {
 
-
       command = zoneOrCmd;
       duration = cmdOrDur as number;
     } else {
-
 
       zone = zoneOrCmd;
       command = cmdOrDur as "run" | "stop";
@@ -569,7 +587,6 @@ export class HydrawiseMatterController {
 
     if(zone?.relay_id) {
 
-
       params.relay_id = zone.relay_id.toString();
     }
 
@@ -578,7 +595,6 @@ export class HydrawiseMatterController {
         params.action = "run";
 
         if(duration === undefined || duration <= 0) {
-
 
           return null;
         }
@@ -597,7 +613,6 @@ export class HydrawiseMatterController {
 
         if(duration === undefined || duration <= 0) {
 
-
           return null;
         }
         params.custom = duration.toString();
@@ -613,17 +628,22 @@ export class HydrawiseMatterController {
     return this.platform.retrieve("setzone.php", params);
   }
 
-  // Parse numeric relay ID from part ID string (e.g. "zone-12345" -> 12345).
-  private getRelayId(partId: string): number {
+  // Parse numeric relay ID from ID string (e.g. "zone-12345" -> 12345 or "12345" -> 12345).
+  private getRelayId(id: string): number {
+
+    const match = id.match(/zone-(\d+)/);
+
+    if(match) {
 
 
-    const match = partId.match(/zone-(\d+)/);
+      return parseInt(match[1], 10);
+    }
+    const numeric = parseInt(id, 10);
 
-    return match ? parseInt(match[1], 10) : 0;
+    return isNaN(numeric) ? 0 : numeric;
   }
 
   private isStoppedBySensor(zone: HydrawiseZoneConfig): boolean {
-
 
     return !zone.run && !zone.timestr && (zone.time === 1576800000) &&
       this.status.sensors.filter(sensor => sensor.type === 1).some(sensor => sensor.relays.some(relay => relay.id === zone.relay_id));
@@ -631,18 +651,15 @@ export class HydrawiseMatterController {
 
   private get isAllSuspended(): boolean {
 
-
     return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== 1576800000) || this.isStoppedBySensor(zone));
   }
 
   private get statusJson(): string {
 
-
     return JSON.stringify(this.status.relays.map(x => ({ name: x.name, relay: x.relay, run: x.run, time: x.time, timestr: x.timestr })));
   }
 
   private hasFeature(option: string): boolean {
-
 
     return this.platform.featureOptions.test(option, this.controller.serial_number);
   }
