@@ -58,36 +58,44 @@ export class HydrawiseMatterController {
   }
 
   // Initialization: Fetches status, registers accessories, and starts loop.
-  public async init(): Promise<void> {
+  public async init(initialStatus?: StatusScheduleResponse): Promise<void> {
 
     let initialized = false;
 
-    // Fetch initial status to discover zones/relays.
-    await retry(async (): Promise<boolean> => {
+    // Use pre-fetched status if available, otherwise fetch it ourselves.
+    if(initialStatus) {
 
-      const response = await this.platform.retrieve("statusschedule.php", {
+      this.status = initialStatus;
+      initialized = true;
+    } else {
 
-        controller_id: this.controller.controller_id.toString()
-      });
+      // Fetch initial status to discover zones/relays.
+      await retry(async (): Promise<boolean> => {
 
-      if(!response) {
+        const response = await this.platform.retrieve("statusschedule.php", {
 
-        return false;
-      }
+          controller_id: this.controller.controller_id.toString()
+        });
 
-      try {
+        if(!response) {
 
-        this.status = await response.body.json() as StatusScheduleResponse;
-        initialized = true;
+          return false;
+        }
 
-        return true;
-      } catch(error) {
+        try {
 
-        this.log.error("Unable to retrieve the initial status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+          this.status = await response.body.json() as StatusScheduleResponse;
+          initialized = true;
 
-        return false;
-      }
-    }, HYDRAWISE_API_RETRY_INTERVAL * 1000);
+          return true;
+        } catch(error) {
+
+          this.log.error("Unable to retrieve the initial status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+          return false;
+        }
+      }, HYDRAWISE_API_RETRY_INTERVAL * 1000);
+    }
 
     if(!initialized) {
 

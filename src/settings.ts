@@ -9,6 +9,9 @@ export const HYDRAWISE_API_TIMEOUT = 25;
 // How often, in seconds, should we retry Hydrawise API calls when they fail.
 export const HYDRAWISE_API_RETRY_INTERVAL = 60;
 
+// How often, in seconds, should we retry Hydrawise API calls during initial startup. Shorter than the normal interval to minimize startup delays.
+export const HYDRAWISE_API_STARTUP_RETRY_INTERVAL = 10;
+
 // How much, in seconds, jitter should we inject into the API polling interval. This helps ensure we stay clear of the Hydrawise API rate limits.
 export const HYDRAWISE_API_JITTER = 0.2;
 
