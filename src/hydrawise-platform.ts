@@ -3,10 +3,10 @@
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
-import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
+import type { CustomerDetailsResponse, HydrawiseControllerConfig, StatusScheduleResponse } from "./hydrawise-types.js";
 import { type Dispatcher, Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { FeatureOptions, retry } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
 import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
 import { MqttClient, type Nullable } from "homebridge-plugin-utils";
 import { APIEvent } from "homebridge";
@@ -127,9 +127,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       for(const controller of this.account.controllers) {
 
         this.log.info("Discovered irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
-
-        await this.configureController(controller);
       }
+
+      await Promise.all(this.account.controllers.map(controller => this.configureController(controller)));
 
       // Cleanup orphaned HAP accessories that aren't in the authoritative list provided by Hydrawise for this account.
       this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
@@ -187,6 +187,34 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return;
     }
 
+    // Fetch the initial zone status once and share it between HAP and Matter controllers to avoid duplicate API calls during startup.
+    let initialStatus: StatusScheduleResponse | undefined;
+
+    await retry(async (): Promise<boolean> => {
+
+      const response = await this.retrieve("statusschedule.php", {
+
+        controller_id: controller.controller_id.toString()
+      });
+
+      if(!response) {
+
+        return false;
+      }
+
+      try {
+
+        initialStatus = await response.body.json() as StatusScheduleResponse;
+
+        return true;
+      } catch(error) {
+
+        this.log.error("%s: Unable to retrieve initial status: %s", controller.name, util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+        return false;
+      }
+    }, HYDRAWISE_API_STARTUP_RETRY_INTERVAL * 1000, 3);
+
     // Always configure the HAP accessory.
     if(!this.configuredDevices[hapUuid]) {
 
@@ -207,7 +235,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.info("Configuring HAP irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
       // Add it to our list of configured devices.
-      this.configuredDevices[hapUuid] = new HydrawiseController(this, accessory, controller);
+      this.configuredDevices[hapUuid] = new HydrawiseController(this, accessory, controller, initialStatus);
 
       // Refresh the accessory cache.
       this.api.updatePlatformAccessories([accessory]);
@@ -222,7 +250,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         const controllerDevice = new HydrawiseMatterController(this, controller, matterUuid);
 
-        await controllerDevice.init();
+        await controllerDevice.init(initialStatus);
 
         const newAccessories = controllerDevice.getNewAccessories();
         const allAccessories = controllerDevice.getAllAccessories();

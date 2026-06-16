@@ -27,17 +27,21 @@ export class HydrawiseController {
   public readonly controller: HydrawiseControllerConfig;
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
+  private initialStatusProvided: boolean;
+  private isFirstPoll: boolean;
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
   private status: StatusScheduleResponse;
   private zoneHints: { [index: number]: Record<string, boolean> };
 
   // The constructor initializes key variables and calls configureDevice().
-  constructor(platform: HydrawisePlatform, accessory: PlatformAccessory, controller: HydrawiseControllerConfig) {
+  constructor(platform: HydrawisePlatform, accessory: PlatformAccessory, controller: HydrawiseControllerConfig, initialStatus?: StatusScheduleResponse) {
 
     this.accessory = accessory;
     this.api = platform.api;
-    this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
+    this.status = initialStatus ?? { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
+    this.initialStatusProvided = initialStatus !== undefined;
+    this.isFirstPoll = true;
     this.config = platform.config;
     this.hap = this.api.hap;
     this.hints = {} as HydrawiseHints;
@@ -244,12 +248,19 @@ export class HydrawiseController {
     // We loop forever, updating our irrigation system state at regular intervals.
     for(;;) {
 
-      const isFirstRun = this.status.nextpoll === -1;
+      const isFirstRun = this.isFirstPoll;
 
-      // Update our status. If it's our first run through, we use our internal defaults.
-      // eslint-disable-next-line no-await-in-loop
-      await retry(async () => this.getStatus(),
-        (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+      // Skip the initial API call if we've been provided with pre-fetched status data from the platform.
+      if(this.initialStatusProvided) {
+
+        this.initialStatusProvided = false;
+      } else {
+
+        // Update our status. If it's our first run through, we use our internal defaults.
+        // eslint-disable-next-line no-await-in-loop
+        await retry(async () => this.getStatus(),
+          (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+      }
 
       // Let's get the list of current valves on this irrigation controller.
       const currentValves = this.status.relays.map(x => x.relay_id.toString());
@@ -463,6 +474,9 @@ export class HydrawiseController {
       // Update our suspend status.
       this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
         this.isAllSuspended);
+
+      // Mark that we've completed the initial poll cycle.
+      this.isFirstPoll = false;
 
       // Sleep until our next polling interval due to the Hydrawise API being rate-limited.
       // eslint-disable-next-line no-await-in-loop
