@@ -74,7 +74,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.log.debug("Debug logging on. Expect a lot of data.");
 
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
-    api.on(APIEvent.DID_FINISH_LAUNCHING, () => void this.configureHydrawise());
+    api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
+
+      // Immediately bind handlers on cached Matter accessories so they're available before the Hydrawise API responds.
+      this.bindCachedMatterAccessories();
+      void this.configureHydrawise();
+    });
   }
 
   // This gets called when homebridge restores cached accessories at startup. We intentionally avoid doing anything significant here, and save all that logic for
@@ -250,7 +255,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         const controllerDevice = new HydrawiseMatterController(this, controller, matterUuid);
 
-        await controllerDevice.init(initialStatus);
+        if(!await controllerDevice.init(initialStatus)) {
+
+          this.log.error("Skipping Matter configuration for %s due to initialization failure. Cached accessories will be preserved.", controller.name);
+
+          return;
+        }
 
         const newAccessories = controllerDevice.getNewAccessories();
         const allAccessories = controllerDevice.getAllAccessories();
@@ -302,6 +312,126 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     this.accessories.splice(this.accessories.indexOf(accessory), 1);
     this.api.updatePlatformAccessories(this.accessories);
+  }
+
+  // Immediately bind handlers on cached Matter accessories so they're available before the Hydrawise API responds.
+  // This allows Matter/HomeKit to start using devices right away while the Hydrawise API is still being contacted.
+  private bindCachedMatterAccessories(): void {
+
+    if(!this.api.isMatterEnabled?.() || this.matterAccessories.size === 0) {
+
+      return;
+    }
+
+    const cachedAccessories: MatterAccessory[] = [];
+
+    for(const accessory of this.matterAccessories.values()) {
+
+      const context = accessory.context as { serialNumber?: string; relayId?: number; controllerId?: number; type?: string };
+
+      // Skip accessories that don't have the enriched context (e.g. from before this update).
+      if(!context?.controllerId) {
+
+        continue;
+      }
+
+      if(context.type === "suspend") {
+
+        accessory.handlers = {
+
+          onOff: {
+
+            on: async () => this.handleEarlyCommand(context.controllerId!, 0, "suspendall"),
+            off: async () => this.handleEarlyCommand(context.controllerId!, 0, "resumeall")
+          }
+        };
+      } else if(context.type === "zone" && context.relayId) {
+
+        const useSwitch = accessory.deviceType === this.api.matter!.deviceTypes.OnOffOutlet;
+
+        if(useSwitch) {
+
+          accessory.handlers = {
+
+            onOff: {
+
+              on: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "run"),
+              off: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "stop")
+            }
+          };
+        } else {
+
+          accessory.handlers = {
+
+            valveConfigurationAndControl: {
+
+              open: async (args: unknown) => this.handleEarlyCommand(context.controllerId!, context.relayId!, "run",
+                (args as { openDuration?: number })?.openDuration),
+              close: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "stop")
+            }
+          };
+        }
+      }
+
+      cachedAccessories.push(accessory);
+    }
+
+    if(cachedAccessories.length > 0) {
+
+      void this.api.matter!.updatePlatformAccessories(cachedAccessories).catch((error: unknown) => {
+
+        this.log.error("Failed to restore cached Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+      });
+
+      this.log.info("Restored %s cached Matter accessories for immediate availability.", cachedAccessories.length.toString());
+    }
+  }
+
+  // Handle commands from early-bound Matter accessories before the full controller is configured.
+  private async handleEarlyCommand(controllerId: number, relayId: number, action: "run" | "stop" | "suspendall" | "resumeall", duration?: number): Promise<void> {
+
+    const params: Record<string, string> = { controller_id: controllerId.toString() };
+
+    switch(action) {
+
+      case "run":
+
+        params.relay_id = relayId.toString();
+        params.action = "run";
+        params.custom = (duration ?? 300).toString();
+        params.period_id = "999";
+
+        break;
+
+      case "stop":
+
+        params.relay_id = relayId.toString();
+        params.action = "stop";
+
+        break;
+
+      case "suspendall":
+
+        params.action = "suspendall";
+        params.custom = ((Date.now() / 1000) + 31556926).toString();
+        params.period_id = "999";
+
+        break;
+
+      case "resumeall":
+
+        params.action = "suspendall";
+        params.custom = (Date.now() / 1000).toString();
+        params.period_id = "999";
+
+        break;
+
+      default:
+
+        return;
+    }
+
+    await this.retrieve("setzone.php", params);
   }
 
   // Initialize our network stack.
