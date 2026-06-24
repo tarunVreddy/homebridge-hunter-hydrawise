@@ -58,7 +58,7 @@ export class HydrawiseMatterController {
   }
 
   // Initialization: Fetches status, registers accessories, and starts loop.
-  public async init(initialStatus?: StatusScheduleResponse): Promise<void> {
+  public async init(initialStatus?: StatusScheduleResponse): Promise<boolean> {
 
     let initialized = false;
 
@@ -101,7 +101,7 @@ export class HydrawiseMatterController {
 
       this.log.error("Failed to fetch initial Hydrawise status during Matter initialization.");
 
-      return;
+      return false;
     }
 
     const matter = this.api.matter!;
@@ -114,7 +114,7 @@ export class HydrawiseMatterController {
     for(const zone of this.status.relays) {
 
 
-      const zoneUuid = this.api.hap.uuid.generate(this.controller.serial_number + "-zone-" + zone.relay_id);
+      const zoneUuid = this.api.matter!.uuid.generate(this.controller.serial_number + "-zone-" + zone.relay_id);
 
       this.zoneUuids.set(zone.relay_id, zoneUuid);
 
@@ -137,7 +137,7 @@ export class HydrawiseMatterController {
           model: "Hydrawise Zone",
           firmwareRevision: "2.0.0",
           hardwareRevision: "1.0.0",
-          context: { serialNumber: this.controller.serial_number, relayId: zone.relay_id },
+          context: { serialNumber: this.controller.serial_number, relayId: zone.relay_id, controllerId: this.controller.controller_id, type: "zone" },
           clusters: useSwitch ? {
 
 
@@ -199,7 +199,7 @@ export class HydrawiseMatterController {
     if(this.hasFeature("Device.Suspend")) {
 
 
-      const suspendUuid = this.api.hap.uuid.generate(this.controller.serial_number + "-suspend");
+      const suspendUuid = this.api.matter!.uuid.generate(this.controller.serial_number + "-suspend");
 
       this.suspendUuid = suspendUuid;
 
@@ -222,7 +222,7 @@ export class HydrawiseMatterController {
           model: "Hydrawise Suspend Switch",
           firmwareRevision: "2.0.0",
           hardwareRevision: "1.0.0",
-          context: { serialNumber: this.controller.serial_number },
+          context: { serialNumber: this.controller.serial_number, controllerId: this.controller.controller_id, type: "suspend" },
           clusters: {
 
 
@@ -256,6 +256,8 @@ export class HydrawiseMatterController {
     this.configureMqtt();
 
     // Note: The state synchronization loop is started externally via startPolling() after Matter registration completes.
+
+    return true;
   }
 
   // Start the state synchronization polling loop. Called by the platform after Matter registration is complete.
@@ -439,7 +441,7 @@ export class HydrawiseMatterController {
     this.log.info("%s scheduled watering for all zones.", suspend ? "Suspending" : "Resuming");
 
     // Year from now to suspend, or 0 (current time) to resume.
-    const timestamp = suspend ? (Date.now() / 1000) + 31556926 : 0;
+    const timestamp = (Date.now() / 1000) + (suspend ? 31556926 : 0);
     const response = await this.sendCommand("suspendall", timestamp);
 
     let status;
