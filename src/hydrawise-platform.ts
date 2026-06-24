@@ -330,7 +330,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       const context = accessory.context as { serialNumber?: string; relayId?: number; controllerId?: number; type?: string };
 
       // Skip accessories that don't have the enriched context (e.g. from before this update).
-      if(!context?.controllerId) {
+      const controllerId = context.controllerId;
+      const relayId = context.relayId;
+
+      if(!controllerId) {
 
         continue;
       }
@@ -341,13 +344,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
           onOff: {
 
-            on: async () => this.handleEarlyCommand(context.controllerId!, 0, "suspendall"),
-            off: async () => this.handleEarlyCommand(context.controllerId!, 0, "resumeall")
+            off: async (): Promise<void> => this.handleEarlyCommand(controllerId, 0, "resumeall"),
+            on: async (): Promise<void> => this.handleEarlyCommand(controllerId, 0, "suspendall")
           }
         };
-      } else if(context.type === "zone" && context.relayId) {
+      } else if(context.type === "zone" && relayId) {
 
-        const useSwitch = accessory.deviceType === this.api.matter!.deviceTypes.OnOffOutlet;
+        const useSwitch = accessory.deviceType === this.api.matter?.deviceTypes.OnOffOutlet;
 
         if(useSwitch) {
 
@@ -355,8 +358,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
             onOff: {
 
-              on: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "run"),
-              off: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "stop")
+              off: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "stop"),
+              on: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "run")
             }
           };
         } else {
@@ -365,9 +368,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
             valveConfigurationAndControl: {
 
-              open: async (args: unknown) => this.handleEarlyCommand(context.controllerId!, context.relayId!, "run",
-                (args as { openDuration?: number })?.openDuration),
-              close: async () => this.handleEarlyCommand(context.controllerId!, context.relayId!, "stop")
+              close: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "stop"),
+              open: async (args: unknown): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "run",
+                (args as { openDuration?: number }).openDuration)
             }
           };
         }
@@ -376,9 +379,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       cachedAccessories.push(accessory);
     }
 
-    if(cachedAccessories.length > 0) {
+    if(cachedAccessories.length > 0 && this.api.matter) {
 
-      void this.api.matter!.updatePlatformAccessories(cachedAccessories).catch((error: unknown) => {
+      void this.api.matter.updatePlatformAccessories(cachedAccessories).catch((error: unknown) => {
 
         this.log.error("Failed to restore cached Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
       });

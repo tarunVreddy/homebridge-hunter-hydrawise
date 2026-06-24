@@ -521,18 +521,18 @@ export class HydrawiseMatterController {
 
 
               currentState,
-              targetState,
+              openDuration,
               remainingDuration,
-              openDuration
+              targetState
             }
           );
         }
       }
 
       // Synchronize suspend state.
-      if(this.hasFeature("Device.Suspend") && this.suspendUuid) {
+      if(this.hasFeature("Device.Suspend") && this.suspendUuid && this.api.matter) {
 
-        await this.api.matter!.updateAccessoryState(
+        await this.api.matter.updateAccessoryState(
           this.suspendUuid,
           "onOff",
           { onOff: this.isAllSuspended }
