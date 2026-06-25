@@ -5,8 +5,8 @@
 import type { API, MatterAccessory } from "homebridge";
 import type { HydrawisePlatform } from "./hydrawise-platform.js";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
-import { type HomebridgePluginLogging, type Nullable, retry, sleep } from "homebridge-plugin-utils";
+import { HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
+import { type HomebridgePluginLogging, type Nullable, retry } from "homebridge-plugin-utils";
 import util from "node:util";
 
 export class HydrawiseMatterController {
@@ -255,15 +255,10 @@ export class HydrawiseMatterController {
     // Configure MQTT.
     this.configureMqtt();
 
-    // Note: The state synchronization loop is started externally via startPolling() after Matter registration completes.
+    // Register for state updates from the platform's central polling loop.
+    this.platform.onStatusUpdate(this.controller.controller_id, (status) => { void this.updateState(status); });
 
     return true;
-  }
-
-  // Start the state synchronization polling loop. Called by the platform after Matter registration is complete.
-  public startPolling(): void {
-
-    void this.updateStateLoop();
   }
 
   // Configure MQTT services.
@@ -472,17 +467,12 @@ export class HydrawiseMatterController {
     }
   }
 
-  // Synchronization loop.
-  private async updateStateLoop(): Promise<void> {
+  // Synchronization update.
+  private async updateState(status: StatusScheduleResponse): Promise<void> {
 
-    for(;;) {
+    this.status = status;
 
-      const isFirstRun = this.status.nextpoll === -1;
-
-      await retry(async () => this.getStatus(),
-        (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
-
-      // Synchronize each valve (relay) state.
+    // Synchronize each valve (relay) state.
       for(const zone of this.status.relays) {
 
 
@@ -541,37 +531,6 @@ export class HydrawiseMatterController {
 
       // Publish status JSON to MQTT.
       this.platform.mqtt?.publish(this.controller.serial_number, "controller", this.statusJson);
-
-      // Sleep until next check.
-      await sleep((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
-    }
-  }
-
-  // Retrieve current status from Hydrawise.
-  private async getStatus(): Promise<boolean> {
-
-    const response = await this.platform.retrieve("statusschedule.php", {
-
-      controller_id: this.controller.controller_id.toString()
-    });
-
-    if(!response) {
-
-      return false;
-    }
-
-    try {
-
-      this.status = await response.body.json() as StatusScheduleResponse;
-      this.log.debug("Status updated.");
-    } catch(error) {
-
-      this.log.error("Unable to retrieve status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-      return false;
-    }
-
-    return true;
   }
 
   // Send setzone request to Hydrawise.

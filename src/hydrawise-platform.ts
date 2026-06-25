@@ -3,10 +3,10 @@
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
-import type { CustomerDetailsResponse, HydrawiseControllerConfig, StatusScheduleResponse } from "./hydrawise-types.js";
+import type { CustomerDetailsResponse, HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.js";
 import { type Dispatcher, Pool, errors, interceptors, request } from "undici";
-import { FeatureOptions, retry } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
+import { FeatureOptions, retry, sleep } from "homebridge-plugin-utils";
+import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
 import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
 import { MqttClient, type Nullable } from "homebridge-plugin-utils";
 import { APIEvent } from "homebridge";
@@ -29,6 +29,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly hap: HAP;
   public readonly log: Logging;
   public readonly mqtt: Nullable<MqttClient>;
+  private pollingLoops: Set<number>;
+  private statusCallbacks: Map<number, ((status: StatusScheduleResponse) => void)[]>;
 
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
@@ -43,6 +45,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.log = log;
     this.log.debug = this.debug.bind(this);
     this.mqtt = null;
+    this.pollingLoops = new Set();
+    this.statusCallbacks = new Map();
 
     this.config = {
 
@@ -295,10 +299,78 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         }
 
         this.configuredMatterDevices[matterUuid] = controllerDevice;
-        controllerDevice.startPolling();
 
         this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
       }
+    }
+
+    if(!this.pollingLoops.has(controller.controller_id)) {
+
+      this.pollingLoops.add(controller.controller_id);
+      void this.pollingLoop(controller.controller_id, initialStatus);
+    }
+  }
+
+  // Register a callback for status updates for a specific controller.
+  public onStatusUpdate(controllerId: number, callback: (status: StatusScheduleResponse) => void): void {
+
+    if(!this.statusCallbacks.has(controllerId)) {
+
+      this.statusCallbacks.set(controllerId, []);
+    }
+
+    this.statusCallbacks.get(controllerId)!.push(callback);
+  }
+
+  // Centralized polling loop for a physical controller.
+  private async pollingLoop(controllerId: number, initialStatus?: StatusScheduleResponse): Promise<void> {
+
+    let status = initialStatus ?? { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
+    let isFirstPoll = initialStatus === undefined;
+
+    for(;;) {
+
+      if(!isFirstPoll) {
+
+        await retry(async (): Promise<boolean> => {
+
+          const response = await this.retrieve("statusschedule.php", { controller_id: controllerId.toString() });
+
+          if(!response) {
+
+            return false;
+          }
+
+          try {
+
+            status = await response.body.json() as StatusScheduleResponse;
+
+            return true;
+          } catch(error) {
+
+            this.log.error("Unable to retrieve status for controller %s: %s", controllerId.toString(), util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+            return false;
+          }
+        }, (status.nextpoll === -1 ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+      }
+
+      isFirstPoll = false;
+
+      // Dispatch the updated status to all registered controllers (HAP and Matter).
+      const callbacks = this.statusCallbacks.get(controllerId);
+
+      if(callbacks) {
+
+        for(const callback of callbacks) {
+
+          // We intentionally do not await callbacks to ensure they execute independently.
+          void callback(status);
+        }
+      }
+
+      // Sleep until our next polling interval.
+      await sleep((status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
     }
   }
 
