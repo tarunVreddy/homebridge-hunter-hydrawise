@@ -391,8 +391,8 @@ export class HydrawiseController {
           valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
         }
 
-        // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
-        if((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR)) {
+        // Active represents whether the zone is currently on.
+        if(zone.time === 1) {
 
           valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
           this.log.debug("Setting %s as active.", this.getValveName(valveService, zone));
