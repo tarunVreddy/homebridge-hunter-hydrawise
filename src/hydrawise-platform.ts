@@ -358,7 +358,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       }
 
       // Sleep until our next polling interval.
-      await sleep((status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
+      await sleep((status.nextpoll <= 0 ? HYDRAWISE_API_RETRY_INTERVAL : status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
     }
   }
 

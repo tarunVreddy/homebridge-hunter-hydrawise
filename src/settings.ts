@@ -13,7 +13,7 @@ export const HYDRAWISE_API_RETRY_INTERVAL = 60;
 export const HYDRAWISE_API_STARTUP_RETRY_INTERVAL = 10;
 
 // How much, in seconds, jitter should we inject into the API polling interval. This helps ensure we stay clear of the Hydrawise API rate limits.
-export const HYDRAWISE_API_JITTER = 0.2;
+export const HYDRAWISE_API_JITTER = 2.0;
 
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
