@@ -4,7 +4,7 @@
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
 import type { CustomerDetailsResponse, HydrawiseControllerConfig, StatusScheduleResponse } from "./hydrawise-types.js";
-import { type Dispatcher, Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
+import { type Dispatcher, Pool, errors, interceptors, request } from "undici";
 import { FeatureOptions, retry } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
 import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
@@ -452,11 +452,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Cleanup any existing dispatcher we may have.
     void this.dispatcher?.destroy();
 
-    // We want to enable the use of HTTP/2, accept unauthorized SSL certificates and retry a request up to three times.
-    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connect: { rejectUnauthorized: false }, connections: 1 })
+    // We want to enable the use of HTTP/2 and retry a request up to three times.
+    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connections: 1 })
       .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 }));
-
-    setGlobalDispatcher(this.dispatcher);
   }
 
   // Communicate HTTP requests with the Hydrawise API.
@@ -493,7 +491,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     try {
 
       // Execute the API call.
-      response = await request(url, { signal: signal });
+      response = await request(url, { dispatcher: this.dispatcher, signal: signal });
 
       // Bad username and password.
       if(response.statusCode === 404) {
