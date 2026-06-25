@@ -118,43 +118,32 @@ export class HydrawiseMatterController {
 
       this.zoneUuids.set(zone.relay_id, zoneUuid);
 
-      let zoneAccessory = this.platform.matterAccessories.get(zoneUuid);
-      let isNew = false;
+      // We must always construct the full MatterAccessory object because cached accessories
+      // lose their object prototypes (like deviceType.with) during serialization.
+      const zoneAccessory: MatterAccessory = {
 
-      if(!zoneAccessory) {
+        UUID: zoneUuid,
+        displayName: zone.name,
+        deviceType: useSwitch ? matter.deviceTypes.OnOffOutlet : matter.deviceTypes.WaterValve,
+        serialNumber: `${this.controller.serial_number}-${zone.relay_id}`,
+        manufacturer: "Hunter",
+        model: "Hydrawise Zone",
+        firmwareRevision: "2.0.0",
+        hardwareRevision: "1.0.0",
+        context: { serialNumber: this.controller.serial_number, relayId: zone.relay_id, controllerId: this.controller.controller_id, type: "zone" },
+        clusters: useSwitch ? {
 
+          onOff: { onOff: zone.time === 1 }
+        } : {
 
-        isNew = true;
+          valveConfigurationAndControl: {
 
-        zoneAccessory = {
-
-
-          UUID: zoneUuid,
-          displayName: zone.name,
-          deviceType: useSwitch ? matter.deviceTypes.OnOffOutlet : matter.deviceTypes.WaterValve,
-          serialNumber: `${this.controller.serial_number}-${zone.relay_id}`,
-          manufacturer: "Hunter",
-          model: "Hydrawise Zone",
-          firmwareRevision: "2.0.0",
-          hardwareRevision: "1.0.0",
-          context: { serialNumber: this.controller.serial_number, relayId: zone.relay_id, controllerId: this.controller.controller_id, type: "zone" },
-          clusters: useSwitch ? {
-
-
-            onOff: { onOff: zone.time === 1 }
-          } : {
-
-
-            valveConfigurationAndControl: {
-
-
-              currentState: 0,
-              targetState: 0,
-              defaultOpenDuration: 300
-            }
+            currentState: 0,
+            targetState: 0,
+            defaultOpenDuration: 300
           }
-        };
-      }
+        }
+      };
 
       // Bind callback handlers to the zone accessory.
       if(useSwitch) {
@@ -187,49 +176,32 @@ export class HydrawiseMatterController {
 
       this.accessories.set(zoneUuid, zoneAccessory);
       this.allAccessories.push(zoneAccessory);
-
-      if(isNew) {
-
-
-        this.accessoriesToRegister.push(zoneAccessory);
-      }
+      this.accessoriesToRegister.push(zoneAccessory);
     }
 
-    // Configure suspend switch if enabled.
+    // We must always construct the full MatterAccessory object for the suspend switch as well.
     if(this.hasFeature("Device.Suspend")) {
-
 
       const suspendUuid = this.api.matter!.uuid.generate(this.controller.serial_number + "-suspend");
 
       this.suspendUuid = suspendUuid;
 
-      let suspendAccessory = this.platform.matterAccessories.get(suspendUuid);
-      let isNew = false;
+      const suspendAccessory: MatterAccessory = {
 
-      if(!suspendAccessory) {
+        UUID: suspendUuid,
+        displayName: this.controller.name + " Suspend All Zones",
+        deviceType: matter.deviceTypes.OnOffOutlet,
+        serialNumber: `${this.controller.serial_number}-suspend`,
+        manufacturer: "Hunter",
+        model: "Hydrawise Suspend Switch",
+        firmwareRevision: "2.0.0",
+        hardwareRevision: "1.0.0",
+        context: { serialNumber: this.controller.serial_number, controllerId: this.controller.controller_id, type: "suspend" },
+        clusters: {
 
-
-        isNew = true;
-
-        suspendAccessory = {
-
-
-          UUID: suspendUuid,
-          displayName: this.controller.name + " Suspend All Zones",
-          deviceType: matter.deviceTypes.OnOffOutlet,
-          serialNumber: `${this.controller.serial_number}-suspend`,
-          manufacturer: "Hunter",
-          model: "Hydrawise Suspend Switch",
-          firmwareRevision: "2.0.0",
-          hardwareRevision: "1.0.0",
-          context: { serialNumber: this.controller.serial_number, controllerId: this.controller.controller_id, type: "suspend" },
-          clusters: {
-
-
-            onOff: { onOff: this.isAllSuspended }
-          }
-        };
-      }
+          onOff: { onOff: this.isAllSuspended }
+        }
+      };
 
       suspendAccessory.handlers = {
 
@@ -244,12 +216,7 @@ export class HydrawiseMatterController {
 
       this.accessories.set(suspendUuid, suspendAccessory);
       this.allAccessories.push(suspendAccessory);
-
-      if(isNew) {
-
-
-        this.accessoriesToRegister.push(suspendAccessory);
-      }
+      this.accessoriesToRegister.push(suspendAccessory);
     }
 
     // Configure MQTT.
