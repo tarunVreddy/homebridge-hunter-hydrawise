@@ -3,8 +3,8 @@
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
-import { type HomebridgePluginLogging, type Nullable, acquireService, getServiceName, retry, sleep, validService } from "homebridge-plugin-utils";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.js";
+import { type HomebridgePluginLogging, type Nullable, acquireService, getServiceName, validService } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
 import type { Dispatcher } from "undici";
 import type { HydrawiseOptions } from "./hydrawise-options.js";
@@ -27,7 +27,6 @@ export class HydrawiseController {
   public readonly controller: HydrawiseControllerConfig;
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
-  private initialStatusProvided: boolean;
   private isFirstPoll: boolean;
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
@@ -40,7 +39,6 @@ export class HydrawiseController {
     this.accessory = accessory;
     this.api = platform.api;
     this.status = initialStatus ?? { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
-    this.initialStatusProvided = initialStatus !== undefined;
     this.isFirstPoll = true;
     this.config = platform.config;
     this.hap = this.api.hap;
@@ -73,8 +71,8 @@ export class HydrawiseController {
     this.configureSuspendSwitches();
     this.configureMqtt();
 
-    // Kickoff our state updates.
-    void this.updateState();
+    // Register for state updates.
+    this.platform.onStatusUpdate(this.controller.controller_id, (status) => { void this.updateState(status); });
   }
 
   // Configure controller-specific settings.
@@ -243,26 +241,12 @@ export class HydrawiseController {
   }
 
   // Update the irrigation system state from the Hydrawise API to HomeKit.
-  private async updateState(): Promise<void> {
+  private async updateState(status: StatusScheduleResponse): Promise<void> {
 
-    // We loop forever, updating our irrigation system state at regular intervals.
-    for(;;) {
+    this.status = status;
+    const isFirstRun = this.isFirstPoll;
 
-      const isFirstRun = this.isFirstPoll;
-
-      // Skip the initial API call if we've been provided with pre-fetched status data from the platform.
-      if(this.initialStatusProvided) {
-
-        this.initialStatusProvided = false;
-      } else {
-
-        // Update our status. If it's our first run through, we use our internal defaults.
-        // eslint-disable-next-line no-await-in-loop
-        await retry(async () => this.getStatus(),
-          (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
-      }
-
-      // Let's get the list of current valves on this irrigation controller.
+    // Let's get the list of current valves on this irrigation controller.
       const currentValves = this.status.relays.map(x => x.relay_id.toString());
 
       // Remove valves that no longer exist.
@@ -477,11 +461,6 @@ export class HydrawiseController {
 
       // Mark that we've completed the initial poll cycle.
       this.isFirstPoll = false;
-
-      // Sleep until our next polling interval due to the Hydrawise API being rate-limited.
-      // eslint-disable-next-line no-await-in-loop
-      await sleep((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
-    }
   }
 
   // Send a command to the Hydrawise API.
@@ -584,33 +563,6 @@ export class HydrawiseController {
       return "Next run will be " + (zone.timestr.includes(":") ? "at " + this.formatStartTime(zone.timestr) : "on " + zone.timestr) + " for " +
         this.getMinutes(zone.run) + ".";
     }
-  }
-
-  // Retrieve the current status from the Hydrawise API.
-  private async getStatus(): Promise<boolean> {
-
-    // Get our schedule for this controller.
-    // eslint-disable-next-line camelcase
-    const response = await this.platform.retrieve("statusschedule.php", { controller_id: this.controller.controller_id.toString() });
-
-    // Not found, let's retry again.
-    if(!response) {
-
-      return false;
-    }
-
-    try {
-
-      this.status = await response.body.json() as StatusScheduleResponse;
-
-      this.log.debug("Status updated.");
-      this.log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
-    } catch(error) {
-
-      this.log.error("Unable to retrieve the current status of the irrigation controller: --%s--", util.inspect(error, { colors: true, depth: null, sorted: true }));
-    }
-
-    return true;
   }
 
   // Utility to test for whether a zone has been stopped due to a rain sensor.
