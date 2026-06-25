@@ -80,8 +80,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
     api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
 
-      // Immediately bind handlers on cached Matter accessories so they're available before the Hydrawise API responds.
-      this.bindCachedMatterAccessories();
       void this.configureHydrawise();
     });
   }
@@ -287,16 +285,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
           }
         }
 
-        if(allAccessories.length > 0) {
-
-          try {
-
-            await this.api.matter!.updatePlatformAccessories(allAccessories);
-          } catch(error) {
-
-            this.log.error("Failed to update Matter accessory handlers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-          }
-        }
 
         this.configuredMatterDevices[matterUuid] = controllerDevice;
 
@@ -384,82 +372,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     this.accessories.splice(this.accessories.indexOf(accessory), 1);
     this.api.updatePlatformAccessories(this.accessories);
-  }
-
-  // Immediately bind handlers on cached Matter accessories so they're available before the Hydrawise API responds.
-  // This allows Matter/HomeKit to start using devices right away while the Hydrawise API is still being contacted.
-  private bindCachedMatterAccessories(): void {
-
-    if(!this.api.isMatterEnabled?.() || this.matterAccessories.size === 0) {
-
-      return;
-    }
-
-    const cachedAccessories: MatterAccessory[] = [];
-
-    for(const accessory of this.matterAccessories.values()) {
-
-      const context = accessory.context as { serialNumber?: string; relayId?: number; controllerId?: number; type?: string };
-
-      // Skip accessories that don't have the enriched context (e.g. from before this update).
-      const controllerId = context.controllerId;
-      const relayId = context.relayId;
-
-      if(!controllerId) {
-
-        continue;
-      }
-
-      if(context.type === "suspend") {
-
-        accessory.handlers = {
-
-          onOff: {
-
-            off: async (): Promise<void> => this.handleEarlyCommand(controllerId, 0, "resumeall"),
-            on: async (): Promise<void> => this.handleEarlyCommand(controllerId, 0, "suspendall")
-          }
-        };
-      } else if(context.type === "zone" && relayId) {
-
-        const useSwitch = accessory.deviceType === this.api.matter?.deviceTypes.OnOffOutlet;
-
-        if(useSwitch) {
-
-          accessory.handlers = {
-
-            onOff: {
-
-              off: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "stop"),
-              on: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "run")
-            }
-          };
-        } else {
-
-          accessory.handlers = {
-
-            valveConfigurationAndControl: {
-
-              close: async (): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "stop"),
-              open: async (args: unknown): Promise<void> => this.handleEarlyCommand(controllerId, relayId, "run",
-                (args as { openDuration?: number }).openDuration)
-            }
-          };
-        }
-      }
-
-      cachedAccessories.push(accessory);
-    }
-
-    if(cachedAccessories.length > 0 && this.api.matter) {
-
-      void this.api.matter.updatePlatformAccessories(cachedAccessories).catch((error: unknown) => {
-
-        this.log.error("Failed to restore cached Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-      });
-
-      this.log.info("Restored %s cached Matter accessories for immediate availability.", cachedAccessories.length.toString());
-    }
   }
 
   // Handle commands from early-bound Matter accessories before the full controller is configured.
@@ -616,7 +528,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       // We destroyed the pool due to a reset event and our inflight connections are failing.
       if(error instanceof errors.RequestRetryError) {
 
-        this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
+        this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically. Error: %s", error instanceof Error ? error.message : String(error));
 
         return null;
       }
