@@ -24,7 +24,8 @@ export class HydrawiseMatterController {
   private suspendUuid?: string;
 
   private accessoriesToRegister: MatterAccessory[] = [];
-  private allAccessories: MatterAccessory[] = [];
+  private accessoriesToUpdate: MatterAccessory[] = [];
+  private readonly allAccessories: MatterAccessory[] = [];
 
   constructor(platform: HydrawisePlatform, controller: HydrawiseControllerConfig, uuid: string) {
 
@@ -43,11 +44,16 @@ export class HydrawiseMatterController {
     };
   }
 
-  // Retrieve the list of new accessories that need to be registered with the Matter bridge.
+  // Get all accessories that are ready to be registered with the platform.
   public getNewAccessories(): MatterAccessory[] {
 
-
     return this.accessoriesToRegister;
+  }
+
+  // Get all accessories that are ready to be updated with the platform.
+  public getUpdateAccessories(): MatterAccessory[] {
+
+    return this.accessoriesToUpdate;
   }
 
   // Retrieve the list of all accessories (both cached and new) to update handlers.
@@ -107,8 +113,9 @@ export class HydrawiseMatterController {
     const matter = this.api.matter!;
     const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
 
+    this.allAccessories.length = 0;
     this.accessoriesToRegister = [];
-    this.allAccessories = [];
+    this.accessoriesToUpdate = [];
 
     // Configure each discovered relay (zone) as a separate accessory.
     for(const zone of this.status.relays) {
@@ -176,7 +183,13 @@ export class HydrawiseMatterController {
 
       this.accessories.set(zoneUuid, zoneAccessory);
       this.allAccessories.push(zoneAccessory);
-      this.accessoriesToRegister.push(zoneAccessory);
+      
+      const isNew = !this.platform.matterAccessories.has(zoneUuid);
+      if(isNew) {
+        this.accessoriesToRegister.push(zoneAccessory);
+      } else {
+        this.accessoriesToUpdate.push(zoneAccessory);
+      }
     }
 
     // We must always construct the full MatterAccessory object for the suspend switch as well.
@@ -216,7 +229,13 @@ export class HydrawiseMatterController {
 
       this.accessories.set(suspendUuid, suspendAccessory);
       this.allAccessories.push(suspendAccessory);
-      this.accessoriesToRegister.push(suspendAccessory);
+      
+      const isNew = !this.platform.matterAccessories.has(suspendUuid);
+      if(isNew) {
+        this.accessoriesToRegister.push(suspendAccessory);
+      } else {
+        this.accessoriesToUpdate.push(suspendAccessory);
+      }
     }
 
     // Configure MQTT.
