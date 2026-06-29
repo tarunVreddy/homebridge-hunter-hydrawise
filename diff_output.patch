@@ -1,0 +1,331 @@
+diff --git a/src/hydrawise-controller.ts b/src/hydrawise-controller.ts
+index 9034670..398be08 100644
+--- a/src/hydrawise-controller.ts
++++ b/src/hydrawise-controller.ts
+@@ -3,8 +3,8 @@
+  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
+  */
+ import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
+-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
+-import { type HomebridgePluginLogging, type Nullable, acquireService, getServiceName, retry, sleep, validService } from "homebridge-plugin-utils";
++import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.js";
++import { type HomebridgePluginLogging, type Nullable, acquireService, getServiceName, validService } from "homebridge-plugin-utils";
+ import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
+ import type { Dispatcher } from "undici";
+ import type { HydrawiseOptions } from "./hydrawise-options.js";
+@@ -27,7 +27,6 @@ export class HydrawiseController {
+   public readonly controller: HydrawiseControllerConfig;
+   private readonly hap: HAP;
+   private readonly hints: HydrawiseHints;
+-  private initialStatusProvided: boolean;
+   private isFirstPoll: boolean;
+   public readonly log: HomebridgePluginLogging;
+   private readonly platform: HydrawisePlatform;
+@@ -40,7 +39,6 @@ export class HydrawiseController {
+     this.accessory = accessory;
+     this.api = platform.api;
+     this.status = initialStatus ?? { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
+-    this.initialStatusProvided = initialStatus !== undefined;
+     this.isFirstPoll = true;
+     this.config = platform.config;
+     this.hap = this.api.hap;
+@@ -73,8 +71,8 @@ export class HydrawiseController {
+     this.configureSuspendSwitches();
+     this.configureMqtt();
+ 
+-    // Kickoff our state updates.
+-    void this.updateState();
++    // Register for state updates.
++    this.platform.onStatusUpdate(this.controller.controller_id, (status) => { void this.updateState(status); });
+   }
+ 
+   // Configure controller-specific settings.
+@@ -243,26 +241,12 @@ export class HydrawiseController {
+   }
+ 
+   // Update the irrigation system state from the Hydrawise API to HomeKit.
+-  private async updateState(): Promise<void> {
++  private async updateState(status: StatusScheduleResponse): Promise<void> {
+ 
+-    // We loop forever, updating our irrigation system state at regular intervals.
+-    for(;;) {
++    this.status = status;
++    const isFirstRun = this.isFirstPoll;
+ 
+-      const isFirstRun = this.isFirstPoll;
+-
+-      // Skip the initial API call if we've been provided with pre-fetched status data from the platform.
+-      if(this.initialStatusProvided) {
+-
+-        this.initialStatusProvided = false;
+-      } else {
+-
+-        // Update our status. If it's our first run through, we use our internal defaults.
+-        // eslint-disable-next-line no-await-in-loop
+-        await retry(async () => this.getStatus(),
+-          (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+-      }
+-
+-      // Let's get the list of current valves on this irrigation controller.
++    // Let's get the list of current valves on this irrigation controller.
+       const currentValves = this.status.relays.map(x => x.relay_id.toString());
+ 
+       // Remove valves that no longer exist.
+@@ -477,11 +461,6 @@ export class HydrawiseController {
+ 
+       // Mark that we've completed the initial poll cycle.
+       this.isFirstPoll = false;
+-
+-      // Sleep until our next polling interval due to the Hydrawise API being rate-limited.
+-      // eslint-disable-next-line no-await-in-loop
+-      await sleep((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
+-    }
+   }
+ 
+   // Send a command to the Hydrawise API.
+@@ -586,33 +565,6 @@ export class HydrawiseController {
+     }
+   }
+ 
+-  // Retrieve the current status from the Hydrawise API.
+-  private async getStatus(): Promise<boolean> {
+-
+-    // Get our schedule for this controller.
+-    // eslint-disable-next-line camelcase
+-    const response = await this.platform.retrieve("statusschedule.php", { controller_id: this.controller.controller_id.toString() });
+-
+-    // Not found, let's retry again.
+-    if(!response) {
+-
+-      return false;
+-    }
+-
+-    try {
+-
+-      this.status = await response.body.json() as StatusScheduleResponse;
+-
+-      this.log.debug("Status updated.");
+-      this.log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
+-    } catch(error) {
+-
+-      this.log.error("Unable to retrieve the current status of the irrigation controller: --%s--", util.inspect(error, { colors: true, depth: null, sorted: true }));
+-    }
+-
+-    return true;
+-  }
+-
+   // Utility to test for whether a zone has been stopped due to a rain sensor.
+   private isStoppedBySensor(zone: HydrawiseZoneConfig): boolean {
+ 
+diff --git a/src/hydrawise-matter-controller.ts b/src/hydrawise-matter-controller.ts
+index 5cc084b..97d6fd3 100644
+--- a/src/hydrawise-matter-controller.ts
++++ b/src/hydrawise-matter-controller.ts
+@@ -5,8 +5,8 @@
+ import type { API, MatterAccessory } from "homebridge";
+ import type { HydrawisePlatform } from "./hydrawise-platform.js";
+ import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
+-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
+-import { type HomebridgePluginLogging, type Nullable, retry, sleep } from "homebridge-plugin-utils";
++import { HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
++import { type HomebridgePluginLogging, type Nullable, retry } from "homebridge-plugin-utils";
+ import util from "node:util";
+ 
+ export class HydrawiseMatterController {
+@@ -255,17 +255,12 @@ export class HydrawiseMatterController {
+     // Configure MQTT.
+     this.configureMqtt();
+ 
+-    // Note: The state synchronization loop is started externally via startPolling() after Matter registration completes.
++    // Register for state updates from the platform's central polling loop.
++    this.platform.onStatusUpdate(this.controller.controller_id, (status) => { void this.updateState(status); });
+ 
+     return true;
+   }
+ 
+-  // Start the state synchronization polling loop. Called by the platform after Matter registration is complete.
+-  public startPolling(): void {
+-
+-    void this.updateStateLoop();
+-  }
+-
+   // Configure MQTT services.
+   private configureMqtt(): boolean {
+ 
+@@ -472,17 +467,12 @@ export class HydrawiseMatterController {
+     }
+   }
+ 
+-  // Synchronization loop.
+-  private async updateStateLoop(): Promise<void> {
+-
+-    for(;;) {
++  // Synchronization update.
++  private async updateState(status: StatusScheduleResponse): Promise<void> {
+ 
+-      const isFirstRun = this.status.nextpoll === -1;
++    this.status = status;
+ 
+-      await retry(async () => this.getStatus(),
+-        (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+-
+-      // Synchronize each valve (relay) state.
++    // Synchronize each valve (relay) state.
+       for(const zone of this.status.relays) {
+ 
+ 
+@@ -541,37 +531,6 @@ export class HydrawiseMatterController {
+ 
+       // Publish status JSON to MQTT.
+       this.platform.mqtt?.publish(this.controller.serial_number, "controller", this.statusJson);
+-
+-      // Sleep until next check.
+-      await sleep((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
+-    }
+-  }
+-
+-  // Retrieve current status from Hydrawise.
+-  private async getStatus(): Promise<boolean> {
+-
+-    const response = await this.platform.retrieve("statusschedule.php", {
+-
+-      controller_id: this.controller.controller_id.toString()
+-    });
+-
+-    if(!response) {
+-
+-      return false;
+-    }
+-
+-    try {
+-
+-      this.status = await response.body.json() as StatusScheduleResponse;
+-      this.log.debug("Status updated.");
+-    } catch(error) {
+-
+-      this.log.error("Unable to retrieve status: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
+-
+-      return false;
+-    }
+-
+-    return true;
+   }
+ 
+   // Send setzone request to Hydrawise.
+diff --git a/src/hydrawise-platform.ts b/src/hydrawise-platform.ts
+index ed03041..48c0548 100644
+--- a/src/hydrawise-platform.ts
++++ b/src/hydrawise-platform.ts
+@@ -3,10 +3,10 @@
+  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
+  */
+ import type { API, DynamicPlatformPlugin, HAP, Logging, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
+-import type { CustomerDetailsResponse, HydrawiseControllerConfig, StatusScheduleResponse } from "./hydrawise-types.js";
++import type { CustomerDetailsResponse, HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.js";
+ import { type Dispatcher, Pool, errors, interceptors, request } from "undici";
+-import { FeatureOptions, retry } from "homebridge-plugin-utils";
+-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
++import { FeatureOptions, retry, sleep } from "homebridge-plugin-utils";
++import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_STARTUP_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
+ import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
+ import { MqttClient, type Nullable } from "homebridge-plugin-utils";
+ import { APIEvent } from "homebridge";
+@@ -29,6 +29,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
+   public readonly hap: HAP;
+   public readonly log: Logging;
+   public readonly mqtt: Nullable<MqttClient>;
++  private pollingLoops: Set<number>;
++  private statusCallbacks: Map<number, ((status: StatusScheduleResponse) => void)[]>;
+ 
+   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
+ 
+@@ -43,6 +45,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
+     this.log = log;
+     this.log.debug = this.debug.bind(this);
+     this.mqtt = null;
++    this.pollingLoops = new Set();
++    this.statusCallbacks = new Map();
+ 
+     this.config = {
+ 
+@@ -295,11 +299,79 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
+         }
+ 
+         this.configuredMatterDevices[matterUuid] = controllerDevice;
+-        controllerDevice.startPolling();
+ 
+         this.log.info("Configured Matter irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
+       }
+     }
++
++    if(!this.pollingLoops.has(controller.controller_id)) {
++
++      this.pollingLoops.add(controller.controller_id);
++      void this.pollingLoop(controller.controller_id, initialStatus);
++    }
++  }
++
++  // Register a callback for status updates for a specific controller.
++  public onStatusUpdate(controllerId: number, callback: (status: StatusScheduleResponse) => void): void {
++
++    if(!this.statusCallbacks.has(controllerId)) {
++
++      this.statusCallbacks.set(controllerId, []);
++    }
++
++    this.statusCallbacks.get(controllerId)!.push(callback);
++  }
++
++  // Centralized polling loop for a physical controller.
++  private async pollingLoop(controllerId: number, initialStatus?: StatusScheduleResponse): Promise<void> {
++
++    let status = initialStatus ?? { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
++    let isFirstPoll = initialStatus === undefined;
++
++    for(;;) {
++
++      if(!isFirstPoll) {
++
++        await retry(async (): Promise<boolean> => {
++
++          const response = await this.retrieve("statusschedule.php", { controller_id: controllerId.toString() });
++
++          if(!response) {
++
++            return false;
++          }
++
++          try {
++
++            status = await response.body.json() as StatusScheduleResponse;
++
++            return true;
++          } catch(error) {
++
++            this.log.error("Unable to retrieve status for controller %s: %s", controllerId.toString(), util.inspect(error, { colors: true, depth: null, sorted: true }));
++
++            return false;
++          }
++        }, (status.nextpoll === -1 ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
++      }
++
++      isFirstPoll = false;
++
++      // Dispatch the updated status to all registered controllers (HAP and Matter).
++      const callbacks = this.statusCallbacks.get(controllerId);
++
++      if(callbacks) {
++
++        for(const callback of callbacks) {
++
++          // We intentionally do not await callbacks to ensure they execute independently.
++          void callback(status);
++        }
++      }
++
++      // Sleep until our next polling interval.
++      await sleep((status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
++    }
+   }
+ 
+   // Remove the accessory from HomeKit.
