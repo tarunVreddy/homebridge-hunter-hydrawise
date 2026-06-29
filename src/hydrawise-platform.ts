@@ -80,6 +80,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
     api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
 
+      // Register all cached Matter accessories immediately so they don't appear as "new" devices when the bridge starts.
+      if (this.api.isMatterEnabled?.() && this.matterAccessories.size > 0) {
+        try {
+          void this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, Array.from(this.matterAccessories.values()));
+        } catch (error) {
+          this.log.error("Failed to register cached Matter accessories: %s", util.inspect(error, { colors: true }));
+        }
+      }
+
       void this.configureHydrawise();
     });
   }
@@ -265,7 +274,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         }
 
         const newAccessories = controllerDevice.getNewAccessories();
-        const allAccessories = controllerDevice.getAllAccessories();
 
         if(newAccessories.length > 0) {
 
@@ -279,12 +287,21 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
             }
           } catch(error) {
 
-            this.log.error("Failed to register Matter accessories: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-            return;
+            this.log.error("Failed to register Matter accessories for %s: %s", controller.name, util.inspect(error, { colors: true }));
           }
         }
 
+        // Apply updates to cached Matter accessories that we immediately registered at startup.
+        if((controllerDevice as HydrawiseMatterController).getUpdateAccessories) {
+          const updateAccessories = (controllerDevice as HydrawiseMatterController).getUpdateAccessories();
+          if(updateAccessories.length > 0) {
+            try {
+              void this.api.matter!.updatePlatformAccessories(updateAccessories);
+            } catch(error) {
+              this.log.error("Failed to update Matter accessories for %s: %s", controller.name, util.inspect(error, { colors: true }));
+            }
+          }
+        }
 
         this.configuredMatterDevices[matterUuid] = controllerDevice;
 
