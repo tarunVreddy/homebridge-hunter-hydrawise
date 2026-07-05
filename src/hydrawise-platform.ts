@@ -78,12 +78,21 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.log.debug("Debug logging on. Expect a lot of data.");
 
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
-    api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
+    api.on(APIEvent.DID_FINISH_LAUNCHING, async () => {
 
       // Register all cached Matter accessories immediately so they don't appear as "new" devices when the bridge starts.
       if (this.api.isMatterEnabled?.() && this.matterAccessories.size > 0) {
         try {
-          void this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, Array.from(this.matterAccessories.values()));
+          const matter = this.api.matter!;
+          for(const acc of this.matterAccessories.values()) {
+            if (acc.context?.type === "suspend") {
+              acc.deviceType = matter.deviceTypes.OnOffOutlet;
+            } else if (acc.context?.type === "zone") {
+              const useSwitch = this.featureOptions.test("Matter.Valve.AsSwitch", acc.context?.serialNumber);
+              acc.deviceType = useSwitch ? matter.deviceTypes.OnOffOutlet : matter.deviceTypes.WaterValve;
+            }
+          }
+          await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, Array.from(this.matterAccessories.values()));
         } catch (error) {
           this.log.error("Failed to register cached Matter accessories: %s", util.inspect(error, { colors: true }));
         }
