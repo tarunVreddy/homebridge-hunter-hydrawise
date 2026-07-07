@@ -479,29 +479,27 @@ export class HydrawiseMatterController {
 
         const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
 
-        if(useSwitch) {
-
-
-          await this.api.matter!.updateAccessoryState(
-            zoneUuid,
-            "onOff",
-            { onOff: isOn }
-          );
-        } else {
-
-
-          await this.api.matter!.updateAccessoryState(
-            zoneUuid,
-            "valveConfigurationAndControl",
-            {
-
-
-              currentState,
-              openDuration,
-              remainingDuration,
-              targetState
-            }
-          );
+        try {
+          if(useSwitch) {
+            await this.api.matter!.updateAccessoryState(
+              zoneUuid,
+              "onOff",
+              { onOff: isOn }
+            );
+          } else {
+            await this.api.matter!.updateAccessoryState(
+              zoneUuid,
+              "valveConfigurationAndControl",
+              {
+                currentState,
+                openDuration,
+                remainingDuration,
+                targetState
+              }
+            );
+          }
+        } catch (error: any) {
+          this.log.debug(`Failed to update Matter accessory state for ${zone.name}: ${error.message}`);
         }
       }
 
