@@ -27,6 +27,8 @@ export class HydrawiseMatterController {
   private accessoriesToUpdate: MatterAccessory[] = [];
   private readonly allAccessories: MatterAccessory[] = [];
 
+  private registrationReady = false;
+
   constructor(platform: HydrawisePlatform, controller: HydrawiseControllerConfig, uuid: string) {
 
     this.platform = platform;
@@ -61,6 +63,51 @@ export class HydrawiseMatterController {
 
 
     return this.allAccessories;
+  }
+
+  // Wait for Homebridge to finish registering all accessories in the Matter server.
+  public async waitForRegistration(maxWaitMs: number = 10000): Promise<boolean> {
+
+    const startTime = Date.now();
+    const uuids = Array.from(this.zoneUuids.values());
+
+    if(this.suspendUuid) {
+
+      uuids.push(this.suspendUuid);
+    }
+
+    while(Date.now() - startTime < maxWaitMs) {
+
+      try {
+
+        const allReady = uuids.every(uuid => {
+
+          // If getAccessoryInfo is not available (e.g. older homebridge), assume ready after a short delay
+          if(!(this.api.matter as any)?.getAccessoryInfo) {
+
+            return true;
+          }
+
+          const info = (this.api.matter as any).getAccessoryInfo(uuid);
+          return !!info;
+        });
+
+        if(allReady) {
+
+          this.registrationReady = true;
+
+          return true;
+        }
+      } catch {
+        // Not yet available.
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    this.log.warn("Timed out waiting for Matter accessories to register.");
+
+    return false;
   }
 
   // Initialization: Fetches status, registers accessories, and starts loop.
@@ -455,6 +502,12 @@ export class HydrawiseMatterController {
 
   // Synchronization update.
   private async updateState(status: StatusScheduleResponse): Promise<void> {
+
+    if(!this.registrationReady) {
+      
+      this.log.debug("Skipping state update - Matter accessories not yet registered.");
+      return;
+    }
 
     this.status = status;
 
