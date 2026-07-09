@@ -88,14 +88,41 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         this.log.info("Registering %s cached Matter accessories immediately.", this.matterAccessories.size);
         
         const accessoriesToRegister = Array.from(this.matterAccessories.values()).map(acc => {
-          // The deviceType object is serialized in the cache, so we must restore it to the actual
-          // Matter.js device type object before registering, as the server expects it to have methods like .with()
+          let expectedDeviceType;
+          let initialClusters;
+          
           if(acc.deviceType?.name === "OnOffOutlet" || acc.deviceType?.name === "OnOffPlugInUnit") {
-            acc.deviceType = this.api.matter!.deviceTypes.OnOffOutlet;
+            expectedDeviceType = this.api.matter!.deviceTypes.OnOffOutlet;
+            initialClusters = { onOff: { onOff: false } };
           } else if(acc.deviceType?.name === "WaterValve") {
-            acc.deviceType = this.api.matter!.deviceTypes.WaterValve;
+            expectedDeviceType = this.api.matter!.deviceTypes.WaterValve;
+            initialClusters = { valveConfigurationAndControl: { currentState: 0, targetState: 0, defaultOpenDuration: 300 } };
+          } else {
+             expectedDeviceType = this.api.matter!.deviceTypes.OnOffOutlet;
+             initialClusters = { onOff: { onOff: false } };
           }
-          return acc;
+
+          // We construct a brand new, clean MatterAccessory object here.
+          // Cached objects deserialized from JSON contain internal properties (like _parts, _eventEmitter)
+          // that can confuse matter.js's state hashing during a full server reboot.
+          const cleanAcc: any = {
+            UUID: acc.UUID,
+            displayName: acc.displayName,
+            deviceType: expectedDeviceType,
+            serialNumber: acc.serialNumber || "Unknown",
+            manufacturer: acc.manufacturer || "Hunter",
+            model: acc.model || "Hydrawise",
+            firmwareRevision: acc.firmwareRevision,
+            hardwareRevision: acc.hardwareRevision,
+            context: acc.context,
+            clusters: initialClusters,
+            handlers: acc.handlers
+          };
+          
+          // Update the cache map to point to our clean object so future filters work!
+          this.matterAccessories.set(acc.UUID, cleanAcc);
+
+          return cleanAcc;
         });
 
         this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessoriesToRegister);
