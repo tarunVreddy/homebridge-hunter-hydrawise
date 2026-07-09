@@ -1,20 +1,26 @@
 {
-  "name": "homebridge-hunter-hydrawise",
-  "displayName": "Hunter Hydrawise",
+  "name": "homebridge-hunter-hydrawise-matter",
+  "displayName": "Hunter Hydrawise (Matter)",
   "version": "1.3.0-beta.14",
   "description": "HomeKit integration for Hunter Hydrawise Irrigation Controllers.",
   "license": "ISC",
   "author": {
-    "name": "HJD",
-    "url": "https://github.com/hjdhjd"
+    "name": "tarunVreddy",
+    "url": "https://github.com/tarunVreddy"
   },
-  "homepage": "https://github.com/hjdhjd/homebridge-hunter-hydrawise#readme",
+  "contributors": [
+    {
+      "name": "HJD",
+      "url": "https://github.com/hjdhjd"
+    }
+  ],
+  "homepage": "https://github.com/tarunVreddy/homebridge-hunter-hydrawise-matter#readme",
   "repository": {
     "type": "git",
-    "url": "git://github.com/hjdhjd/homebridge-hunter-hydrawise.git"
+    "url": "git://github.com/tarunVreddy/homebridge-hunter-hydrawise-matter.git"
   },
   "bugs": {
-    "url": "https://github.com/hjdhjd/homebridge-hunter-hydrawise/issues"
+    "url": "https://github.com/tarunVreddy/homebridge-hunter-hydrawise-matter/issues"
   },
   "type": "module",
   "engines": {

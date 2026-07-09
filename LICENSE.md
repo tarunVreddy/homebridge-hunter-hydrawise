@@ -1,6 +1,7 @@
 Internet Systems Consortium license
 ===================================
 
+Copyright (c) `2026`, `tarunVreddy https://github.com/tarunVreddy`
 Copyright (c) `2017-2025`, `HJD https://github.com/hjdhjd`
 
 Permission to use, copy, modify, and/or distribute this software for any purpose
