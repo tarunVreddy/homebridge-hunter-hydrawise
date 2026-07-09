@@ -23,8 +23,6 @@ export class HydrawiseMatterController {
   private readonly zoneUuids: Map<number, string> = new Map();
   private suspendUuid?: string;
 
-  private accessoriesToRegister: MatterAccessory[] = [];
-  private accessoriesToUpdate: MatterAccessory[] = [];
   private readonly allAccessories: MatterAccessory[] = [];
 
   private registrationReady = false;
@@ -46,19 +44,7 @@ export class HydrawiseMatterController {
     };
   }
 
-  // Get all accessories that are ready to be registered with the platform.
-  public getNewAccessories(): MatterAccessory[] {
-
-    return this.accessoriesToRegister;
-  }
-
-  // Get all accessories that are ready to be updated with the platform.
-  public getUpdateAccessories(): MatterAccessory[] {
-
-    return this.accessoriesToUpdate;
-  }
-
-  // Retrieve the list of all accessories (both cached and new) to update handlers.
+  // Retrieve the list of all accessories to register.
   public getAllAccessories(): MatterAccessory[] {
 
 
@@ -66,48 +52,18 @@ export class HydrawiseMatterController {
   }
 
   // Wait for Homebridge to finish registering all accessories in the Matter server.
-  public async waitForRegistration(maxWaitMs: number = 10000): Promise<boolean> {
+  // Since registerPlatformAccessories is fire-and-forget for bridged accessories,
+  // we use a timer-based approach as getAccessoryInfo is not exposed on the MatterAPI.
+  public async waitForRegistration(accessoryCount: number, maxWaitMs: number = 15000): Promise<void> {
 
-    const startTime = Date.now();
-    const uuids = Array.from(this.zoneUuids.values());
+    // Scale the wait time based on the number of accessories (each takes ~50ms to register).
+    const estimatedMs = Math.min(Math.max(accessoryCount * 100, 2000), maxWaitMs);
 
-    if(this.suspendUuid) {
+    this.log.debug("Waiting %sms for %s Matter accessories to register.", estimatedMs, accessoryCount);
 
-      uuids.push(this.suspendUuid);
-    }
+    await new Promise(resolve => setTimeout(resolve, estimatedMs));
 
-    while(Date.now() - startTime < maxWaitMs) {
-
-      try {
-
-        const allReady = uuids.every(uuid => {
-
-          // If getAccessoryInfo is not available (e.g. older homebridge), assume ready after a short delay
-          if(!(this.api.matter as any)?.getAccessoryInfo) {
-
-            return true;
-          }
-
-          const info = (this.api.matter as any).getAccessoryInfo(uuid);
-          return !!info;
-        });
-
-        if(allReady) {
-
-          this.registrationReady = true;
-
-          return true;
-        }
-      } catch {
-        // Not yet available.
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-
-    this.log.warn("Timed out waiting for Matter accessories to register.");
-
-    return false;
+    this.registrationReady = true;
   }
 
   // Initialization: Fetches status, registers accessories, and starts loop.
@@ -161,8 +117,6 @@ export class HydrawiseMatterController {
     const useSwitch = this.hasFeature("Matter.Valve.AsSwitch");
 
     this.allAccessories.length = 0;
-    this.accessoriesToRegister = [];
-    this.accessoriesToUpdate = [];
 
     // Configure each discovered relay (zone) as a separate accessory.
     for(const zone of this.status.relays) {
@@ -230,13 +184,6 @@ export class HydrawiseMatterController {
 
       this.accessories.set(zoneUuid, zoneAccessory);
       this.allAccessories.push(zoneAccessory);
-      
-      const isNew = !this.platform.matterAccessories.has(zoneUuid);
-      if(isNew) {
-        this.accessoriesToRegister.push(zoneAccessory);
-      } else {
-        this.accessoriesToUpdate.push(zoneAccessory);
-      }
     }
 
     // We must always construct the full MatterAccessory object for the suspend switch as well.
@@ -276,13 +223,6 @@ export class HydrawiseMatterController {
 
       this.accessories.set(suspendUuid, suspendAccessory);
       this.allAccessories.push(suspendAccessory);
-      
-      const isNew = !this.platform.matterAccessories.has(suspendUuid);
-      if(isNew) {
-        this.accessoriesToRegister.push(suspendAccessory);
-      } else {
-        this.accessoriesToUpdate.push(suspendAccessory);
-      }
     }
 
     // Configure MQTT.

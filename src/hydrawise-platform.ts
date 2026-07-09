@@ -265,15 +265,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
           return;
         }
 
-        const newAccessories = controllerDevice.getNewAccessories();
+        const allAccessories = controllerDevice.getAllAccessories();
 
-        if(newAccessories.length > 0) {
+        if(allAccessories.length > 0) {
 
           try {
 
-            await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessories);
+            // Always register all accessories via registerPlatformAccessories, even cached ones.
+            // Homebridge's AccessoryManager.registerAccessory restores cached state for known UUIDs.
+            // The "update" path (updatePlatformAccessories) requires accessories to already be in
+            // the server's Map from a prior registerPlatformAccessories call in this session.
+            await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, allAccessories);
 
-            for(const acc of newAccessories) {
+            for(const acc of allAccessories) {
 
               this.matterAccessories.set(acc.UUID, acc);
             }
@@ -283,20 +287,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
           }
         }
 
-        // Apply updates to cached Matter accessories that we immediately registered at startup.
-        if((controllerDevice as HydrawiseMatterController).getUpdateAccessories) {
-          const updateAccessories = (controllerDevice as HydrawiseMatterController).getUpdateAccessories();
-          if(updateAccessories.length > 0) {
-            try {
-              void this.api.matter!.updatePlatformAccessories(updateAccessories);
-            } catch(error) {
-              this.log.error("Failed to update Matter accessories for %s: %s", controller.name, util.inspect(error, { colors: true }));
-            }
-          }
-        }
-
-        // Wait for the fire-and-forget registration to actually complete in the background
-        await controllerDevice.waitForRegistration();
+        // Wait for the fire-and-forget registration to actually complete in the background.
+        await controllerDevice.waitForRegistration(allAccessories.length);
 
         this.configuredMatterDevices[matterUuid] = controllerDevice;
 
