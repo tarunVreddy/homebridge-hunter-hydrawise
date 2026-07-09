@@ -277,7 +277,7 @@ export class HydrawiseMatterController {
   }
 
   // Handle command to open (start watering) a zone.
-  private async handleOpen(id: string, duration?: number, isMatterCommand: boolean = false): Promise<void> {
+  public async handleOpen(id: string, duration?: number, isMatterCommand: boolean = false): Promise<void> {
 
     const relayId = this.getRelayId(id);
     const zone = this.status.relays.find(x => x.relay_id === relayId);
@@ -342,7 +342,7 @@ export class HydrawiseMatterController {
   }
 
   // Handle command to close (stop watering) a zone.
-  private async handleClose(id: string, isMatterCommand: boolean = false): Promise<void> {
+  public async handleClose(id: string, isMatterCommand: boolean = false): Promise<void> {
 
     const relayId = this.getRelayId(id);
     const zone = this.status.relays.find(x => x.relay_id === relayId);
@@ -404,7 +404,7 @@ export class HydrawiseMatterController {
   }
 
   // Handle command to suspend/resume watering for all zones.
-  private async handleSuspend(suspend: boolean, isMatterCommand: boolean = false): Promise<void> {
+  public async handleSuspend(suspend: boolean, isMatterCommand: boolean = false): Promise<void> {
 
     this.log.info("%s scheduled watering for all zones.", suspend ? "Suspending" : "Resuming");
 

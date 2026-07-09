@@ -80,6 +80,14 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
     api.on(APIEvent.DID_FINISH_LAUNCHING, async () => {
 
+      // To prevent Alexa from thinking these are "new" devices on every reboot, we MUST
+      // register the cached Matter accessories immediately. If we wait for the Hydrawise API call,
+      // the Matter Server will come online with 0 devices, and when we finally add them,
+      // it triggers a parts list change notification.
+      if(this.api.isMatterEnabled?.() && this.matterAccessories.size > 0) {
+        this.log.info("Registering %s cached Matter accessories immediately.", this.matterAccessories.size);
+        this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, Array.from(this.matterAccessories.values()));
+      }
 
       void this.configureHydrawise();
     });
@@ -97,6 +105,50 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public configureMatterAccessory(accessory: MatterAccessory): void {
 
     this.log.debug("Loading cached Matter accessory: %s", accessory.displayName);
+    
+    // Reattach proxy handlers based on the context so we can register the accessory immediately
+    // during boot before the Hydrawise API call finishes.
+    if(accessory.context) {
+
+      const type = accessory.context.type as string;
+      const controllerId = accessory.context.controllerId as number;
+      const relayId = accessory.context.relayId as number;
+      const matterUuid = this.api.matter?.uuid.generate(controllerId.toString()) || "";
+
+      if(type === "zone" && relayId !== undefined) {
+        const useSwitch = this.featureOptions.test("Matter.Valve.AsSwitch");
+        const expectedTypeName = useSwitch ? "OnOffOutlet" : "WaterValve";
+
+        if(accessory.deviceType?.name !== expectedTypeName) {
+          this.log.info("Device type for %s changed from %s to %s. Discarding cache.", accessory.displayName, accessory.deviceType?.name, expectedTypeName);
+          return;
+        }
+
+        if(useSwitch) {
+          accessory.handlers = {
+            onOff: {
+              on: async () => this.configuredMatterDevices[matterUuid]?.handleOpen(relayId.toString(), undefined, true),
+              off: async () => this.configuredMatterDevices[matterUuid]?.handleClose(relayId.toString(), true)
+            }
+          };
+        } else {
+          accessory.handlers = {
+            valveConfigurationAndControl: {
+              open: async (args: any) => this.configuredMatterDevices[matterUuid]?.handleOpen(relayId.toString(), args?.openDuration, true),
+              close: async () => this.configuredMatterDevices[matterUuid]?.handleClose(relayId.toString(), true)
+            }
+          };
+        }
+      } else if(type === "suspend") {
+        accessory.handlers = {
+          onOff: {
+            on: async () => this.configuredMatterDevices[matterUuid]?.handleSuspend(true, true),
+            off: async () => this.configuredMatterDevices[matterUuid]?.handleSuspend(false, true)
+          }
+        };
+      }
+    }
+
     this.matterAccessories.set(accessory.UUID, accessory);
   }
 
@@ -271,11 +323,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
           try {
 
-            // Always register all accessories via registerPlatformAccessories, even cached ones.
-            // Homebridge's AccessoryManager.registerAccessory restores cached state for known UUIDs.
-            // The "update" path (updatePlatformAccessories) requires accessories to already be in
-            // the server's Map from a prior registerPlatformAccessories call in this session.
-            await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, allAccessories);
+            // We already registered cached accessories synchronously in didFinishLaunching.
+            // So here we ONLY register newly discovered accessories that were not in the cache.
+            // This prevents Alexa from discovering existing devices as "new" on every reboot due to registration delays.
+            const newAccessories = allAccessories.filter(acc => !this.matterAccessories.has(acc.UUID));
+
+            if(newAccessories.length > 0) {
+
+              this.log.info("Registering %s new Matter accessories for %s.", newAccessories.length, controller.name);
+              await this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessories);
+            }
 
             for(const acc of allAccessories) {
 
