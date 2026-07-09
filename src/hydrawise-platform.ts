@@ -86,7 +86,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       // it triggers a parts list change notification.
       if(this.api.isMatterEnabled?.() && this.matterAccessories.size > 0) {
         this.log.info("Registering %s cached Matter accessories immediately.", this.matterAccessories.size);
-        this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, Array.from(this.matterAccessories.values()));
+        
+        const accessoriesToRegister = Array.from(this.matterAccessories.values()).map(acc => {
+          // The deviceType object is serialized in the cache, so we must restore it to the actual
+          // Matter.js device type object before registering, as the server expects it to have methods like .with()
+          if(acc.deviceType?.name === "OnOffOutlet" || acc.deviceType?.name === "OnOffPlugInUnit") {
+            acc.deviceType = this.api.matter!.deviceTypes.OnOffOutlet;
+          } else if(acc.deviceType?.name === "WaterValve") {
+            acc.deviceType = this.api.matter!.deviceTypes.WaterValve;
+          }
+          return acc;
+        });
+
+        this.api.matter!.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessoriesToRegister);
       }
 
       void this.configureHydrawise();
@@ -117,10 +129,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       if(type === "zone" && relayId !== undefined) {
         const useSwitch = this.featureOptions.test("Matter.Valve.AsSwitch");
-        const expectedTypeName = useSwitch ? "OnOffOutlet" : "WaterValve";
+        const expectedTypeNames = useSwitch ? ["OnOffOutlet", "OnOffPlugInUnit"] : ["WaterValve"];
 
-        if(accessory.deviceType?.name !== expectedTypeName) {
-          this.log.info("Device type for %s changed from %s to %s. Discarding cache.", accessory.displayName, accessory.deviceType?.name, expectedTypeName);
+        if(accessory.deviceType?.name && !expectedTypeNames.includes(accessory.deviceType.name)) {
+          this.log.info("Device type for %s changed from %s to %s. Discarding cache.", accessory.displayName, accessory.deviceType?.name, expectedTypeNames[0]);
           return;
         }
 
