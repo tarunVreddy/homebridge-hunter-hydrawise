@@ -6,9 +6,9 @@ import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
+import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.js";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, superviseLoop, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
-import type { HydrawiseOptions } from "./hydrawise-options.js";
 import type { HydrawisePlatform } from "./hydrawise-platform.js";
 import { HydrawiseReservedNames } from "./hydrawise-types.js";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
@@ -17,7 +17,6 @@ import util from "node:util";
 // Device-specific options and settings.
 interface HydrawiseHints {
 
-  logZone: boolean;
   suspendAll: boolean;
 }
 
@@ -35,6 +34,7 @@ export class HydrawiseController {
   private readonly api: API;
   private readonly config: HydrawiseOptions;
   public readonly controller: HydrawiseControllerConfig;
+  private enabledZones: HydrawiseZoneConfig[];
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
   public readonly log: HomebridgePluginLogging;
@@ -48,6 +48,7 @@ export class HydrawiseController {
     this.accessory = accessory;
     this.api = platform.api;
     this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
+    this.enabledZones = [];
     this.config = platform.config;
     this.hap = this.api.hap;
     this.hints = {} as HydrawiseHints;
@@ -82,7 +83,6 @@ export class HydrawiseController {
   // Configure controller-specific settings.
   private configureHints(): boolean {
 
-    this.hints.logZone = this.hasFeature("Log.Zone");
     this.hints.suspendAll = this.hasFeature("Device.Suspend");
 
     return true;
@@ -245,7 +245,7 @@ export class HydrawiseController {
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended);
 
-    this.platform.featureOptions.logFeature("Device.Suspend", "Suspend all zones switch", this.log, this.controller.serial_number);
+    this.platform.featureOptions.logFeature("Device.Suspend", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
 
     return true;
   }
@@ -266,14 +266,19 @@ export class HydrawiseController {
         backoff: (): number => (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) *
           1000, signal });
 
-      // Let's get the list of current valves on this irrigation controller.
-      const currentValves = this.status.relays.map(x => x.relay_id.toString());
-
-      // Remove valves that no longer exist.
-      this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !currentValves.includes(x.subtype ?? "")).map(x => this.accessory.removeService(x));
-
       // Trim whitespace on zone names.
       this.status.relays = this.status.relays.map(x => ({ ...x, name: x.name.trim() }));
+
+      // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
+      // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
+      this.enabledZones = this.status.relays.filter(zone => this.hasZoneFeature("Device", zone.relay_id.toString()));
+
+      // Let's get the list of zones that should have valves on this irrigation controller.
+      const currentValves = this.enabledZones.map(x => x.relay_id.toString());
+
+      // Remove valves for zones that no longer exist or that the user has disabled.
+      this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !currentValves.includes(x.subtype ?? ""))
+        .map(x => this.accessory.removeService(x));
 
       let irrigationRemaining = 0;
 
@@ -281,7 +286,7 @@ export class HydrawiseController {
       const irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
 
       // Discover any new zones and update our zone state.
-      for(const zone of this.status.relays) {
+      for(const zone of this.enabledZones) {
 
         // Acquire the valve service.
         let isNewValve = false;
@@ -388,14 +393,15 @@ export class HydrawiseController {
                 hint.isManual = false;
               }
 
-              // No more manually activated zones, we can resume our schedule.
-              if(![...this.zoneHints.values()].some(x => x.isManual)) {
+              // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state at invocation time so this
+              // handler always acts on the current poll's enabled zones.
+              if(!this.enabledZones.some(x => this.zoneHints.get(x.relay_id)?.isManual)) {
 
                 irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
               }
 
-              // If this was the only zone currently running on the irrigation controller, let's set the system to state to no longer in use.
-              if(!this.status.relays.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
+              // If this was the only enabled zone currently running on the irrigation controller, let's set the system state to no longer in use.
+              if(!this.enabledZones.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
 
                 irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
               }
@@ -446,7 +452,7 @@ export class HydrawiseController {
           this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
 
         // Log our activity, if configured to do so.
-        if(this.hints.logZone) {
+        if(this.hasZoneFeature("Log.Zone", zone.relay_id.toString())) {
 
           // Inform the user if the zone has been started or stopped.
           if(isValveInUse !== hints.isOn) {
@@ -471,24 +477,14 @@ export class HydrawiseController {
         (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
       irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
 
-      // No more manually activated zones, we can resume our schedule.
-      if(![...this.zoneHints.values()].some(x => x.isManual)) {
+      // Update the irrigation system's program mode when no enabled zone is manually running: if every enabled zone is currently stopped by a rain sensor,
+      // no program is scheduled; otherwise we're on our normal scheduled program.
+      const enabledHints = this.enabledZones.map(zone => this.zoneHints.get(zone.relay_id)).filter(hints => hints !== undefined);
 
-        if([...this.zoneHints.values()].filter(x => x.isStopped).length === this.status.relays.length) {
+      if(!enabledHints.some(x => x.isManual)) {
 
-          irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED);
-        } else {
-
-          irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
-        }
-      }
-
-      // Update the irrigation system's program mode if we're not manually running on any zones.
-      if(![...this.zoneHints.values()].some(x => x.isManual)) {
-
-        // If all our zones have been stopped by a rain sensor, we indicate that no program is currently scheduled, otherwise, we're on our normal scheduled program.
         irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
-          ([...this.zoneHints.values()].filter(x => x.isStopped).length === this.status.relays.length) ?
+          (enabledHints.filter(x => x.isStopped).length === this.enabledZones.length) ?
             this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED : this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
       }
 
@@ -666,10 +662,19 @@ export class HydrawiseController {
     return ((hours % 12) || 12).toString() + ":" + minutes.toString().padStart(2, "0") + " " + (hours >= 12 ? "PM" : "AM");
   }
 
-  // Utility for checking feature options on a device.
-  private hasFeature(option: string): boolean {
+  // Utility for checking a controller-scoped feature option. The narrowed option-name union makes a scope-violating call a compile error: only controller-scopable
+  // options can be named here. The serial rides the canonical controller position with the device slot left undefined; the resolved storage key is the flat
+  // option-and-serial string regardless of which slot carries the serial, so controller-scope resolution is stable across that positioning.
+  private hasFeature(option: HydrawiseControllerOption): boolean {
 
-    return this.platform.featureOptions.test(option, this.controller.serial_number);
+    return this.platform.featureOptions.test(option, undefined, this.controller.serial_number);
+  }
+
+  // Utility for checking a zone-scoped feature option. The zone id rides the device position and the serial the controller position, so resolution walks the zone
+  // override, then the controller, then global, then the catalog default. Only zone-scopable options can be named here.
+  private hasZoneFeature(option: HydrawiseZoneOption, zoneId: string): boolean {
+
+    return this.platform.featureOptions.test(option, zoneId, this.controller.serial_number);
   }
 
   // Utility function to get the configured name of a valve, if set.

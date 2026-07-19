@@ -22,10 +22,11 @@ Feature options allow you to enable or disable certain features in this plugin. 
 
 The priority given to these options works in the following order, from highest to lowest priority where settings that are higher in priority will override the ones below:
 
-  * Device options that are enabled or disabled.
+  * Zone options that are enabled or disabled.
+  * Controller options that are enabled or disabled.
   * Global options that are enabled or disabled.
 
-All feature options can be set at any scope level, or at multiple scope levels. If an option isn't applicable to a particular category of device, it is ignored. If you want to override a global feature option you've set, you can override the global feature option for the individual device, if you choose.
+All feature options can be set at any scope level, or at multiple scope levels. If an option isn't applicable to a particular scope, it is ignored. A zone option overrides a controller option, a controller option overrides a global option, and a global option overrides the plugin default. If you want to override a global feature option you've set, you can override it for an individual controller or zone, if you choose.
 
 > [!IMPORTANT]
 > It's strongly recommended that you use the Homebridge webUI](https://github.com/homebridge/homebridge-config-ui-x) to configure this plugin - it's easier to use for most people, and will ensure you always have a valid configuration.**
@@ -41,14 +42,14 @@ Feature options provide a rich mechanism for tailoring your `homebridge-hunter-h
 
 | Option                                         | Description
 |------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Device"></A>`Device`                  | Make this device available in HomeKit. **(default: enabled)**.
-| <A NAME="Device.Suspend"></A>`Device.Suspend`  | Enable a switch accessory to control suspending all zones. **(default: disabled)**.
+| <A NAME="Device"></A>`Device`                  | Make this device available in HomeKit. At the controller scope, this makes the whole controller and all its zones available; at the zone scope, it makes this zone's valve available. **(default: enabled)**. <BR>*Configurable at the whole controller and each zone.*
+| <A NAME="Device.Suspend"></A>`Device.Suspend`  | Enable a switch accessory to control suspending all zones. **(default: disabled)**. <BR>*Configurable at the whole controller.*
 
 #### <A NAME="log"></A>Logging feature options.
 
 | Option                             | Description
 |------------------------------------|-------------------------------------------------------------
-| <A NAME="Log.Zone"></A>`Log.Zone`  | Log zone start and stop events in Homebridge. **(default: enabled)**.
+| <A NAME="Log.Zone"></A>`Log.Zone`  | Log zone start and stop events in Homebridge. **(default: enabled)**. <BR>*Configurable at the whole controller and each zone.*
 
 <!-- FEATURE OPTIONS:END -->
 

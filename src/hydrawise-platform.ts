@@ -173,8 +173,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // See if we already know about this accessory or if it's truly new.
     let accessory = this.accessories.find(x => x.UUID === uuid);
 
-    // Check to see if the user has disabled the device.
-    if(!this.featureOptions.test("Device", controller.controller_id.toString())) {
+    // Check to see if the user has disabled the device. We key the controller-wide Device gate on the serial number in the canonical controller position, with the
+    // device slot left undefined, matching the runtime's hasFeature convention so the whole plugin resolves controller-scope options against one identity.
+    if(!this.featureOptions.test("Device", undefined, controller.serial_number)) {
 
       // If the accessory already exists, let's remove it.
       if(accessory) {
