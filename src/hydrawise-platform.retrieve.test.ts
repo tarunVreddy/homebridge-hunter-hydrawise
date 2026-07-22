@@ -66,19 +66,36 @@ describe("HydrawisePlatform retrieve", () => {
     assert.ok(loggedAt(lines(), "error", "rate limit"), "a 429 should log the rate-limit message");
   });
 
-  test("Bug 1: a 403 reaches the reduced status gate and returns as success", async (t) => {
+  test("a 403 outside the 2xx range classifies as an error and returns null (the bug 1 fix)", async (t) => {
 
-    const { emit, platform } = buildPlatform();
+    const { emit, lines, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
     programStatusReply(dispatcher.agent, "customerdetails.php", 403);
 
-    // The status gate reduces to statusCode < 200, so a 403 - not 404, not 429, not in the interceptor retry list - skips the error branch and retrieve returns
-    // the response as a success (non-null). A corrected gate would classify a 403 as an error and return null; that flip is the distinguishing observable.
+    // The status gate classifies any status outside the 2xx range as an error, so a 403 - not 404, not 429, and not in the serverErrors set - returns null and
+    // logs its raw status code and reason phrase.
     const response = await platform.retrieve("customerdetails.php");
 
-    assert.ok(response, "the reduced gate lets a 403 through as a success response");
+    assert.equal(response, null, "a 403 outside the 2xx range classifies as an error and returns null");
+    assert.ok(loggedAt(lines(), "error", "403"), "a 403 logs its raw status code at error level");
+  });
+
+  test("a 500 in the serverErrors set returns null and logs the temporarily-unavailable message (the bug 1 fix)", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programStatusReply(dispatcher.agent, "customerdetails.php", 500);
+
+    // A 500 is in the serverErrors set, so the classifier takes the temporarily-unavailable arm. The MockAgent answers the raw status directly - it stands in for
+    // the global dispatcher, bypassing the retry interceptor - so the 500 reaches the gate on the first attempt.
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a 500 classifies as an error and returns null");
+    assert.ok(loggedAt(lines(), "error", "temporarily unavailable"), "a serverErrors status logs the temporarily-unavailable message");
   });
 
   test("returns null quietly when the platform signal is already aborted", async () => {

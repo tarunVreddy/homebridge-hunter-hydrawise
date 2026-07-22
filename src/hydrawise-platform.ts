@@ -260,7 +260,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // 500: Internal server error.
     // 502: Bad gateway.
     // 503: Service temporarily unavailable.
-    const serverErrors = new Set([ 400, 404, 429, 500, 502, 503 ]);
+    // 504: Gateway timeout.
+    const serverErrors = new Set([ 400, 404, 429, 500, 502, 503, 504 ]);
 
     let response: Dispatcher.ResponseData<unknown>;
 
@@ -299,8 +300,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         return null;
       }
 
-      // Some other unknown error occurred.
-      if(!(response.statusCode >= 200) && (response.statusCode < 300)) {
+      // Any response outside the 2xx success range is an error. A status the retry interceptor treats as a server-side failure shares the temporarily-unavailable
+      // message once it has survived retries; every other non-2xx status reports its raw code and reason phrase.
+      if((response.statusCode < 200) || (response.statusCode >= 300)) {
 
         this.log.error(serverErrors.has(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
           (STATUS_CODES[response.statusCode] ?? ""));
