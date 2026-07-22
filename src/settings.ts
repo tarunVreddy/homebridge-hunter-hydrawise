@@ -15,6 +15,9 @@ export const HYDRAWISE_API_JITTER = 0.2;
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 
+// The suspend-all duration, in seconds. Hydrawise's suspend-all convention pushes the resume boundary one year into the future; a resume sends the current time.
+export const HYDRAWISE_SUSPEND_DURATION = 31556926;
+
 // Default MQTT topic to use when publishing events. This is in the form of: hydrawise/device/event
 export const HYDRAWISE_MQTT_TOPIC = "hydrawise";
 

@@ -3,7 +3,7 @@
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.ts";
 import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.ts";
@@ -207,8 +207,9 @@ export class HydrawiseController {
 
     service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
 
-      // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation.
-      const timestamp = (Date.now() / 1000) + (value ? 31556926 : 0);
+      // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation. Both floor to a whole second so the
+      // command carries the integer seconds the API expects rather than a fractional millisecond remainder.
+      const timestamp = Math.floor(Date.now() / 1000) + (value ? HYDRAWISE_SUSPEND_DURATION : 0);
 
       const response = await this.sendCommand("suspendall", timestamp);
 

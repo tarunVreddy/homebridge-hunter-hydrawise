@@ -2,7 +2,7 @@
  *
  * hydrawise-controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
  * handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone stops, the
- * command-failure revert, and the suspend / resume commands including the unfloored suspend timestamp pin.
+ * command-failure revert, and the suspend / resume commands including the floored suspend timestamp pin (the bug 14 fix).
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -12,6 +12,7 @@ import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-ty
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./hydrawise-api.fixtures.ts";
 import { firstOf } from "./testing.helpers.ts";
@@ -117,7 +118,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
     assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a failed run should revert the valve to inactive");
   });
 
-  test("Bug 14: the suspend command carries an unfloored fractional timestamp", async (t) => {
+  test("the suspend command floors its timestamp to a whole second (the bug 14 fix)", async (t) => {
 
     const h = buildController({ program: (recorder) => {
 
@@ -134,10 +135,8 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     assert.ok(suspend, "the suspend switch should exist");
 
-    // The production timestamp is (Date.now() / 1000) + 31556926 - the one-year suspend offset added AFTER the unfloored division. Bracket the invocation with
-    // before/after Date.now() reads: the captured custom param must lie inside the bracket, and it must carry a fractional part unless the bracket happens to
-    // straddle an integer. A floored fix (Math.floor(Date.now() / 1000) + offset) yields an integer that falls below the bracket's lower bound.
-    const offset = 31556926;
+    // The production timestamp is Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION - the one-year offset added onto a whole-second floor. We bracket the
+    // invocation with before/after Date.now() reads floored the same way: the captured custom param must be an integer lying inside the floored bracket.
     const before = Date.now();
 
     await suspend.getCharacteristic(Characteristic.On).triggerSet(true);
@@ -150,18 +149,11 @@ describe("HydrawiseController valve and suspend onSet", () => {
     assert.equal(command.params?.["relay_id"], undefined, "a controller-wide suspend carries no relay id");
 
     const custom = Number(command.params?.["custom"]);
-    const low = (before / 1000) + offset;
-    const high = (after / 1000) + offset;
+    const low = Math.floor(before / 1000) + HYDRAWISE_SUSPEND_DURATION;
+    const high = Math.floor(after / 1000) + HYDRAWISE_SUSPEND_DURATION;
 
-    assert.ok((custom >= low) && (custom <= high), "the suspend timestamp should lie in the unfloored before/after bracket");
-
-    // The bracket straddles an integer only when a whole second boundary falls between the two reads; otherwise the unfloored value must be fractional.
-    const bracketAdmitsInteger = Math.floor(high) >= Math.ceil(low);
-
-    if(!bracketAdmitsInteger) {
-
-      assert.notEqual(custom % 1, 0, "the unfloored suspend timestamp carries a fractional part");
-    }
+    assert.ok((custom >= low) && (custom <= high), "the floored suspend timestamp lies in the whole-second before/after bracket");
+    assert.equal(custom % 1, 0, "the suspend timestamp is floored to a whole second");
   });
 
   test("a suspend command rejected by the API reverts the switch and logs the failure", async (t) => {
@@ -234,6 +226,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const custom = Number(command.params?.["custom"]);
 
     assert.equal(command.params?.["action"], "suspendall", "a resume also sends the suspendall action");
-    assert.ok((custom >= (before / 1000)) && (custom <= (after / 1000)), "a resume timestamp is the current time with no one-year offset");
+    assert.ok((custom >= Math.floor(before / 1000)) && (custom <= Math.floor(after / 1000)), "a resume timestamp is the current whole second, no one-year offset");
   });
 });
