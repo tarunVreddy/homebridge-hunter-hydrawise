@@ -1,0 +1,221 @@
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * hydrawise-platform.retrieve.test.ts: The HydrawisePlatform.retrieve() HTTP path, exercised against a REAL platform whose undici traffic is driven through a
+ * MockAgent installed as the global dispatcher after construction. Covers the happy 200, the invalid-key and rate-limit status branches, the bug-1 status gate,
+ * the shutdown-abort short circuit, the connection-error taxonomy, and the bounded timeout branch.
+ *
+ * BUG 11 (platform.ts:246, the Pool's `rejectUnauthorized: false` TLS posture): NO executable pin exists here. The MockAgent swap bypasses the real Pool
+ * entirely, so its TLS connect options never run, and the Pool exposes no reflectable view of them. This defect is therefore a documented characterization note
+ * rather than an assertion - the one pin demoted in this slice.
+ */
+
+// The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
+/* eslint-disable camelcase */
+import { buildPlatform, installMockDispatcher, loggedAt, programJsonReply, programStatusReply } from "./testing/platform.helpers.ts";
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { errors } from "undici";
+
+// APIEvent.SHUTDOWN's string value, the event the platform binds its teardown to. Firing it aborts the shutdown signal and destroys the dispatcher.
+const SHUTDOWN_EVENT = "shutdown";
+
+describe("HydrawisePlatform retrieve", () => {
+
+  test("returns the response on a 200 and answers the parsed body", async (t) => {
+
+    const { emit, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", { controller_id: 500001 });
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.ok(response, "a 200 response should be returned as non-null");
+
+    const body = await response.body.json() as { controller_id: number };
+
+    assert.equal(body.controller_id, 500001, "the parsed body should carry the reply data");
+  });
+
+  test("returns null and logs an invalid-key error on a 404", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a 404 should classify as an error and return null");
+    assert.ok(loggedAt(lines(), "error", "Invalid API key"), "a 404 should log the invalid-key message");
+  });
+
+  test("returns null and logs a rate-limit error on a 429", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programStatusReply(dispatcher.agent, "customerdetails.php", 429);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a 429 should classify as an error and return null");
+    assert.ok(loggedAt(lines(), "error", "rate limit"), "a 429 should log the rate-limit message");
+  });
+
+  test("Bug 1: a 403 reaches the reduced status gate and returns as success", async (t) => {
+
+    const { emit, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programStatusReply(dispatcher.agent, "customerdetails.php", 403);
+
+    // The status gate reduces to statusCode < 200, so a 403 - not 404, not 429, not in the interceptor retry list - skips the error branch and retrieve returns
+    // the response as a success (non-null). A corrected gate would classify a 403 as an error and return null; that flip is the distinguishing observable.
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.ok(response, "the reduced gate lets a 403 through as a success response");
+  });
+
+  test("returns null quietly when the platform signal is already aborted", async () => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", { controller_id: 500001 });
+
+    // Firing shutdown aborts the platform signal, which supersedes every other classification: retrieve returns null and logs nothing.
+    emit(SHUTDOWN_EVENT);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "an aborted platform signal short-circuits retrieve to null");
+    assert.ok(!loggedAt(lines(), "error", "Invalid API key"), "the abort path logs no error");
+  });
+
+  test("returns null on a connection timeout", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(new errors.ConnectTimeoutError());
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a connection timeout should return null");
+    assert.ok(loggedAt(lines(), "error", "Connection timed out"), "a connection timeout should be logged");
+  });
+
+  test("returns null on a request retry error", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // RequestRetryError requires its third constructor argument; omitting it throws in setup as its constructor destructures that headers object.
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(new errors.RequestRetryError("retry exhausted", 500, {}));
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a request retry error should return null");
+    assert.ok(loggedAt(lines(), "error", "Unable to connect to the Hydrawise API"), "a request retry error should be logged");
+  });
+
+  test("classifies a refused connection through the TypeError cause switch", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    const refused = new TypeError("fetch failed");
+
+    refused.cause = { code: "ECONNREFUSED" };
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(refused);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a refused connection should return null");
+    assert.ok(loggedAt(lines(), "error", "Connection refused"), "ECONNREFUSED should log the refused message");
+  });
+
+  test("classifies a reset connection through the TypeError cause switch", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    const reset = new TypeError("fetch failed");
+
+    reset.cause = { code: "ECONNRESET" };
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(reset);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a reset connection should return null");
+    assert.ok(loggedAt(lines(), "error", "Connection has been reset"), "ECONNRESET should log the reset message");
+  });
+
+  test("classifies an unresolved hostname through the TypeError cause switch", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    const notFound = new TypeError("fetch failed");
+
+    notFound.cause = { code: "ENOTFOUND" };
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(notFound);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "an unresolved hostname should return null");
+    assert.ok(loggedAt(lines(), "error", "Hostname or IP address not found"), "ENOTFOUND should log the not-found message");
+  });
+
+  test("logs the raw error for an unrecognized TypeError cause code", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    const other = new TypeError("fetch failed");
+
+    other.cause = { code: "EPIPE", message: "broken pipe" };
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(other);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "an unrecognized cause should still return null");
+    assert.ok(loggedAt(lines(), "error", "EPIPE"), "an unrecognized cause code should be logged verbatim");
+  });
+
+  test("returns null and re-arms networking on the request timeout branch", { timeout: 15000 }, async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // Delay the reply past the 7-second per-request timeout so the composed AbortSignal.timeout fires first, driving the DOMException TimeoutError branch. This is
+    // the one bounded real-wait in the suite; it settles at ~7s, well inside the 15s test timeout.
+    dispatcher.agent.get("https://api.hydrawise.com").intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .reply(200, { controller_id: 500001 }).delay(9000);
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a request that exceeds the timeout budget should return null");
+    assert.ok(loggedAt(lines(), "error", "taking too long"), "the timeout branch should log the slow-response message");
+  });
+});
