@@ -259,8 +259,9 @@ export class HydrawiseController {
 
       const isFirstRun = this.status.nextpoll === -1;
 
-      // Update our status, retrying forever on a network failure at the polling cadence. On the first run we use the fixed retry interval; afterwards we honor the
-      // API's nextpoll hint, clamped so a failure never waits longer than twice the retry interval. A shutdown abort ends the retry through the signal.
+      // Update our status, retrying forever on a network failure or a malformed or mis-shaped body at the polling cadence. On the first run we use the fixed retry
+      // interval; afterwards we honor the API's nextpoll hint, clamped so a failure never waits longer than twice the retry interval. A shutdown abort ends the
+      // retry through the signal.
       // eslint-disable-next-line no-await-in-loop
       await retry(() => this.getStatus(), { attempts: Infinity,
         backoff: (): number => (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) *
@@ -620,21 +621,46 @@ export class HydrawiseController {
 
     try {
 
-      this.status = await response.body.json() as StatusScheduleResponse;
+      // Parse the body into a local and validate its shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast
+      // and crash updateState outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
+      const parsed = await response.body.json();
+
+      if(!this.isStatusSchedule(parsed)) {
+
+        throw new Error("The Hydrawise API returned a status body with an unexpected shape.");
+      }
+
+      this.status = parsed;
 
       this.log.debug("Status updated.");
       this.log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
     } catch(error) {
 
-      // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds without manufacturing a parse-failure error. A genuine parse failure
-      // keeps the stale status and does not throw, so retry treats the poll as complete rather than retrying on a malformed body.
+      // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds without manufacturing a parse-failure error. A genuine parse or
+      // shape failure throws so the retry loop waits and re-polls; the stale status is never republished as fresh.
       if(this.platform.signal.aborted) {
 
         throw error;
       }
 
       this.log.error("Unable to retrieve the current status of the irrigation controller: --%s--", util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+      throw new Error("Unable to retrieve the current status of the irrigation controller.");
     }
+  }
+
+  // Guard that a parsed status body carries the shape updateState relies on: relays and sensors arrays and a numeric nextpoll. A body that fails this check is
+  // treated as a failed poll rather than being adopted as our status.
+  private isStatusSchedule(value: unknown): value is StatusScheduleResponse {
+
+    if((typeof value !== "object") || (value === null)) {
+
+      return false;
+    }
+
+    const candidate = value as Partial<StatusScheduleResponse>;
+
+    return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number");
   }
 
   // Utility to test for whether a zone has been stopped due to a rain sensor.

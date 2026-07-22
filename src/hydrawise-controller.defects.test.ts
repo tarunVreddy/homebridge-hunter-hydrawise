@@ -96,9 +96,9 @@ describe("HydrawiseController updateState defect pins", () => {
       "the retained manual flag suppresses the recompute, leaving the program mode stale");
   });
 
-  test("Bug 10: a malformed poll body leaves the prior status in place, logs the error, and still completes the poll - the update pass runs and the per-poll " +
-    "MQTT publish fires from the stale status", async (t) => {
+  test("a malformed poll body throws so the loop retries and republishes recovered status, not the stale poll (the bug 10 fix)", async (t) => {
 
+    const cleanup = assertNoUnhandledRejections();
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
@@ -111,26 +111,47 @@ describe("HydrawiseController updateState defect pins", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    // The second publish is the malformed poll completing from the stale running status. Once it lands - and before the recovering poll 250ms later flips the
-    // zone to scheduled - a direct HomeKit read confirms this.status stayed the prior poll: the running zone's valve still reports in use.
+    // Poll 1 publishes the running status. The malformed poll throws through getStatus, so the retry loop waits and re-polls rather than republishing; the second
+    // publish is the recovered default (scheduled). We assert at exactly this checkpoint because the distinguishing shape holds only here: the second publish
+    // differs from the stale first, and statusschedule.php has been called three times (poll 1, the malformed attempt, and the recovering retry) before it. A loop
+    // that swallowed the malformed body instead would republish the stale status as the second publish after only two calls, converging by the third publish.
     await waitFor(() => (mqtt.publishes.length >= 2) ? true : undefined);
-
-    const valve = h.accessory.getServiceById(Service.Valve, "700001");
-
-    assert.ok(valve, "the running zone's valve should exist");
-    assert.equal(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE,
-      "after the malformed poll a characteristic read still reflects the prior running poll");
-
-    // The third publish is the recovering default poll (scheduled). Waiting on it confirms the loop kept running past the malformed poll.
-    await waitFor(() => (mqtt.publishes.length >= 3) ? true : undefined);
-
-    assert.ok(loggedAt(h.lines(), "error", "Unable to retrieve the current status"), "a malformed body should log the parse failure");
-    assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "the loop should proceed to a further poll on the stale cadence");
 
     const first = firstOf(mqtt.publishes, "MQTT publish").payload;
 
-    assert.equal(mqtt.publishes[1]?.payload, first, "the malformed poll publishes the stale prior status unchanged");
-    assert.notEqual(mqtt.publishes[2]?.payload, first, "the recovering poll publishes fresh status distinct from the stale one");
+    assert.notEqual(mqtt.publishes[1]?.payload, first, "the malformed poll retries; the second publish is the recovered status, not the stale prior poll");
+    assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the malformed attempt, and the recovering retry all precede the second publish");
+    assert.ok(loggedAt(h.lines(), "error", "Unable to retrieve the current status"), "a malformed body should log the failure");
+
+    cleanup();
+  });
+
+  test("a mis-shaped poll body missing relays throws so the loop retries instead of adopting it (the bug 10 fix)", async (t) => {
+
+    const cleanup = assertNoUnhandledRejections();
+    const h = buildController({ mqtt: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { body: { nextpoll: 5, sensors: [] }, kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.ok(h.mqtt, "the MQTT recorder should be attached");
+    const mqtt = h.mqtt;
+
+    // A valid-JSON body missing relays fails the shape guard and throws through the same path as a parse failure, so the loop retries. The second publish is the
+    // recovered default, reached after three statusschedule.php calls - the same distinguishing shape the malformed-body scenario pins.
+    await waitFor(() => (mqtt.publishes.length >= 2) ? true : undefined);
+
+    const first = firstOf(mqtt.publishes, "MQTT publish").payload;
+
+    assert.notEqual(mqtt.publishes[1]?.payload, first, "the mis-shaped poll retries; the second publish is the recovered status, not the stale prior poll");
+    assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the mis-shaped attempt, and the recovering retry all precede the second publish");
+    assert.ok(loggedAt(h.lines(), "error", "Unable to retrieve the current status"), "a mis-shaped body should log the failure");
+
+    cleanup();
   });
 
   test("all zones suspended aggregates to program-scheduled with the suspend switch on", async (t) => {
