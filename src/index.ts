@@ -2,9 +2,9 @@
  *
  * index.ts: homebridge-hydrawise plugin registration.
  */
-import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.js";
+import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { API } from "homebridge";
-import { HydrawisePlatform } from "./hydrawise-platform.js";
+import { HydrawisePlatform } from "./hydrawise-platform.ts";
 
 // Register our platform with homebridge.
 export default (api: API): void => {

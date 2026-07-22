@@ -3,14 +3,14 @@
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
-import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
-import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.js";
+import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, superviseLoop, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
-import type { HydrawisePlatform } from "./hydrawise-platform.js";
-import { HydrawiseReservedNames } from "./hydrawise-types.js";
+import type { HydrawisePlatform } from "./hydrawise-platform.ts";
+import { HydrawiseReservedNames } from "./hydrawise-types.ts";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
 

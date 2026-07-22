@@ -4,13 +4,13 @@
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, MqttClient, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
-import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.js";
+import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.ts";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
-import { featureOptionCategories, featureOptions } from "./hydrawise-options.js";
+import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
 import type { Dispatcher } from "undici";
-import { HydrawiseController } from "./hydrawise-controller.js";
-import type { HydrawiseOptions } from "./hydrawise-options.js";
+import { HydrawiseController } from "./hydrawise-controller.ts";
+import type { HydrawiseOptions } from "./hydrawise-options.ts";
 import type { Nullable } from "homebridge-plugin-utils";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
