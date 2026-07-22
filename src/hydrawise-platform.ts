@@ -239,11 +239,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return dispatch(opts, handler);
     };
 
-    // Cleanup any existing dispatcher we may have.
+    // Destroy any existing dispatcher before we re-arm. With a single HTTP/2 connection a wedged session carries every in-flight request, so destroy fails them fast
+    // onto the fresh pool through their own retry loops, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
     void this.dispatcher?.destroy();
 
-    // We want to enable the use of HTTP/2, accept unauthorized SSL certificates and retry a request up to three times.
-    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connect: { rejectUnauthorized: false }, connections: 1 })
+    // We want to enable the use of HTTP/2 and retry a request up to three times.
+    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connections: 1 })
       .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 }));
 
     setGlobalDispatcher(this.dispatcher);

@@ -4,9 +4,8 @@
  * MockAgent installed as the global dispatcher after construction. Covers the happy 200, the invalid-key and rate-limit status branches, the bug-1 status gate,
  * the shutdown-abort short circuit, the connection-error taxonomy, and the bounded timeout branch.
  *
- * BUG 11 (platform.ts:246, the Pool's `rejectUnauthorized: false` TLS posture): NO executable pin exists here. The MockAgent swap bypasses the real Pool
- * entirely, so its TLS connect options never run, and the Pool exposes no reflectable view of them. This defect is therefore a documented characterization note
- * rather than an assertion - the one pin demoted in this slice.
+ * The Pool's TLS posture is not observable through this MockAgent swap: the swap stands in for the global dispatcher, so the real Pool's connect options never run
+ * and it exposes no reflectable view of them. The connection's certificate validation therefore has no executable pin here, in either direction.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
