@@ -2,10 +2,11 @@
  *
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
-import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
+import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
-import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
+  StatusScheduleResponse } from "./hydrawise-types.ts";
 import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, superviseLoop, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
@@ -30,7 +31,7 @@ interface HydrawiseZoneHints {
 
 export class HydrawiseController {
 
-  private readonly accessory: PlatformAccessory;
+  private readonly accessory: HydrawiseAccessory;
   private readonly api: API;
   private readonly config: HydrawiseOptions;
   public readonly controller: HydrawiseControllerConfig;
@@ -42,8 +43,9 @@ export class HydrawiseController {
   private status: StatusScheduleResponse;
   private readonly zoneHints: Map<number, HydrawiseZoneHints>;
 
-  // The constructor initializes key variables and calls configureDevice().
-  constructor(platform: HydrawisePlatform, accessory: PlatformAccessory, controller: HydrawiseControllerConfig) {
+  // The constructor initializes key variables and calls configureDevice(). The platform passes the denormalized account roster - every account controller's identity,
+  // enabled or not - so this controller can seed it into its own accessory context, giving any one accessory knowledge of all its siblings.
+  constructor(platform: HydrawisePlatform, accessory: HydrawiseAccessory, controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]) {
 
     this.accessory = accessory;
     this.api = platform.api;
@@ -59,14 +61,23 @@ export class HydrawiseController {
     // Prefix every log line with this controller's live name. The platform's log.debug is already rebound to the platform's debug gate, so debug routing stays intact.
     this.log = prefixedLog(platform.log, (): string => this.name);
 
-    this.configureDevice();
+    this.configureDevice(roster);
   }
 
   // Configure an irrigation system accessory for HomeKit.
-  private configureDevice(): void {
+  private configureDevice(roster: HydrawiseControllerIdentity[]): void {
 
-    // Clean out the context object.
+    // Capture the prior persisted zone roster before we wipe the context. We restore it below so a restart does not blank the zone list during the window between this
+    // configure pass and the first completed poll, when the runtime has not yet rebuilt the roster from a fresh status body.
+    const priorZones = this.accessory.context.zones;
+
+    // Clean out the context object, then reseed the identity rosters this controller owns. The controller is the single writer of accessory context: it seeds its own
+    // identity (the self-identity the webUI's zone lookup keys on) and the denormalized account roster here, and rewrites the zone roster on change from each poll. We
+    // restore the prior zone roster when it is a well-formed array and degrade a malformed prior value to empty, so a corrupt cache entry never crashes the reader.
     this.accessory.context = {};
+    this.accessory.context.controller = { controllerId: this.controller.controller_id, name: this.controller.name, serialNumber: this.controller.serial_number };
+    this.accessory.context.controllers = roster;
+    this.accessory.context.zones = this.isZoneRoster(priorZones) ? priorZones : [];
 
     // Configure ourselves.
     this.configureHints();
@@ -270,6 +281,10 @@ export class HydrawiseController {
 
       // Trim whitespace on zone names.
       this.status.relays = this.status.relays.map(x => ({ ...x, name: x.name.trim() }));
+
+      // Persist the full reported zone roster to the accessory context when it changes. We run this before the enablement projection below so the persisted roster
+      // carries every reported zone, feature-disabled or not - the complete listing the webUI reads back from cache with no cloud call.
+      this.persistZoneRoster();
 
       // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
       // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
@@ -672,6 +687,58 @@ export class HydrawiseController {
     const candidate = value as Partial<StatusScheduleResponse>;
 
     return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number");
+  }
+
+  // Persist the reported zone roster to the accessory context, writing and flushing only when it changed since the last poll. We project every reported zone to the
+  // identity-only shape, naming each field explicitly rather than spreading the wire zone so no volatile schedule field leaks into persisted context, ordered by relay
+  // for a stable comparison. The comparison is field-wise because the projection is a fresh array every poll, so a reference check would differ every time and flush on
+  // every poll; a single flush persists the change to Homebridge's cache so the roster survives an unclean shutdown. A rare single-poll flap that flips a field and
+  // back across two polls costs two flushes, which we accept - roster changes are rare and a flush is cheap.
+  private persistZoneRoster(): void {
+
+    const zones = this.status.relays.map(zone => ({ name: zone.name, relay: zone.relay, relayId: zone.relay_id })).sort((a, b) => a.relay - b.relay);
+
+    // After configureDevice's seed the context always carries a zones array, so the nullish fallback is a defensive floor for a context that predates the seed rather
+    // than an expected path.
+    if(this.sameZoneRoster(this.accessory.context.zones ?? [], zones)) {
+
+      return;
+    }
+
+    this.accessory.context.zones = zones;
+    this.api.updatePlatformAccessories([this.accessory]);
+  }
+
+  // Compare two zone rosters field-wise: equal length and, at every index, equal relay id, relay number, and name. We never compare by reference because the
+  // projection persistZoneRoster builds is a fresh array every poll, so a reference check would always differ and flush needlessly.
+  private sameZoneRoster(previous: HydrawiseZoneIdentity[], next: HydrawiseZoneIdentity[]): boolean {
+
+    if(previous.length !== next.length) {
+
+      return false;
+    }
+
+    // We capture the paired entry and guard it before the field comparison. The equal-length check above guarantees a paired entry exists; the guard narrows the
+    // strict indexed-access `| undefined` so the comparison reads the fields directly, and a defensively-absent entry simply reports the rosters as differing.
+    return previous.every((entry, index) => {
+
+      const other = next[index];
+
+      if(!other) {
+
+        return false;
+      }
+
+      return (entry.relayId === other.relayId) && (entry.relay === other.relay) && (entry.name === other.name);
+    });
+  }
+
+  // Guard that a persisted context value is a well-formed zone roster: an array whose every entry carries the three identity fields with the right types. A malformed
+  // prior value - a non-array, or an entry missing a field - fails this check and degrades to an empty roster, so a corrupt cache entry never crashes the webUI reader.
+  private isZoneRoster(value: unknown): value is HydrawiseZoneIdentity[] {
+
+    return Array.isArray(value) && value.every(entry => (typeof entry === "object") && (entry !== null) && (typeof (entry as HydrawiseZoneIdentity).name === "string") &&
+      (typeof (entry as HydrawiseZoneIdentity).relay === "number") && (typeof (entry as HydrawiseZoneIdentity).relayId === "number"));
   }
 
   // Utility to test for whether a zone has been stopped due to a rain sensor.

@@ -10,13 +10,13 @@
  */
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import type { HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../hydrawise-options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
 import { FeatureOptions } from "homebridge-plugin-utils";
 import { HydrawiseController } from "../hydrawise-controller.ts";
-import type { HydrawiseControllerConfig } from "../hydrawise-types.ts";
 import type { HydrawiseOptions } from "../hydrawise-options.ts";
 import { HydrawisePlatform } from "../hydrawise-platform.ts";
 import { capturingLog } from "../testing.helpers.ts";
@@ -217,10 +217,10 @@ interface TestHap {
 const testHap: TestHap = { Characteristic, Service, uuid: { generate: (data: string): string => data } };
 
 // The platform double's read surface, as the controller and its configure chain consume it. The construction-boundary cast to HydrawisePlatform happens in
-// buildController.
+// buildController. The api carries updatePlatformAccessories because the controller flushes its persisted zone roster through it; the double records each flush.
 export interface TestPlatform {
 
-  api: { hap: TestHap };
+  api: { hap: TestHap; updatePlatformAccessories: (accessories: TestAccessory[]) => void };
   config: HydrawiseOptions;
   featureOptions: FeatureOptions;
   hap: TestHap;
@@ -240,10 +240,12 @@ export interface MakeTestPlatformOptions {
   userOptions?: string[];
 }
 
-// The handles makeTestPlatform returns: the platform double plus the doubles and capture buffers a test asserts against and the lever to abort a live signal.
+// The handles makeTestPlatform returns: the platform double plus the doubles and capture buffers a test asserts against and the lever to abort a live signal. The
+// flushes buffer records every updatePlatformAccessories call the controller makes, so a test asserts on the zone-roster flush cadence.
 export interface MakeTestPlatformResult {
 
   abort: (reason?: string) => void;
+  flushes: TestAccessory[][];
   lines: () => CapturedLogLine[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
@@ -268,6 +270,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
   const mqtt = options.mqtt ? new TestMqttClient() : null;
   const retrieve = new RetrieveRecorder();
+  const flushes: TestAccessory[][] = [];
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
   const config: HydrawiseOptions = {
 
@@ -280,7 +283,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
   const platform: TestPlatform = {
 
-    api: { hap: testHap },
+    api: { hap: testHap, updatePlatformAccessories: (accessories: TestAccessory[]): void => { flushes.push(accessories); } },
     config,
     featureOptions: featureOpts,
     hap: testHap,
@@ -290,7 +293,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     signal: signalController.signal
   };
 
-  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), lines, mqtt, platform, retrieve, signalController };
+  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, retrieve, signalController };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -301,6 +304,14 @@ export interface BuildControllerOptions extends MakeTestPlatformOptions {
   // Program the retrieve recorder before the controller is constructed. The controller's polling loop issues its first retrieve synchronously during
   // construction, so a live-loop test must seed the recorder here rather than after buildController returns, or that first poll consumes the empty program.
   program?: (recorder: RetrieveRecorder) => void;
+
+  // The denormalized account roster the platform would pass into the controller constructor. Defaults to a single-entry roster derived from the controller config,
+  // so a test that does not care about siblings gets a sensible self-only roster; a multi-controller test supplies its own.
+  roster?: HydrawiseControllerIdentity[];
+
+  // Seed the accessory context before construction, as Homebridge does when it restores a cached accessory. Runs before the controller constructs, so a test can
+  // prove configureDevice's wipe-then-seed preserves (or shape-degrades) a prior persisted zone roster.
+  seedContext?: (accessory: TestAccessory) => void;
 }
 
 // The handles buildController returns: the constructed production controller plus the underlying doubles and capture buffers a test asserts against.
@@ -321,13 +332,18 @@ export function buildController(options: BuildControllerOptions = {}): BuildCont
   const platformResult = makeTestPlatform(options);
   const controllerConfig: HydrawiseControllerConfig = { ...syntheticController, ...options.controller };
   const accessory = makeTestAccessory(controllerConfig.name, testHap.uuid.generate(controllerConfig.controller_id.toString()));
+  const roster: HydrawiseControllerIdentity[] = options.roster ?? [{ controllerId: controllerConfig.controller_id, name: controllerConfig.name,
+    serialNumber: controllerConfig.serial_number }];
+
+  // Seed the accessory context before construction, as Homebridge restores a cached accessory ahead of configure, so a test can drive the preservation path.
+  options.seedContext?.(accessory);
 
   // Seed the recorder before construction, because the controller's polling loop issues its first retrieve synchronously as the constructor runs.
   options.program?.(platformResult.retrieve);
 
   // The construction-boundary casts (platform, accessory) bridge the doubles to the production constructor's parameter types - the only casts a controller test needs.
   const controller = new HydrawiseController(platformResult.platform as unknown as ConstructorParameters<typeof HydrawiseController>[0],
-    accessory as unknown as ConstructorParameters<typeof HydrawiseController>[1], controllerConfig);
+    accessory as unknown as ConstructorParameters<typeof HydrawiseController>[1], controllerConfig, roster);
 
   return { accessory, controller, controllerConfig, ...platformResult };
 }

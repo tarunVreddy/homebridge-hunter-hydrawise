@@ -2,6 +2,8 @@
  *
  * hydrawise-types.ts: Interface and type definitions for Hydrawise.
  */
+import type { PlatformAccessory } from "homebridge";
+
 // HBHH reserved names.
 export const HydrawiseReservedNames = {
 
@@ -81,3 +83,41 @@ export interface SetZoneResponse {
   message: string;
   message_type: "error" | "info";
 }
+
+// The persisted identity of a single irrigation controller. This is the denormalized, wire-independent shape the runtime writes into the accessory context and the
+// webUI reads back from the accessory cache and the /refreshControllers response, so a stopped plugin's controller list stays answerable without any cloud call. It
+// carries only the three identity fields the webUI needs to list, scope, and refresh a controller - never any volatile status.
+export interface HydrawiseControllerIdentity {
+
+  controllerId: number;
+  name: string;
+  serialNumber: string;
+}
+
+// The persisted identity of a single irrigation zone, written into the accessory context on change and read back by the webUI's zone list. Like the controller
+// identity above it carries only the stable fields a zone listing needs - the relay display index, the relay id the runtime scopes zone options against, and the
+// display name - and never the volatile schedule state the wire zone also carries.
+export interface HydrawiseZoneIdentity {
+
+  name: string;
+  relay: number;
+  relayId: number;
+}
+
+/* The typed HomeKit accessory context this plugin persists on every controller accessory. Homebridge round-trips this object verbatim through its on-disk cache, so
+ * it holds only plain, JSON-serializable identity data the webUI can read back with zero cloud calls: the owning controller's own identity (the self-identity the
+ * webUI's zone lookup keys on), the denormalized account roster (every account controller, enabled or not, so any one accessory knows all its siblings), and the
+ * owning controller's zone roster. Every field is optional because this is the honest boundary type: an accessory restored from a pre-roster cache carries none of
+ * them, and the runtime seeds them on the first configure pass before any reader relies on them.
+ */
+export interface HydrawiseAccessoryContext {
+
+  controller?: HydrawiseControllerIdentity;
+  controllers?: HydrawiseControllerIdentity[];
+  zones?: HydrawiseZoneIdentity[];
+}
+
+// A Hydrawise controller accessory: a Homebridge PlatformAccessory whose context is our typed HydrawiseAccessoryContext. This alias is the single name threaded
+// through every accessory field, parameter, and creation site, so the context contract lives in exactly one place. Because every context field is optional the alias
+// stays assignable both ways with the platform's bare PlatformAccessory (the wide UnknownContext) without a cast at the construction and configure boundaries.
+export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;

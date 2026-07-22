@@ -4,7 +4,8 @@
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, MqttClient, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
-import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.ts";
+import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig,
+  HydrawiseControllerIdentity } from "./hydrawise-types.ts";
 import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
@@ -17,7 +18,7 @@ import util from "node:util";
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
-  private readonly accessories: PlatformAccessory[];
+  private readonly accessories: HydrawiseAccessory[];
   private account: CustomerDetailsResponse;
   public readonly api: API;
   private dispatcher?: Dispatcher;
@@ -105,7 +106,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   // This gets called when homebridge restores cached accessories at startup. We intentionally avoid doing anything significant here, and save all that logic for
   // Hydrawise API enumeration.
-  public configureAccessory(accessory: PlatformAccessory): void {
+  public configureAccessory(accessory: HydrawiseAccessory): void {
 
     // Add this to the accessory array so we can track it.
     this.accessories.push(accessory);
@@ -152,11 +153,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Trim whitespace on irrigation controller names.
     this.account.controllers = this.account.controllers.map(x => ({ ...x, name: x.name.trim() }));
 
+    // Map the trimmed account to the persisted controller-identity shape once, so every controller we configure seeds the same denormalized roster into its accessory
+    // context - each accessory then knows every sibling, enabled or not, which is what lets the webUI list the whole account from any one accessory with no cloud call.
+    const roster: HydrawiseControllerIdentity[] = this.account.controllers.map(controller => ({ controllerId: controller.controller_id, name: controller.name,
+      serialNumber: controller.serial_number }));
+
     for(const controller of this.account.controllers) {
 
       this.log.info("Discovered irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-      this.configureController(controller);
+      this.configureController(controller, roster);
     }
 
     // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
@@ -164,8 +170,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       .map(accessory => this.removeAccessory(accessory));
   }
 
-  // Configure a discovered irrigation controller.
-  private configureController(controller: HydrawiseControllerConfig): Nullable<HydrawiseController> {
+  // Configure a discovered irrigation controller. The account roster is threaded through to the controller so it can seed its accessory context with every sibling's
+  // identity.
+  private configureController(controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]): Nullable<HydrawiseController> {
 
     // Generate this controller's unique identifier.
     const uuid = this.hap.uuid.generate(controller.controller_id.toString());
@@ -196,7 +203,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // It's a new device - let's add it to HomeKit.
     if(!accessory) {
 
-      accessory = new this.api.platformAccessory(controller.name, uuid);
+      accessory = new this.api.platformAccessory<HydrawiseAccessoryContext>(controller.name, uuid);
 
       // Register this accessory with Homebridge and add it to the accessory array so we can track it.
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
@@ -206,8 +213,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Inform the user.
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-    // Add it to our list of configured devices.
-    this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller);
+    // Add it to our list of configured devices. The controller seeds its accessory context during construction; the flush just below persists that seed.
+    this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller, roster);
 
     // Refresh the accessory cache.
     this.api.updatePlatformAccessories([accessory]);
