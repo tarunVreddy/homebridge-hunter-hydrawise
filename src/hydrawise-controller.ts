@@ -275,11 +275,21 @@ export class HydrawiseController {
       // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
       this.enabledZones = this.status.relays.filter(zone => this.hasZoneFeature("Device", zone.relay_id.toString()));
 
-      // Let's get the list of zones that should have valves on this irrigation controller.
-      const currentValves = this.enabledZones.map(x => x.relay_id.toString());
+      // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive both prunes from it. The hints map tracks
+      // only zones in the current poll's enabled projection, so a zone that vanishes and later reappears starts fresh instead of resurrecting its old manual and
+      // rain-stopped flags.
+      const liveZoneIds = new Set(this.enabledZones.map(zone => zone.relay_id.toString()));
+
+      for(const relayId of this.zoneHints.keys()) {
+
+        if(!liveZoneIds.has(relayId.toString())) {
+
+          this.zoneHints.delete(relayId);
+        }
+      }
 
       // Remove valves for zones that no longer exist or that the user has disabled.
-      this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !currentValves.includes(x.subtype ?? ""))
+      this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !liveZoneIds.has(x.subtype ?? ""))
         .map(x => this.accessory.removeService(x));
 
       let irrigationRemaining = 0;

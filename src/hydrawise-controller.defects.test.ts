@@ -56,8 +56,8 @@ describe("HydrawiseController updateState defect pins", () => {
       "the empty enabled domain aggregates to no program scheduled");
   });
 
-  test("Bug 15: a zone manually started, vanished, then reappearing while still running keeps the retained manual flag, so the program mode stays the stale " +
-    "no-program-scheduled while the valve reports in use", async (t) => {
+  test("a zone manually started, vanished, then reappearing while still running starts fresh, so the program mode recomputes to scheduled while the valve " +
+    "reports in use (the bug 15 fix)", async (t) => {
 
     const h = buildController({ program: (recorder) => {
 
@@ -77,8 +77,8 @@ describe("HydrawiseController updateState defect pins", () => {
     assert.ok(firstValve, "the zone valve should exist after the first poll");
     await firstValve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
 
-    // Poll 2 drops the zone (valve pruned; the empty domain recomputes the program mode to no-program-scheduled), and the retained hint entry survives that
-    // pruning. The default poll brings the zone back still running.
+    // Poll 2 drops the zone (valve pruned; the empty domain recomputes the program mode to no-program-scheduled), and the prune drops the zone's hint entry with
+    // it. The default poll brings the zone back still running.
     await waitFor(() => (h.accessory.getServiceById(Service.Valve, "700001") === undefined) ? true : undefined);
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
 
@@ -88,12 +88,11 @@ describe("HydrawiseController updateState defect pins", () => {
     assert.ok(reappeared, "the zone valve should reappear");
     assert.ok(irrigation, "the irrigation system service should exist");
 
-    // The reappeared entry kept isManual true (the running-zone branch skips the manual clear), so the aggregate guard suppresses the program-mode recompute and
-    // it remains the stale no-program-scheduled from the vanish poll, even as the valve reports in use. A pruning fix would create a fresh non-manual entry, the
-    // guard would fire, and the program mode would recompute to program-scheduled.
+    // The reappeared entry starts fresh with isManual false - the prune dropped the stale entry when the zone vanished - so the aggregate guard fires and
+    // recomputes: one running, non-rain-stopped zone selects program-scheduled, even as the valve reports in use.
     await waitFor(() => (reappeared.getCharacteristic(Characteristic.InUse).value === Characteristic.InUse.IN_USE) ? true : undefined);
-    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED,
-      "the retained manual flag suppresses the recompute, leaving the program mode stale");
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "the fresh entry lets the aggregate recompute to program-scheduled");
   });
 
   test("a malformed poll body throws so the loop retries and republishes recovered status, not the stale poll (the bug 10 fix)", async (t) => {
