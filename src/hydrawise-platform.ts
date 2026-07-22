@@ -391,12 +391,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     }
   }
 
-  // Utility for debug logging.
+  // Utility for debug logging. We route this through log.warn rather than log.debug so that plugin-level debug output stays visible regardless of whether
+  // Homebridge itself is run with its own debug flag, which is what gates log.debug.
   public debug(message: string, ...parameters: unknown[]): void {
 
     if(this.config.debug) {
 
-      this.log.error(util.format(message, ...parameters));
+      this.log.warn(util.format(message, ...parameters));
     }
   }
 }

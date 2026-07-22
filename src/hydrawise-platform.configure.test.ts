@@ -158,24 +158,24 @@ describe("HydrawisePlatform configure", () => {
     assert.ok(loggedAt(lines(), "error", "no Hunter Hydrawise API key"), "the missing key should be reported");
   });
 
-  test("Bug 2: debug output routes through log.error when debug is enabled", (t) => {
+  test("debug output routes through log.warn when debug is enabled (the bug 2 fix)", (t) => {
 
     const { emit, lines } = buildPlatform({ debug: true });
 
     t.after(() => emit(SHUTDOWN));
 
     // The constructor reassigns log.debug to the platform's debug method and immediately logs the debug banner; with debug enabled that method emits through
-    // log.error, so the banner surfaces at error level in the capture.
-    assert.ok(loggedAt(lines(), "error", "Debug logging on. Expect a lot of data."), "an enabled debug gate routes debug output to error level");
+    // log.warn, so the banner surfaces at warning level in the capture.
+    assert.ok(loggedAt(lines(), "warn", "Debug logging on. Expect a lot of data."), "an enabled debug gate routes debug output to warning level");
   });
 
-  test("Bug 2: debug output is suppressed when debug is disabled", (t) => {
+  test("debug output is suppressed when debug is disabled", (t) => {
 
     const { emit, lines } = buildPlatform({ debug: false });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.ok(!loggedAt(lines(), "error", "Debug logging on. Expect a lot of data."), "a disabled debug gate emits nothing");
+    assert.ok(!loggedAt(lines(), "warn", "Debug logging on. Expect a lot of data."), "a disabled debug gate emits nothing");
   });
 
   test("constructs an MQTT client for a valid broker URL", (t) => {
