@@ -19,6 +19,10 @@ const DEVICE_OPTION_KEY = expandOption(DEVICE_CATEGORY, "").toLowerCase();
 // The two floor-entry prefixes the Device option can carry: an explicit enable or an explicit disable of a whole controller.
 const DEVICE_FLOOR_PREFIXES = [ "disable." + DEVICE_OPTION_KEY + ".", "enable." + DEVICE_OPTION_KEY + "." ];
 
+// The canonical option name of the zone-scoped name override, derived through the engine's own grammar for the same reason the floor key is: a rename of the
+// option cannot silently break the lookup.
+const ZONE_NAME_OPTION = expandOption(DEVICE_CATEGORY, "Name");
+
 // The guidance sentences the controller notice states render through the infoPanel. Complete sentences, shown verbatim to the user.
 const NOTICE_DISABLED = "This controller is disabled in your Homebridge configuration, so its zones are not listed. " +
   "Use the Refresh from Hydrawise button above the controller list to retrieve them.";
@@ -80,14 +84,19 @@ const getCatalog = () => {
   return catalogPromise;
 };
 
-// Ask the feature-option engine whether the runtime publishes a controller, using the runtime's exact gate call so the webUI and the plugin cannot disagree
-// about a controller's enabled state. The engine is rebuilt per call because the configured options change underneath us as the user edits them.
-const isControllerEnabled = async (config, serialNumber) => {
+// Build the feature-option engine over the cached catalog and the user's configured options. The engine is rebuilt per call because the configured options change
+// underneath us as the user edits them, so an edit the user just saved is reflected the next time we ask. Every consult in this file resolves through here, which
+// is what keeps the enable-state oracle and the zone-name lookup answering from one engine rather than two.
+const getEngine = async (config) => {
 
   const { categories, options } = await getCatalog();
 
-  return new FeatureOptions(categories, options, config?.options ?? []).test(DEVICE_CATEGORY, undefined, serialNumber);
+  return new FeatureOptions(categories, options, config?.options ?? []);
 };
+
+// Ask the feature-option engine whether the runtime publishes a controller, using the runtime's exact gate call so the webUI and the plugin cannot disagree
+// about a controller's enabled state.
+const isControllerEnabled = async (config, serialNumber) => (await getEngine(config)).test(DEVICE_CATEGORY, undefined, serialNumber);
 
 // Case-fold a serial for cross-source identity comparison, matching the runtime feature-option engine's serial lowercasing so the webUI and the plugin agree on a
 // controller's identity.
@@ -109,8 +118,9 @@ const isZoneIdentity = (value) => (typeof value === "object") && (value !== null
  *
  * excludedNames carries the lowercased Device-category option names the catalog declares, and any candidate id it names is dropped. Such an entry is that option's
  * global-scope entry - the raw-tail lookup key the engine's own config index stores for it - rather than a Device-scoped serial, so honoring the exclusion is what
- * keeps this scan and the engine agreeing on what an entry means. We slice the original entry, not the lowercased copy, so a mixed-case serial keeps its display
- * casing.
+ * keeps this scan and the engine agreeing on what an entry means. A candidate carrying an "=" is dropped for the same reason: the character is the value grammar's
+ * payload delimiter, so such a tail is a value-centric option's entry rather than a serial, and no Hydrawise serial contains one. We slice the original entry, not
+ * the lowercased copy, so a mixed-case serial keeps its display casing.
  */
 const floorSerials = (options, excludedNames) => {
 
@@ -139,7 +149,7 @@ const floorSerials = (options, excludedNames) => {
 
       const id = entry.slice(prefix.length);
 
-      if(id.length && !id.includes(".") && !excludedNames.has(id.toLowerCase())) {
+      if(id.length && !id.includes(".") && !id.includes("=") && !excludedNames.has(id.toLowerCase())) {
 
         serials.push(id);
       }
@@ -254,6 +264,34 @@ const firstRunOnSubmit = async ({ commit }) => {
 
 // The controller-as-device pseudo-entry is tagged "controller"; every other entry the server returns is a zone.
 const isController = (device) => device.kind === "controller";
+
+/* The name HomeKit last showed for a zone's valve, read from the matched cached accessory's serialized services. The valve is located the way the framework's own
+ * cache reader locates a service - by the constructor name Homebridge serializes alongside it - narrowed by the subtype the runtime keys each valve on, which is
+ * the zone's relay id.
+ *
+ * This is the LAST-FLUSHED name, not a live mirror: Homebridge rewrites the accessory cache when an accessory is registered, updated, or unregistered, never on a
+ * bare characteristic write. With name synchronization at its default the plugin keeps each valve at its effective name, so this tracks that name closely; where a
+ * user has opted out of synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name
+ * HomeKit shows the user and so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
+ */
+const cachedValveName = (accessory, relayId) => {
+
+  const service = accessory?.services?.find((entry) => (entry?.constructorName === "Valve") && (entry?.subtype === relayId.toString()));
+
+  if(!Array.isArray(service?.characteristics)) {
+
+    return undefined;
+  }
+
+  const nameValue = (constructorName) => {
+
+    const value = service.characteristics.find((characteristic) => characteristic?.constructorName === constructorName)?.value;
+
+    return ((typeof value === "string") && value.length) ? value : undefined;
+  };
+
+  return nameValue("ConfiguredName") ?? nameValue("Name");
+};
 
 /* Return the account's irrigation controllers for the two-level sidebar, with zero automatic cloud calls. We merge three sources into the session roster and return
  * it: (a) the denormalized controller roster every cached accessory carries in its context - any one accessory knows every sibling, enabled or not; (b) the config
@@ -430,22 +468,58 @@ const getDevices = async (controller, { config } = {}) => {
     }
   }
 
-  // A disabled controller can still list zones (a refresh stored them, or its accessory survives until the next restart), so the listing carries the
-  // disabled notice alongside the zone count. The consult is best-effort: a catalog failure must never break a healthy listing, so it reads as enabled.
-  const enabled = await isControllerEnabled(config, controller.serialNumber).catch(() => true);
+  /* One consult answers both questions this listing asks of the configuration: whether the controller is published, and what name the user has set for each zone.
+   * A disabled controller can still list zones (a refresh stored them, or its accessory survives until the next restart), so the listing carries the disabled
+   * notice alongside the zone count. The whole consult is best-effort and all-or-nothing: a catalog or engine failure is treated as no consult at all - the
+   * controller reads as enabled and every zone label falls through to the arms below - so a failure can never break a healthy listing, and the two consumers
+   * cannot end up disagreeing about whether the engine answered.
+   */
+  let enabled = true;
+  const overrides = new Map();
 
-  // The zone rows, sorted by relay, keyed by the relay id the runtime scopes zone options against; then the controller-as-device pseudo-entry the two-level sidebar
-  // selects on load, hidden from the zone list and reporting the zone count.
-  const zoneRows = zones.slice().sort((a, b) => a.relay - b.relay).map((zone) => ({ kind: "zone", name: zone.name, relay: zone.relay, relayId: zone.relayId,
-    serialNumber: zone.relayId.toString() }));
+  try {
+
+    const engine = await getEngine(config);
+
+    enabled = engine.test(DEVICE_CATEGORY, undefined, controller.serialNumber);
+
+    for(const zone of zones) {
+
+      const override = engine.value(ZONE_NAME_OPTION, zone.relayId.toString(), controller.serialNumber);
+
+      if((typeof override === "string") && override.trim().length) {
+
+        overrides.set(zone.relayId, override.trim());
+      }
+    }
+  } catch {
+
+    enabled = true;
+    overrides.clear();
+  }
+
+  /* The zone rows, sorted by relay, keyed by the relay id the runtime scopes zone options against; then the controller-as-device pseudo-entry the two-level sidebar
+   * selects on load, hidden from the zone list and reporting the zone count.
+   *
+   * A zone's sidebar label is its relay number and its effective name: the user's configured override when set - so a just-saved edit reads back immediately - then
+   * the name HomeKit last showed, then the name Hydrawise reported. The number is a sidebar affordance only; it is never part of a HomeKit name, and the controller
+   * pseudo-entry carries no number at all.
+   */
+  const zoneRows = zones.slice().sort((a, b) => a.relay - b.relay).map((zone) => ({ kind: "zone",
+    name: zone.relay.toString() + ". " + (overrides.get(zone.relayId) ?? cachedValveName(matched, zone.relayId) ?? zone.name), relay: zone.relay,
+    relayId: zone.relayId, serialNumber: zone.relayId.toString() }));
   const controllerEntry = { kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
     serialNumber: controller.serialNumber, sidebarGroup: "hidden", zoneCount: zoneRows.length };
 
   return { devices: [ controllerEntry, ...zoneRows ], error: "" };
 };
 
-// Only show feature options whose declared scopes include the current level. Global scope shows everything; the controller pseudo-entry shows controller-scopable
-// options; a zone shows zone-scopable options. Both scope literals are consulted, so the catalog's declared scopes are the live gate at every level.
+/* Refine which feature options a device row shows, by the scope levels the option declares. The framework's own view-kind gate has already run by the time we are
+ * asked, admitting an option to a device view when it declares either the controller or the device level; this narrows that to the kind of device in hand, so the
+ * controller pseudo-entry shows only controller-scopable options and a zone shows only zone-scopable ones. The optional chaining is what keeps an entry that
+ * declares no scopes from throwing here - such an entry is valid at every level - and the global case returns true unconditionally because only options the
+ * framework already admitted globally ever reach it.
+ */
 const validOption = (device, option) => {
 
   if(!device) {
@@ -455,10 +529,10 @@ const validOption = (device, option) => {
 
   if(isController(device)) {
 
-    return option.meta?.scopes.includes("controller") === true;
+    return option.scopes?.includes("controller") === true;
   }
 
-  return option.meta?.scopes.includes("zone") === true;
+  return option.scopes?.includes("device") === true;
 };
 
 /* Build one row of the device-stats grid. We construct DOM nodes directly via createElement / textContent rather than concatenating a markup string so any HTML

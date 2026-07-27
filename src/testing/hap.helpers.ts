@@ -4,30 +4,36 @@
  * mirrors only the HAP surface the plugin actually touches. homebridge-plugin-utils' REAL acquireService / validService / getServiceName / setServiceName run
  * unmodified against these doubles, so a REAL HydrawiseController is constructed end to end with no live HAP runtime.
  *
- * The doubles carry no cross-kind service statics, so the real service helpers' name-set predicates (serviceRequiresConfiguredName, serviceHasName, ...) resolve
- * honestly false against every marker; the helpers therefore never reach their optional-characteristic add paths, and getServiceName reads through to undefined
- * rather than a real name characteristic. That collapse is the same one the family's other plugin doubles rely on, and it is what lets the real helpers run
- * against a marker namespace this small.
+ * The doubles carry the identity surface those helpers key on, so naming behaves as it does against real HAP. TestService exposes the whole service namespace as
+ * cross-kind statics, which is what the helpers' name-set initializer reads off a service's constructor to decide whether a kind supports the ConfiguredName and
+ * Name characteristics, and TestCharacteristic - the single wrapper class every characteristic instantiates, and therefore the constructor the helpers recover
+ * from a service's first characteristic - exposes the name-characteristic kinds as statics. A Valve consequently takes both name characteristics and an
+ * IrrigationSystem takes Name alone, exactly as against real HAP, and getServiceName reads back what setServiceName wrote.
+ *
+ * Every characteristic write is recorded on its service along with the kind written, so a test can assert that a particular characteristic was or was not
+ * written across a window without reasoning about the routine writes a polling pass performs.
  *
  * Consumed surface (swept from homebridge-plugin-utils/src/service.ts and the plugin source): a service exposes UUID, subtype, displayName (mutable),
  * characteristics (the public array getCharacteristicConstructor destructures), optionalCharacteristics, addOptionalCharacteristic, testCharacteristic,
- * getCharacteristic, updateCharacteristic, and removeService's target shape; a characteristic exposes value, updateValue, onGet, onSet, and
+ * getCharacteristic, updateCharacteristic, and removeService's target shape; a characteristic exposes UUID, value, updateValue, onGet, onSet, and
  * the triggerGet / triggerSet test knobs; an accessory exposes context, displayName, _associatedHAPAccessory, services, addService, getService,
  * getServiceById, and removeService.
  */
 
 // Identity classes for the HAP Characteristic kinds the plugin touches. Each kind is its own marker class carrying a hapKind property (so a failure surfaces the
-// kind in inspect output) and, where production compares against named constants, the HAP integer constants as statics. Production passes the class itself as a
-// key into getCharacteristic / updateCharacteristic; the value is looked up by class identity.
+// kind in inspect output), the UUID identity string HAP exposes on every characteristic, and, where production compares against named constants, the HAP integer
+// constants as statics. Production passes the class itself as a key into getCharacteristic / updateCharacteristic; the value is looked up by class identity.
 class ActiveCharacteristicType {
 
   public static readonly ACTIVE = 1;
   public static readonly INACTIVE = 0;
+  public static readonly UUID = "Active";
   public readonly hapKind = "Active" as const;
 }
 
 class ConfiguredNameCharacteristicType {
 
+  public static readonly UUID = "ConfiguredName";
   public readonly hapKind = "ConfiguredName" as const;
 }
 
@@ -35,6 +41,7 @@ class InUseCharacteristicType {
 
   public static readonly IN_USE = 1;
   public static readonly NOT_IN_USE = 0;
+  public static readonly UUID = "InUse";
   public readonly hapKind = "InUse" as const;
 }
 
@@ -42,26 +49,31 @@ class IsConfiguredCharacteristicType {
 
   public static readonly CONFIGURED = 1;
   public static readonly NOT_CONFIGURED = 0;
+  public static readonly UUID = "IsConfigured";
   public readonly hapKind = "IsConfigured" as const;
 }
 
 class ManufacturerCharacteristicType {
 
+  public static readonly UUID = "Manufacturer";
   public readonly hapKind = "Manufacturer" as const;
 }
 
 class ModelCharacteristicType {
 
+  public static readonly UUID = "Model";
   public readonly hapKind = "Model" as const;
 }
 
 class NameCharacteristicType {
 
+  public static readonly UUID = "Name";
   public readonly hapKind = "Name" as const;
 }
 
 class OnCharacteristicType {
 
+  public static readonly UUID = "On";
   public readonly hapKind = "On" as const;
 }
 
@@ -70,21 +82,25 @@ class ProgramModeCharacteristicType {
   public static readonly NO_PROGRAM_SCHEDULED = 0;
   public static readonly PROGRAM_SCHEDULED = 1;
   public static readonly PROGRAM_SCHEDULED_MANUAL_MODE = 2;
+  public static readonly UUID = "ProgramMode";
   public readonly hapKind = "ProgramMode" as const;
 }
 
 class RemainingDurationCharacteristicType {
 
+  public static readonly UUID = "RemainingDuration";
   public readonly hapKind = "RemainingDuration" as const;
 }
 
 class SerialNumberCharacteristicType {
 
+  public static readonly UUID = "SerialNumber";
   public readonly hapKind = "SerialNumber" as const;
 }
 
 class ServiceLabelIndexCharacteristicType {
 
+  public static readonly UUID = "ServiceLabelIndex";
   public readonly hapKind = "ServiceLabelIndex" as const;
 }
 
@@ -92,11 +108,13 @@ class ServiceLabelNamespaceCharacteristicType {
 
   public static readonly ARABIC_NUMERALS = 1;
   public static readonly DOTS = 0;
+  public static readonly UUID = "ServiceLabelNamespace";
   public readonly hapKind = "ServiceLabelNamespace" as const;
 }
 
 class SetDurationCharacteristicType {
 
+  public static readonly UUID = "SetDuration";
   public readonly hapKind = "SetDuration" as const;
 }
 
@@ -105,6 +123,7 @@ class ValveTypeCharacteristicType {
   public static readonly GENERIC_VALVE = 0;
   public static readonly IRRIGATION = 1;
   public static readonly SHOWER_HEAD = 2;
+  public static readonly UUID = "ValveType";
   public static readonly WATER_FAUCET = 3;
   public readonly hapKind = "ValveType" as const;
 }
@@ -134,18 +153,44 @@ export const Characteristic = {
 export type CharacteristicType = abstract new (...args: never[]) => object;
 export type ServiceType = abstract new (...args: never[]) => object;
 
+// A service kind as the real helpers' name-set initializer consumes it: a marker carrying the identity string it looks the kind up by.
+type ServiceKindMarker = ServiceType & { readonly UUID: string };
+
+// One recorded characteristic write: the kind that was written and the value it received. Assertions filter a service's log by kind, because a service takes
+// routine writes on every polling pass and a claim about one characteristic must not be disturbed by them.
+export interface CharacteristicWrite {
+
+  readonly type: CharacteristicType;
+  readonly value: unknown;
+}
+
 // One characteristic backing instance, owned by a TestService. Holds the last value written plus the optional onGet / onSet handlers production installs.
-// triggerGet / triggerSet are the test-side knobs that exercise the bound handlers without a real HAP request path.
+// triggerGet / triggerSet are the test-side knobs that exercise the bound handlers without a real HAP request path. This is the ONLY characteristic class the
+// double instantiates, so it is what the real getCharacteristicConstructor recovers from a service's first characteristic - which is why the name-characteristic
+// kinds hang off it as statics, mirroring how HAP's Characteristic base class exposes its namespace.
 export class TestCharacteristic {
+
+  public static readonly ConfiguredName = ConfiguredNameCharacteristicType;
+  public static readonly Name = NameCharacteristicType;
 
   public readonly type: CharacteristicType;
   private currentValue: unknown = null;
   private getHandler: (() => unknown) | undefined = undefined;
+  private readonly recordWrite: ((value: unknown) => void) | undefined;
   private setHandler: ((value: unknown) => Promise<void> | void) | undefined = undefined;
 
-  public constructor(type: CharacteristicType) {
+  public constructor(type: CharacteristicType, recordWrite?: (value: unknown) => void) {
 
+    this.recordWrite = recordWrite;
     this.type = type;
+  }
+
+  // The kind's identity string, mirrored from the type's static, matching how HAP exposes a UUID on a characteristic instance. The real acquireService compares
+  // this against the name characteristics' UUIDs when it checks whether a service's optional set already carries them. The fallback is a non-empty sentinel for a
+  // hand-rolled type outside the namespace.
+  public get UUID(): string {
+
+    return (this.type as { UUID?: string }).UUID ?? "unidentified-characteristic-kind";
   }
 
   // The most recently written value. Production reads this after updateCharacteristic to confirm its own write landed.
@@ -154,10 +199,12 @@ export class TestCharacteristic {
     return this.currentValue;
   }
 
-  // Write a value into the characteristic. Returns this so it chains in the production-typical service.updateCharacteristic pattern.
+  // Write a value into the characteristic and record it against the owning service. Returns this so it chains in the production-typical service.updateCharacteristic
+  // pattern.
   public updateValue(value: unknown): this {
 
     this.currentValue = value;
+    this.recordWrite?.(value);
 
     return this;
   }
@@ -190,7 +237,7 @@ export class TestCharacteristic {
   }
 
   // Test-side trigger for the installed onSet handler. After the handler resolves, the supplied value becomes the cached value, mirroring HAP's set-then-cache
-  // behavior.
+  // behavior. The value lands through updateValue so a HomeKit-originated set is recorded like any other write.
   public async triggerSet(value: unknown): Promise<void> {
 
     if(this.setHandler) {
@@ -198,7 +245,7 @@ export class TestCharacteristic {
       await this.setHandler(value);
     }
 
-    this.currentValue = value;
+    this.updateValue(value);
   }
 }
 
@@ -206,15 +253,48 @@ export class TestCharacteristic {
  * across calls (production binds onGet / onSet once and expects the binding to persist). characteristics is a PUBLIC ARRAY view because acquireService's
  * getCharacteristicConstructor destructures the first element to recover the Characteristic constructor and throws when none exists - which is why each
  * constructible service marker seeds one characteristic. displayName is MUTABLE because setServiceName assigns it on every acquire. UUID mirrors the marker's
- * static and is never empty, keeping the real helpers' name-set predicates honestly false against markers that carry no name statics.
+ * static and is never empty, so no service collides with the empty-string entry the helpers' name sets carry for the HAP kinds this double does not model.
  */
 export class TestService {
+
+  /* The service namespace as cross-kind statics, mirroring how a real HAP service class inherits the whole Service namespace. The helpers' name-set initializer
+   * reads these named properties off a service's constructor to build the UUID sets behind their ConfiguredName and Name predicates, so a service that could not
+   * resolve its siblings would answer false for every kind. They live on the base every marker extends - and which is itself directly constructible - so every
+   * service, marker or bare, presents the same view. That uniformity is what keeps outcomes stable: the initializer builds its sets ONCE PER PROCESS from the
+   * first service it happens to see, so a namespace that varied by kind would make naming depend on the order services were created in. Static accessors rather
+   * than fields, because the markers extend this class and so do not exist yet while this class body is evaluated.
+   */
+  public static get AccessoryInformation(): ServiceKindMarker {
+
+    return AccessoryInformationServiceType;
+  }
+
+  public static get IrrigationSystem(): ServiceKindMarker {
+
+    return IrrigationSystemServiceType;
+  }
+
+  public static get ServiceLabel(): ServiceKindMarker {
+
+    return ServiceLabelServiceType;
+  }
+
+  public static get Switch(): ServiceKindMarker {
+
+    return SwitchServiceType;
+  }
+
+  public static get Valve(): ServiceKindMarker {
+
+    return ValveServiceType;
+  }
 
   public displayName: string;
   public readonly subtype: string | undefined;
   public readonly type: ServiceType;
   private readonly characteristicsByType = new Map<CharacteristicType, TestCharacteristic>();
   private readonly optionalTypes = new Set<CharacteristicType>();
+  private readonly writeLog: CharacteristicWrite[] = [];
 
   public constructor(type: ServiceType, displayName: string, subtype: string | undefined) {
 
@@ -238,21 +318,32 @@ export class TestService {
     return [...this.characteristicsByType.values()];
   }
 
-  // The optional-characteristic view HAP exposes. The real acquireService reads this behind its name-set predicates (which resolve false against these markers),
-  // so it is populated only if a caller explicitly declares an optional characteristic.
+  // The optional-characteristic view HAP exposes. The real acquireService reads it to decide whether a kind's supported name characteristics are already present,
+  // and populates it through addOptionalCharacteristic for the kinds that support them.
   public get optionalCharacteristics(): TestCharacteristic[] {
 
     return [...this.optionalTypes].map(type => this.getCharacteristic(type));
   }
 
-  // Fetch or lazily create the characteristic of the given kind. Lazy creation matches HAP, which instantiates required characteristics on first access.
+  // Every characteristic write this service has taken, in order, each carrying the kind that was written.
+  public get writes(): readonly CharacteristicWrite[] {
+
+    return [...this.writeLog];
+  }
+
+  // Fetch or lazily create the characteristic of the given kind. Lazy creation matches HAP, which instantiates required characteristics on first access. The
+  // recorder handed to a new characteristic closes over its kind, so every write it takes lands in this service's log already labeled.
   public getCharacteristic(charType: CharacteristicType): TestCharacteristic {
 
     let char = this.characteristicsByType.get(charType);
 
     if(!char) {
 
-      char = new TestCharacteristic(charType);
+      char = new TestCharacteristic(charType, (value: unknown): void => {
+
+        this.writeLog.push({ type: charType, value });
+      });
+
       this.characteristicsByType.set(charType, char);
     }
 
@@ -280,6 +371,18 @@ export class TestService {
   public testCharacteristic(charType: CharacteristicType): boolean {
 
     return this.characteristicsByType.has(charType);
+  }
+
+  // The recorded writes for the given kinds, which is how a test asks whether a specific characteristic was written across a window.
+  public writesFor(...types: CharacteristicType[]): CharacteristicWrite[] {
+
+    return this.writeLog.filter(write => types.includes(write.type));
+  }
+
+  // Discard the recorded writes, so a test can open a window and observe exactly the writes performed within it.
+  public clearWrites(): void {
+
+    this.writeLog.length = 0;
   }
 }
 

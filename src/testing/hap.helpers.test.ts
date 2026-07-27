@@ -1,17 +1,19 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hap.helpers.test.ts: Self-test for the HAP double. Pins that the REAL homebridge-plugin-utils service helpers (acquireService, validService) run unmodified
- * against the marker namespaces - the seeded first characteristic lets getCharacteristicConstructor recover a constructor without throwing - and that the
- * characteristic trigger knobs, the service accessors, and the accessory accessors behave as production expects.
+ * hap.helpers.test.ts: Self-test for the HAP double. Pins that the REAL homebridge-plugin-utils service helpers (acquireService, validService, getServiceName,
+ * setServiceName) run unmodified against the marker namespaces - the seeded first characteristic lets getCharacteristicConstructor recover a constructor without
+ * throwing, and the cross-kind statics let the name predicates answer per kind the way they do against real HAP - and that the characteristic trigger knobs, the
+ * write recorder, the service accessors, and the accessory accessors behave as production expects.
  */
 import { Characteristic, Service, TestService, makeTestAccessory } from "./hap.helpers.ts";
-import { acquireService, validService } from "homebridge-plugin-utils";
+import { acquireService, getServiceName, setServiceName, validService } from "homebridge-plugin-utils";
 import { describe, test } from "node:test";
 import type { AcquireServiceTarget } from "homebridge-plugin-utils";
+import type { Service as HapService } from "homebridge";
 import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 
-// Confine the double-to-HAP casts the real service helpers require to these two adapters, so the test bodies below stay cast-free.
+// Confine the double-to-HAP casts the real service helpers require to these adapters, so the test bodies below stay cast-free.
 function asAccessory(accessory: ReturnType<typeof makeTestAccessory>): PlatformAccessory {
 
   return accessory as unknown as PlatformAccessory;
@@ -25,6 +27,21 @@ function asTarget(service: typeof Service[keyof typeof Service]): AcquireService
 function asTestService(service: object): TestService {
 
   return service as unknown as TestService;
+}
+
+function asHapService(service: object): HapService {
+
+  return service as unknown as HapService;
+}
+
+// Acquire a service against a fresh accessory and hand back both views of it, since the name assertions below read it as a HAP service and inspect it as a double.
+function acquireDouble(kind: typeof Service[keyof typeof Service], name: string, subtype?: string): TestService {
+
+  const service = acquireService(asAccessory(makeTestAccessory()), asTarget(kind), name, subtype);
+
+  assert.ok(service, "the double should acquire a " + name + " service");
+
+  return asTestService(service);
 }
 
 describe("acquireService against the HAP double", () => {
@@ -59,6 +76,88 @@ describe("acquireService against the HAP double", () => {
 
     validService(asAccessory(accessory), asTarget(Service.Switch), false, "All");
     assert.equal(accessory.getServiceById(Service.Switch, "All"), undefined, "a false validation should remove the service");
+  });
+});
+
+describe("the real name helpers against the HAP double", () => {
+
+  test("round-trips a name through setServiceName and getServiceName", () => {
+
+    const valve = acquireDouble(Service.Valve, "Front Lawn", "700001");
+
+    assert.equal(getServiceName(asHapService(valve)), "Front Lawn", "the name acquireService applied should read back through the real helper");
+
+    setServiceName(asHapService(valve), "Front Lawn Drip Line");
+
+    assert.equal(getServiceName(asHapService(valve)), "Front Lawn Drip Line", "a written name should read back through the real helper");
+    assert.equal(valve.displayName, "Front Lawn Drip Line", "setServiceName should assign the service's display name alongside the characteristics");
+  });
+
+  test("materializes the name characteristics each service kind supports", () => {
+
+    const valve = acquireDouble(Service.Valve, "Front Lawn", "700001");
+    const irrigation = acquireDouble(Service.IrrigationSystem, "Back Yard");
+    const label = acquireDouble(Service.ServiceLabel, "Zones");
+
+    assert.equal(valve.testCharacteristic(Characteristic.ConfiguredName), true, "a valve supports ConfiguredName");
+    assert.equal(valve.testCharacteristic(Characteristic.Name), true, "a valve supports Name");
+    assert.equal(irrigation.testCharacteristic(Characteristic.ConfiguredName), false, "an irrigation system supports Name but not ConfiguredName");
+    assert.equal(irrigation.testCharacteristic(Characteristic.Name), true, "an irrigation system supports Name");
+    assert.equal(getServiceName(asHapService(irrigation)), "Back Yard", "an irrigation system's name resolves through its Name characteristic");
+    assert.equal(label.testCharacteristic(Characteristic.ConfiguredName), false, "a service label supports neither name characteristic");
+    assert.equal(label.testCharacteristic(Characteristic.Name), false, "a service label supports neither name characteristic");
+    assert.equal(getServiceName(asHapService(label)), undefined, "a kind with no name characteristic reads back as unnamed");
+  });
+
+  test("every service marker resolves the same cross-kind namespace", () => {
+
+    // The helpers' name-set initializer reads these off whichever service it sees FIRST and caches the result for the process, so any drift between markers would
+    // make naming depend on the order services happen to be created in.
+    const kinds = [ "AccessoryInformation", "IrrigationSystem", "ServiceLabel", "Switch", "Valve" ];
+    const namespaceOf = (ctor: object): (string | undefined)[] => kinds.map(kind => (ctor as Record<string, { UUID?: string } | undefined>)[kind]?.UUID);
+
+    assert.deepEqual(namespaceOf(TestService), kinds, "the base should resolve every kind to its own identity string");
+
+    for(const [ name, marker ] of Object.entries(Service)) {
+
+      assert.deepEqual(namespaceOf(marker), kinds, "the " + name + " marker should resolve the same namespace as the base and its siblings");
+    }
+  });
+});
+
+describe("the characteristic write recorder", () => {
+
+  test("records each write with the kind that was written", () => {
+
+    const service = new TestService(Service.Valve, "Test", "700001");
+
+    service.updateCharacteristic(Characteristic.Active, 1);
+    service.updateCharacteristic(Characteristic.ConfiguredName, "Front Lawn");
+
+    assert.equal(service.writes.length, 2, "both writes should be recorded");
+    assert.deepEqual(service.writesFor(Characteristic.ConfiguredName).map(write => write.value), ["Front Lawn"], "the filtered view should carry only the named kind");
+    assert.equal(service.writesFor(Characteristic.Name).length, 0, "a kind that was never written should filter to nothing");
+  });
+
+  test("clearWrites opens a window that excludes what came before it", () => {
+
+    const service = new TestService(Service.Valve, "Test", "700001");
+
+    service.updateCharacteristic(Characteristic.ConfiguredName, "Front Lawn");
+    service.clearWrites();
+    service.updateCharacteristic(Characteristic.Active, 1);
+
+    assert.equal(service.writesFor(Characteristic.ConfiguredName).length, 0, "a write made before the window should not appear in it");
+    assert.equal(service.writes.length, 1, "the window should carry exactly the write made inside it");
+  });
+
+  test("a HomeKit-originated set lands through the same write funnel", async () => {
+
+    const service = new TestService(Service.Valve, "Test", "700001");
+
+    await service.getCharacteristic(Characteristic.Active).triggerSet(1);
+
+    assert.deepEqual(service.writesFor(Characteristic.Active).map(write => write.value), [1], "triggerSet should record its value like any other write");
   });
 });
 

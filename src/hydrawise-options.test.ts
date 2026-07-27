@@ -1,10 +1,11 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-options.test.ts: The feature-option catalog and its documentation hook. Pins the catalog defaults, the scope-set drift between the catalog's declared
- * meta.scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
+ * scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
  */
 import { describe, test } from "node:test";
 import { describeOptionScope, featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
+import type { FeatureOptionScope } from "homebridge-plugin-utils";
 import type { HydrawiseFeatureOption } from "./hydrawise-options.ts";
 import assert from "node:assert/strict";
 
@@ -14,8 +15,15 @@ function fullName(category: string, entry: HydrawiseFeatureOption): string {
   return entry.name ? category + "." + entry.name : category;
 }
 
+// Look up a catalog entry by category and entry name, so an assertion names the option it pins rather than depending on where the entry sits in its array. A
+// catalog that gains an option therefore shifts no expectation but its own.
+function optionEntry(category: string, name: string): HydrawiseFeatureOption | undefined {
+
+  return featureOptions[category]?.find(entry => entry.name === name);
+}
+
 // Collect the option names whose declared scopes include the given scope level, sorted for a stable comparison.
-function scopedOptions(scope: "controller" | "zone"): string[] {
+function scopedOptions(scope: FeatureOptionScope): string[] {
 
   const names: string[] = [];
 
@@ -23,7 +31,7 @@ function scopedOptions(scope: "controller" | "zone"): string[] {
 
     for(const entry of entries) {
 
-      if(entry.meta.scopes.includes(scope)) {
+      if(entry.scopes.includes(scope)) {
 
         names.push(fullName(category, entry));
       }
@@ -42,46 +50,74 @@ describe("hydrawise feature options", () => {
 
   test("carries the catalog defaults for each option", () => {
 
-    const device = featureOptions["Device"];
-    const log = featureOptions["Log"];
+    const device = optionEntry("Device", "");
+    const name = optionEntry("Device", "Name");
+    const suspend = optionEntry("Device", "Suspend");
+    const syncName = optionEntry("Device", "SyncName");
+    const logZone = optionEntry("Log", "Zone");
 
-    assert.ok(device && log, "the Device and Log categories should exist");
-    assert.equal(device[0]?.default, true, "the base Device option defaults to enabled");
-    assert.equal(device[1]?.default, false, "the suspend switch defaults to disabled");
-    assert.equal(log[0]?.default, true, "zone logging defaults to enabled");
+    assert.ok(device && name && suspend && syncName && logZone, "every catalog entry the runtime names should exist");
+    assert.equal(device.default, true, "the base Device option defaults to enabled");
+    assert.equal(name.default, true, "the zone name option defaults to enabled, so an unset name resolves to its empty default rather than to nothing");
+    assert.equal(name.defaultValue, "", "the zone name option is value-centric and defaults to empty, which the runtime reads as no override");
+    assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
+    assert.equal(syncName.default, true, "name synchronization defaults to enabled");
+    assert.equal(logZone.default, true, "zone logging defaults to enabled");
   });
 
   test("the controller-scopable options match the controller option-name union", () => {
 
-    // This is the runtime half of the scope-union contract: the set derived from the catalog's meta.scopes must equal the compile-time HydrawiseControllerOption
-    // union. A catalog scope change that is not mirrored in the union surfaces here.
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Suspend", "Log.Zone" ], "every controller-scoped option should be named in the controller union");
+    // This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time HydrawiseControllerOption union.
+    // A catalog scope change that is not mirrored in the union surfaces here.
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
+      "every controller-scoped option should be named in the controller union");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
 
-    assert.deepEqual(scopedOptions("zone"), [ "Device", "Log.Zone" ], "the suspend option is controller-only, so only Device and Log.Zone are zone-scoped");
+    // The framework's "device" level is the zone level in this plugin's projection, so this set is the mirror of HydrawiseZoneOption plus the value-centric
+    // HydrawiseZoneValueOption. The suspend option is controller-only and stays out of it.
+    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.SyncName", "Log.Zone" ],
+      "every zone-scoped option should be named in one of the zone unions");
+  });
+
+  test("the globally-scopable options are the account-wide ones", () => {
+
+    // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
+    // zone, so it resolves at the zone alone.
+    assert.deepEqual(scopedOptions("global"), [ "Device", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
+      "the zone name override is the only option that does not resolve globally");
   });
 
   test("describeOptionScope renders the multi-scope prose", () => {
 
-    const device = featureOptions["Device"]?.[0];
+    const device = optionEntry("Device", "");
 
     assert.ok(device, "the base Device option should exist");
-    assert.equal(describeOptionScope(device), " <BR>*Configurable at the whole controller and each zone.*", "a controller-and-zone option lists both levels");
+    assert.equal(describeOptionScope(device), " <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*",
+      "an option configurable at every level lists all three");
+  });
+
+  test("describeOptionScope renders the two-scope prose", () => {
+
+    const suspend = optionEntry("Device", "Suspend");
+
+    assert.ok(suspend, "the suspend option should exist");
+    assert.equal(describeOptionScope(suspend), " <BR>*Configurable at the whole controller and globally, across every controller.*",
+      "a controller-and-global option lists both levels");
   });
 
   test("describeOptionScope renders the single-scope prose", () => {
 
-    const suspend = featureOptions["Device"]?.[1];
+    const name = optionEntry("Device", "Name");
 
-    assert.ok(suspend, "the suspend option should exist");
-    assert.equal(describeOptionScope(suspend), " <BR>*Configurable at the whole controller.*", "a controller-only option lists just the controller level");
+    assert.ok(name, "the zone name option should exist");
+    assert.equal(describeOptionScope(name), " <BR>*Configurable at each zone.*", "a zone-only option lists just the zone level");
   });
 
   test("describeOptionScope omits the suffix when an option declares no scope", () => {
 
-    // An entry that carries no meta (the base renderer's generic entry shape permits it) yields no scope suffix.
+    // An entry that declares no scopes (the base renderer's generic entry shape permits it) yields no scope suffix.
     assert.equal(describeOptionScope({ default: true, description: "No scope here.", name: "Bare" }), undefined, "a scopeless option should render no suffix");
   });
 });

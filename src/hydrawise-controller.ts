@@ -7,8 +7,9 @@ import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RE
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
   StatusScheduleResponse } from "./hydrawise-types.ts";
-import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption } from "./hydrawise-options.ts";
-import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, superviseLoop, validService } from "homebridge-plugin-utils";
+import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./hydrawise-options.ts";
+import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
+  validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./hydrawise-platform.ts";
 import { HydrawiseReservedNames } from "./hydrawise-types.ts";
@@ -95,6 +96,10 @@ export class HydrawiseController {
   private configureHints(): boolean {
 
     this.hints.suspendAll = this.hasFeature("Device.Suspend");
+
+    // Surface a name-synchronization opt-out at startup. Synchronization is read live on each poll rather than cached in a hint, since a zone can opt out
+    // independently of its controller; this line reports the controller-scope answer, which is the one that governs when no zone says otherwise.
+    this.platform.featureOptions.logFeature("Device.SyncName", "Zone name synchronization", this.log, undefined, this.controller.serial_number);
 
     return true;
   }
@@ -315,30 +320,44 @@ export class HydrawiseController {
       // Discover any new zones and update our zone state.
       for(const zone of this.enabledZones) {
 
+        // The name this zone's valve carries: the user's Name option when set, otherwise the name Hydrawise reports. Resolved once per zone iteration, because both
+        // the acquisition below and the synchronization that follows it answer to the same name.
+        const override = this.zoneNameOverride("Device.Name", zone.relay_id.toString());
+        const effectiveName = override ?? zone.name;
+
         // Acquire the valve service.
         let isNewValve = false;
-        const valveService = acquireService(this.accessory, this.hap.Service.Valve,
-          (this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString())
-            ?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name, zone.relay_id.toString(), (newService: Service) => {
+        const valveService = acquireService(this.accessory, this.hap.Service.Valve, effectiveName, zone.relay_id.toString(), (newService: Service) => {
 
-            // Enumerate the valve service to align with the irrigation controller's zone numbering.
-            newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
+          // Enumerate the valve service to align with the irrigation controller's zone numbering.
+          newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
 
-            // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
-            newService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
+          // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
+          newService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
 
-            // All valves attached to an irrigation system must have their type set accordingly.
-            newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
+          // All valves attached to an irrigation system must have their type set accordingly.
+          newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
 
-            // Ensure that we inform the user of the new valve.
-            isNewValve = true;
-          });
+          // Ensure that we inform the user of the new valve.
+          isNewValve = true;
+        });
 
         if(!valveService) {
 
           this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
 
           continue;
+        }
+
+        // While name synchronization holds for this zone, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is
+        // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
+        // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
+        // because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name option exists to correct them where
+        // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists.
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+        if(!isNewValve && this.hasZoneFeature("Device.SyncName", zone.relay_id.toString()) && (getServiceName(valveService) !== sanitizeName(effectiveName))) {
+
+          setServiceName(valveService, effectiveName);
         }
 
         // See if the zone has been stopped due to a rain sensor event. We compute this before resolving the hint entry so a first-sighted zone seeds its stored rain
@@ -779,6 +798,15 @@ export class HydrawiseController {
   private hasZoneFeature(option: HydrawiseZoneOption, zoneId: string): boolean {
 
     return this.platform.featureOptions.test(option, zoneId, this.controller.serial_number);
+  }
+
+  // Utility for reading a zone-scoped value option. The zone id rides the device position and the serial the controller position, exactly as hasZoneFeature
+  // resolves, and an unset, empty, or whitespace-only value normalizes to undefined so callers can default with ??.
+  private zoneNameOverride(option: HydrawiseZoneValueOption, zoneId: string): string | undefined {
+
+    const name = this.platform.featureOptions.value(option, zoneId, this.controller.serial_number)?.trim();
+
+    return name?.length ? name : undefined;
   }
 
   // Utility function to get the configured name of a valve, if set.
