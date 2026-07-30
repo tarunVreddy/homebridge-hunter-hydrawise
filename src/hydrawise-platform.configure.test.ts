@@ -2,7 +2,7 @@
  *
  * hydrawise-platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
- * orphan pruning, the defect-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
+ * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
  * retry failure paths, and the shutdown teardown.
  */
 import { buildPlatform, countLogged, dispatcherOf, installMockDispatcher, loggedAt, programJsonReply, programStatusReply, seedAccessory, waitFor }
@@ -94,7 +94,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(unregistered[0]?.UUID, "999999", "the orphaned accessory should be unregistered");
   });
 
-  test("Defect 16 fix: a Disable.Device option keyed on the serial excludes the controller", async (t) => {
+  test("a Disable.Device option keyed on the serial excludes the controller (the bug 16 fix)", async (t) => {
 
     const { emit, lines, registered } = buildPlatform({ options: ["Disable.Device.SN0A1B2C3D4"] });
 
@@ -111,7 +111,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(registered.length, 0, "a serial-keyed device disable should exclude the controller");
   });
 
-  test("Defect 16 fix: a serial-keyed disable removes an already-cached accessory", async (t) => {
+  test("a serial-keyed disable removes an already-cached accessory (the bug 16 fix)", async (t) => {
 
     const { emit, platform, unregistered } = buildPlatform({ options: ["Disable.Device.SN0A1B2C3D4"] });
 
@@ -130,7 +130,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(unregistered[0]?.UUID, "500001", "the disabled controller's cached accessory should be unregistered");
   });
 
-  test("Defect 16 fix: a Disable.Device option keyed on the controller id does NOT exclude the controller", async (t) => {
+  test("a Disable.Device option keyed on the controller id does not exclude the controller (the bug 16 fix)", async (t) => {
 
     const { emit, registered } = buildPlatform({ options: ["Disable.Device.500001"] });
 

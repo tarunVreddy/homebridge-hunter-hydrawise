@@ -77,7 +77,8 @@ describe("testing.helpers barrel", () => {
     for(const name of actual) {
 
       assert.ok(allowed.has(name),
-        "Unexpected runtime export from the testing.helpers barrel: " + name + ". Add it to EXPECTED_FUNCTION_EXPORTS or EXPECTED_VALUE_EXPORTS, or remove it from the barrel.");
+        "Unexpected runtime export from the testing.helpers barrel: " + name + ". Add it to EXPECTED_FUNCTION_EXPORTS or EXPECTED_VALUE_EXPORTS, " +
+        "or remove it from the barrel.");
     }
   });
 

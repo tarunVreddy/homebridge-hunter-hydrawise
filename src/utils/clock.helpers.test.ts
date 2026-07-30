@@ -73,6 +73,7 @@ describe("makeFakeClock", () => {
     assert.deepEqual(sleeps, [50], "default sleep recording should still work");
 
     const raced = await clock.raceWithTimeout(Promise.resolve("ok"), 100);
+
     assert.equal(raced, "ok", "default raceWithTimeout should still forward");
   });
 

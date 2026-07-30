@@ -11,6 +11,7 @@ describe("delay", () => {
   test("resolves after a short delay (zero-ms uses the microtask boundary)", async () => {
 
     const before = performance.now();
+
     await delay(0);
     const elapsed = performance.now() - before;
 

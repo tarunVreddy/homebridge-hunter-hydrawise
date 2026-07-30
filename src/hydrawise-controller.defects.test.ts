@@ -34,7 +34,7 @@ function runningZone(): HydrawiseZoneConfig {
 
 describe("HydrawiseController updateState defect pins", () => {
 
-  test("BLESSED ghost-domain: a single zone vanishing recomputes the program mode over the empty domain to no-program-scheduled", async (t) => {
+  test("a single zone vanishing recomputes the program mode over the empty enabled domain to no-program-scheduled (the blessed ghost-domain divergence)", async (t) => {
 
     const h = buildController({ program: (recorder) => {
 
@@ -44,8 +44,10 @@ describe("HydrawiseController updateState defect pins", () => {
 
     t.after(() => h.abort());
 
-    // The valve appears on poll 1 and is pruned once the zone vanishes; on that vanish poll the aggregate runs over the now-empty enabled domain, where the
-    // all-stopped test 0 === 0 selects NO_PROGRAM_SCHEDULED. This is the slice-2 blessed ghost-domain reading, not a bug.
+    // The valve appears on poll 1 and is pruned once the zone vanishes. The program-mode aggregate projects over the current poll's enabled zones only, so a
+    // vanished zone's retained state never feeds it. This is a deliberate, owner-blessed divergence from v1, which recomputed the aggregate every poll but over all
+    // retained zone state, and so could select a program mode off a deleted zone's frozen flags in a multi-zone controller. Here, with one zone, the empty
+    // projection's 0 === 0 equality selects NO_PROGRAM_SCHEDULED.
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
     await waitFor(() => (h.accessory.getServiceById(Service.Valve, "700001") === undefined) ? true : undefined);
 
