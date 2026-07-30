@@ -60,7 +60,7 @@
           "title": "Feature Option",
           "required": false,
           "description": "Enter only one option per entry. Use the feature options webUI tab above unless you know what you're doing.",
-          "placeholder": "e.g. Disable.Device"
+          "placeholder": "e.g. Disable.Device.0610C29283"
         }
       }
     }
