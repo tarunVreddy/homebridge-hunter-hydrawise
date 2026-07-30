@@ -1,15 +1,17 @@
-/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
-import { type HomebridgePluginLogging, type Nullable, acquireService, getServiceName, retry, sleep, validService } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, SetZoneResponse, StatusScheduleResponse } from "./hydrawise-types.js";
+import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, superviseLoop, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawiseOptions } from "./hydrawise-options.js";
 import type { HydrawisePlatform } from "./hydrawise-platform.js";
 import { HydrawiseReservedNames } from "./hydrawise-types.js";
+import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
 
 // Device-specific options and settings.
@@ -17,6 +19,14 @@ interface HydrawiseHints {
 
   logZone: boolean;
   suspendAll: boolean;
+}
+
+// Per-zone state we track across polling cycles so we can detect and report start, stop, and rain-sensor transitions.
+interface HydrawiseZoneHints {
+
+  isManual: boolean;
+  isOn: boolean;
+  isStopped: boolean;
 }
 
 export class HydrawiseController {
@@ -30,7 +40,7 @@ export class HydrawiseController {
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
   private status: StatusScheduleResponse;
-  private zoneHints: { [index: number]: Record<string, boolean> };
+  private readonly zoneHints: Map<number, HydrawiseZoneHints>;
 
   // The constructor initializes key variables and calls configureDevice().
   constructor(platform: HydrawisePlatform, accessory: PlatformAccessory, controller: HydrawiseControllerConfig) {
@@ -43,15 +53,10 @@ export class HydrawiseController {
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
     this.platform = platform;
-    this.zoneHints = {};
+    this.zoneHints = new Map();
 
-    this.log = {
-
-      debug: (message: string, ...parameters: unknown[]): void => platform.debug(util.format(this.name + ": " + message, ...parameters)),
-      error: (message: string, ...parameters: unknown[]): void => platform.log.error(util.format(this.name + ": " + message, ...parameters)),
-      info: (message: string, ...parameters: unknown[]): void => platform.log.info(util.format(this.name + ": " + message, ...parameters)),
-      warn: (message: string, ...parameters: unknown[]): void => platform.log.warn(util.format(this.name + ": " + message, ...parameters))
-    };
+    // Prefix every log line with this controller's live name. The platform's log.debug is already rebound to the platform's debug gate, so debug routing stays intact.
+    this.log = prefixedLog(platform.log, (): string => this.name);
 
     this.configureDevice();
   }
@@ -69,8 +74,9 @@ export class HydrawiseController {
     this.configureSuspendSwitches();
     this.configureMqtt();
 
-    // Kickoff our state updates.
-    void this.updateState();
+    // Kick off our state updates under supervision so a genuine fault in the polling loop surfaces once through the reporter, while a shutdown abort unwinds the loop
+    // silently.
+    void superviseLoop({ loop: (signal): Promise<void> => this.updateState(signal), onError: loopFaultReporter(this.log, "zone status"), signal: this.platform.signal });
   }
 
   // Configure controller-specific settings.
@@ -97,40 +103,42 @@ export class HydrawiseController {
     return true;
   }
 
+  // Compose the wire-level MQTT topic for this controller. Every publish and subscription routes through this helper so the per-controller prefix shape
+  // ("<serial>/<suffix>") lives in exactly one place. The platform's MqttClient prepends its own configured topicPrefix on top of whatever we return here.
+  private mqttTopic(suffix: string): string {
+
+    return this.controller.serial_number + "/" + suffix;
+  }
+
   // Configure MQTT services.
   private configureMqtt(): boolean {
 
     // Return our irrigation controller state.
-    this.platform.mqtt?.subscribeGet(this.controller.serial_number, "controller", "Irrigation controller", () => {
-
-      return this.statusJson;
-    }, this.log);
+    this.platform.mqtt?.subscribeGet(this.mqttTopic("controller"), "controller", (): string => this.statusJson);
 
     // Set the state of a given irrigation zone.
-    this.platform.mqtt?.subscribeSet(this.controller.serial_number, "controller", "Irrigiation controller", async (value: string) => {
+    this.platform.mqtt?.subscribeSet(this.mqttTopic("controller"), "controller", async (value: string): Promise<void> => {
 
       // Parse the command.
       const action = value.split(" ");
 
       // Parse the zone number.
-      const zoneValue = parseInt(action[1]);
+      const zoneValue = parseInt(action[1] ?? "");
 
       // Let's find the zone, if it exists.
       const zone = this.status.relays.find(x => x.relay === zoneValue);
 
-      // No zone, we're done.
+      // No zone. We throw so HBPU's subscribeSet convention logs the error, rather than logging locally and emitting a spurious success line alongside it.
       if(!zone) {
 
-        this.log.error("MQTT: Invalid zone specified.");
-
-        return;
+        throw new Error("MQTT: Invalid zone specified.");
       }
 
       switch(action[0]) {
 
         case "start":
 
-          await this.sendCommand(zone, "run", parseInt(action[2]));
+          await this.sendCommand(zone, "run", parseInt(action[2] ?? ""));
 
           return;
 
@@ -142,11 +150,9 @@ export class HydrawiseController {
 
         default:
 
-          this.log.error("Invalid command.");
-
-          return;
+          throw new Error("Invalid command.");
       }
-    }, this.log);
+    });
 
     return true;
   }
@@ -199,7 +205,7 @@ export class HydrawiseController {
     // Suspend or resume the irrigation schedule.
     service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAllSuspended);
 
-    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
 
       // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation.
       const timestamp = (Date.now() / 1000) + (value ? 31556926 : 0);
@@ -211,7 +217,13 @@ export class HydrawiseController {
       try {
 
         status = await response?.body.json() as SetZoneResponse;
-      } catch(error) {
+      } catch {
+
+        // A shutdown abort mid-read is orderly teardown, not a failure - exit the whole handler quietly, skipping both the error log and the revert timer.
+        if(this.platform.signal.aborted) {
+
+          return;
+        }
 
         this.log.error("Unable to retrieve the result of the %s request.", value ? "suspend" : "resume");
       }
@@ -233,23 +245,26 @@ export class HydrawiseController {
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended);
 
-    this.log.info("Enabling suspend all zones switch.");
+    this.platform.featureOptions.logFeature("Device.Suspend", "Suspend all zones switch", this.log, this.controller.serial_number);
 
     return true;
   }
 
   // Update the irrigation system state from the Hydrawise API to HomeKit.
-  private async updateState(): Promise<void> {
+  private async updateState(signal: AbortSignal): Promise<void> {
 
-    // We loop forever, updating our irrigation system state at regular intervals.
+    // We loop forever, updating our irrigation system state at regular intervals. A shutdown abort unwinds the loop through the signal, which superviseLoop treats as
+    // the expected exit.
     for(;;) {
 
       const isFirstRun = this.status.nextpoll === -1;
 
-      // Update our status. If it's our first run through, we use our internal defaults.
+      // Update our status, retrying forever on a network failure at the polling cadence. On the first run we use the fixed retry interval; afterwards we honor the
+      // API's nextpoll hint, clamped so a failure never waits longer than twice the retry interval. A shutdown abort ends the retry through the signal.
       // eslint-disable-next-line no-await-in-loop
-      await retry(async () => this.getStatus(),
-        (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
+      await retry(() => this.getStatus(), { attempts: Infinity,
+        backoff: (): number => (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) *
+          1000, signal });
 
       // Let's get the list of current valves on this irrigation controller.
       const currentValves = this.status.relays.map(x => x.relay_id.toString());
@@ -294,29 +309,42 @@ export class HydrawiseController {
           continue;
         }
 
-        // See if the zone has been stopped due to a rain sensor event.
+        // See if the zone has been stopped due to a rain sensor event. We compute this before resolving the hint entry so a first-sighted zone seeds its stored rain
+        // state with the live sensor value rather than a static default, which would otherwise fire a spurious rain-sensor transition on the zone's first appearance
+        // during a rain delay.
         const isStopped = this.isStoppedBySensor(zone);
+
+        // Resolve this zone's hint entry, creating it on first sighting seeded with the live sensor state and the falsy manual and on defaults. An existing entry is
+        // left untouched here so its manual and on flags survive across refreshes.
+        let hints = this.zoneHints.get(zone.relay_id);
+
+        if(!hints) {
+
+          hints = { isManual: false, isOn: false, isStopped };
+          this.zoneHints.set(zone.relay_id, hints);
+        }
 
         // Inform the user.
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
         if(isFirstRun || isNewValve) {
 
-          // Create our zone hints, if needed and initialize our stopped state.
-          (this.zoneHints[zone.relay_id] ??= {}).isStopped = isStopped;
+          // Refresh our stopped state unconditionally on a first sighting or valve rediscovery, seeding the stored value with the live sensor reading so the
+          // transition check below does not fire on the zone's first appearance.
+          hints.isStopped = isStopped;
 
           this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
 
           // Manually control the zone valve.
-          valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue) => {
+          valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue): Promise<void> => {
 
             const setOn = value === this.hap.Characteristic.Active.ACTIVE;
-            const duration = valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value?.toString() ?? "0";
+            const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
             let response;
 
             // Request the change in zone state.
             if(setOn) {
 
-              response = await this.sendCommand(zone, "run", parseInt(duration));
+              response = await this.sendCommand(zone, "run", duration);
             } else {
 
               response = await this.sendCommand(zone, "stop");
@@ -332,29 +360,36 @@ export class HydrawiseController {
               return;
             }
 
+            // Resolve this zone's hint entry live at invocation time rather than capturing a reference at registration time, so this handler always acts on the current
+            // entry. A missing entry is a no-op we simply skip past.
+            const hint = this.zoneHints.get(zone.relay_id);
+
             // Update our valve state accordingly.
             if(setOn) {
 
               valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
               valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
-              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
-                ("PROGRAM_SCHEDULED_MANUAL_MODE" in this.hap.Characteristic.ProgramMode) ? this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE as number :
-                  (("PROGRAM_SCHEDULED_MANUAL_MODE_" in this.hap.Characteristic.ProgramMode) ?
-                    this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE_ as number : 2));
+              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
               irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
 
               // Mark this zone as manually activated.
-              this.zoneHints[zone.relay_id].isManual = true;
+              if(hint) {
+
+                hint.isManual = true;
+              }
             } else {
 
               valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
               valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
 
               // Clear out the manual activation tracker for this zone.
-              this.zoneHints[zone.relay_id].isManual = false;
+              if(hint) {
+
+                hint.isManual = false;
+              }
 
               // No more manually activated zones, we can resume our schedule.
-              if(!Object.values(this.zoneHints).some(x => x.isManual)) {
+              if(![...this.zoneHints.values()].some(x => x.isManual)) {
 
                 irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
               }
@@ -372,16 +407,16 @@ export class HydrawiseController {
         }
 
         // Determine whether the zone is currently running from the Hydrawise API.
-        this.zoneHints[zone.relay_id].isOn = zone.time === 1;
+        hints.isOn = zone.time === 1;
 
         // Retrieve whether the valve service is in use from HomeKit's perspective.
         const isValveInUse = valveService.getCharacteristic(this.hap.Characteristic.InUse).value === this.hap.Characteristic.InUse.IN_USE;
 
         // Get the duration of the next run time (if we aren't running currently) or the time remaining in this run if we're running.
-        const duration = parseInt(zone.run);
+        const duration = zone.run;
 
         // If a zone is on, then our irrigation system is in use and we update the remaining runtime duration.
-        if(this.zoneHints[zone.relay_id].isOn) {
+        if(hints.isOn) {
 
           irrigationRemaining += duration;
 
@@ -390,7 +425,7 @@ export class HydrawiseController {
         } else {
 
           // Clear out the manual activation tracker for this zone.
-          this.zoneHints[zone.relay_id].isManual = false;
+          hints.isManual = false;
 
           // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
           valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
@@ -407,28 +442,28 @@ export class HydrawiseController {
         }
 
         // InUse represents whether there is water flowing through the valve currently.
-        valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.zoneHints[zone.relay_id].isOn ?
+        valveService.updateCharacteristic(this.hap.Characteristic.InUse, hints.isOn ?
           this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
 
         // Log our activity, if configured to do so.
         if(this.hints.logZone) {
 
           // Inform the user if the zone has been started or stopped.
-          if(isValveInUse !== this.zoneHints[zone.relay_id].isOn) {
+          if(isValveInUse !== hints.isOn) {
 
-            this.log.info("%s: %s %s", this.getValveName(valveService, zone), this.zoneHints[zone.relay_id].isOn ? "Started" : "Stopped.",
-              this.zoneHints[zone.relay_id].isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone));
+            this.log.info("%s: %s %s", this.getValveName(valveService, zone), hints.isOn ? "Started" : "Stopped.",
+              hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone));
           }
 
           // Inform the user if the zone has been stopped due to a rain sensor.
-          if(isStopped !== this.zoneHints[zone.relay_id].isStopped) {
+          if(isStopped !== hints.isStopped) {
 
             this.log.info("%s: Rain sensor is %s irrigation.", this.getValveName(valveService, zone), isStopped ? "stopping" : "allowing");
           }
         }
 
         // Save the new setting.
-        this.zoneHints[zone.relay_id].isStopped = isStopped;
+        hints.isStopped = isStopped;
       }
 
       // Update the irrigation system state.
@@ -437,9 +472,9 @@ export class HydrawiseController {
       irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
 
       // No more manually activated zones, we can resume our schedule.
-      if(!Object.values(this.zoneHints).some(x => x.isManual)) {
+      if(![...this.zoneHints.values()].some(x => x.isManual)) {
 
-        if(Object.values(this.zoneHints).filter(x => x.isStopped).length === this.status.relays.length) {
+        if([...this.zoneHints.values()].filter(x => x.isStopped).length === this.status.relays.length) {
 
           irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED);
         } else {
@@ -449,24 +484,26 @@ export class HydrawiseController {
       }
 
       // Update the irrigation system's program mode if we're not manually running on any zones.
-      if(!Object.values(this.zoneHints).some(x => x.isManual)) {
+      if(![...this.zoneHints.values()].some(x => x.isManual)) {
 
         // If all our zones have been stopped by a rain sensor, we indicate that no program is currently scheduled, otherwise, we're on our normal scheduled program.
         irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
-          (Object.values(this.zoneHints).filter(x => x.isStopped).length === this.status.relays.length) ?
+          ([...this.zoneHints.values()].filter(x => x.isStopped).length === this.status.relays.length) ?
             this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED : this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
       }
 
-      // Publish our status to MQTT if configured to do so.
-      this.platform.mqtt?.publish(this.controller.serial_number, "controller", this.statusJson);
+      // Publish our status to MQTT if configured to do so, routing through guardedDispatch so a rejected publish - the broker vanishing mid-write, a teardown race -
+      // lands in the log instead of floating as an unhandled rejection.
+      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson); },
+        label: "MQTT publish (controller)", log: this.log });
 
       // Update our suspend status.
       this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
         this.isAllSuspended);
 
-      // Sleep until our next polling interval due to the Hydrawise API being rate-limited.
+      // Sleep until our next polling interval due to the Hydrawise API being rate-limited. A shutdown abort interrupts the wait and unwinds the loop.
       // eslint-disable-next-line no-await-in-loop
-      await sleep((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000);
+      await setTimeoutAsync((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000, undefined, { signal });
     }
   }
 
@@ -492,55 +529,51 @@ export class HydrawiseController {
     }
 
     // User has queued us up...send the command to Hydrawise.
-    // eslint-disable-next-line camelcase
-    const params: Record<string, string> = { controller_id: this.controller.controller_id.toString() };
+    const params: Record<string, string> = {};
+
+    params["controller_id"] = this.controller.controller_id.toString();
 
     // If we've specified the zone, add it to our parameters.
     if(zone?.relay_id) {
 
-      // eslint-disable-next-line camelcase
-      params.relay_id = zone.relay_id.toString();
+      params["relay_id"] = zone.relay_id.toString();
     }
 
     switch(command) {
 
       case "run":
 
-        params.action = "run";
+        params["action"] = "run";
 
         if((duration === undefined) || (duration <= 0)) {
 
           return null;
         }
 
-        params.custom = duration.toString();
-
-        // eslint-disable-next-line camelcase
-        params.period_id = "999";
+        params["custom"] = duration.toString();
+        params["period_id"] = "999";
 
         break;
 
       case "stop":
 
-        params.action = "stop";
+        params["action"] = "stop";
 
         break;
 
       case "suspendall":
 
-        params.action = "suspendall";
+        params["action"] = "suspendall";
 
         if((duration === undefined) || (duration <= 0)) {
 
           return null;
         }
 
-        params.custom = duration.toString();
+        params["custom"] = duration.toString();
+        params["period_id"] = "999";
 
-        // eslint-disable-next-line camelcase
-        params.period_id = "999";
-
-        delete params.relay_id;
+        delete params["relay_id"];
 
         break;
 
@@ -573,16 +606,20 @@ export class HydrawiseController {
   }
 
   // Retrieve the current status from the Hydrawise API.
-  private async getStatus(): Promise<boolean> {
+  private async getStatus(): Promise<void> {
 
     // Get our schedule for this controller.
-    // eslint-disable-next-line camelcase
-    const response = await this.platform.retrieve("statusschedule.php", { controller_id: this.controller.controller_id.toString() });
+    const params: Record<string, string> = {};
 
-    // Not found, let's retry again.
+    params["controller_id"] = this.controller.controller_id.toString();
+
+    const response = await this.platform.retrieve("statusschedule.php", params);
+
+    // A null response is a recoverable API error (or a shutdown abort) that retrieve() already classified and logged. Throw so the retry loop waits and tries again;
+    // on shutdown the loop unwinds through its own signal.
     if(!response) {
 
-      return false;
+      throw new Error("Unable to retrieve the current status of the irrigation controller.");
     }
 
     try {
@@ -593,10 +630,15 @@ export class HydrawiseController {
       this.log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
     } catch(error) {
 
+      // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds without manufacturing a parse-failure error. A genuine parse failure
+      // keeps the stale status and does not throw, so retry treats the poll as complete rather than retrying on a malformed body.
+      if(this.platform.signal.aborted) {
+
+        throw error;
+      }
+
       this.log.error("Unable to retrieve the current status of the irrigation controller: --%s--", util.inspect(error, { colors: true, depth: null, sorted: true }));
     }
-
-    return true;
   }
 
   // Utility to test for whether a zone has been stopped due to a rain sensor.
@@ -607,9 +649,9 @@ export class HydrawiseController {
   }
 
   // Utility to conver the duration from seconds to minutes, with the correct plural marker.
-  private getMinutes(duration: string): string {
+  private getMinutes(duration: number): string {
 
-    const minutes = Math.round(parseInt(duration) / 60);
+    const minutes = Math.round(duration / 60);
 
     return minutes.toString() + " minute" + (minutes !== 1 ? "s" : "");
   }
@@ -617,8 +659,8 @@ export class HydrawiseController {
   // Utility to format the time strings returned by Hydrawise.
   private formatStartTime(time: string): string {
 
-    // Split it into hours and minutes and ensure we convert it in the process.
-    const [ hours, minutes ] = time.split(":").map(Number);
+    // Split it into hours and minutes and ensure we convert it in the process. The defaults keep the arithmetic below total when the input is malformed.
+    const [ hours = 0, minutes = 0 ] = time.split(":").map(Number);
 
     // Return our user-friendly time string.
     return ((hours % 12) || 12).toString() + ":" + minutes.toString().padStart(2, "0") + " " + (hours >= 12 ? "PM" : "AM");
@@ -633,7 +675,7 @@ export class HydrawiseController {
   // Utility function to get the configured name of a valve, if set.
   private getValveName(service: Service, zone: HydrawiseZoneConfig): string {
 
-    return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay + "]";
+    return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
   }
 
   // Utility to return whether all zones are suspended or not.

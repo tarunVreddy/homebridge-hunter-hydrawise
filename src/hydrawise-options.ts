@@ -1,4 +1,4 @@
-/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-options.ts: Feature option and type definitions for Hydrawise.
  */
@@ -6,14 +6,14 @@
 import type { FeatureOptionEntry } from "homebridge-plugin-utils";
 
 // Plugin configuration options.
-export type HydrawiseOptions = {
+export interface HydrawiseOptions {
 
   apiKey: string;
   debug?: boolean;
   mqttTopic: string;
   mqttUrl?: string;
   options?: string[];
-};
+}
 
 // Feature option categories.
 export const featureOptionCategories = [
@@ -23,7 +23,7 @@ export const featureOptionCategories = [
 ];
 
 // Individual feature options, broken out by category.
-export const featureOptions: { [index: string]: FeatureOptionEntry[] } = {
+export const featureOptions: Record<string, FeatureOptionEntry[]> = {
 
   // Device options.
   "Device": [

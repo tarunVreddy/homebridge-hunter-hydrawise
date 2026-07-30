@@ -1,4 +1,4 @@
-/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * settings.ts: Settings and constants for homebridge-hunter-hydrawise.
  */
@@ -14,9 +14,6 @@ export const HYDRAWISE_API_JITTER = 0.2;
 
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
-
-// How often, in seconds, should we try to reconnect with an MQTT broker, if we have one configured.
-export const MQTT_RECONNECT_INTERVAL = 60;
 
 // Default MQTT topic to use when publishing events. This is in the form of: hydrawise/device/event
 export const HYDRAWISE_MQTT_TOPIC = "hydrawise";

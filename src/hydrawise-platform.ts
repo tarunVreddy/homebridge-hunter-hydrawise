@@ -1,16 +1,17 @@
-/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import { APIEvent, FeatureOptions, MqttClient, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
-import { type Dispatcher, Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
-import { FeatureOptions, retry } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
-import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
-import { MqttClient, type Nullable } from "homebridge-plugin-utils";
-import { APIEvent } from "homebridge";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.js";
+import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
+import { featureOptionCategories, featureOptions } from "./hydrawise-options.js";
+import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./hydrawise-controller.js";
+import type { HydrawiseOptions } from "./hydrawise-options.js";
+import type { Nullable } from "homebridge-plugin-utils";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
 
@@ -22,30 +23,42 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private dispatcher?: Dispatcher;
   public readonly featureOptions: FeatureOptions;
   public config: HydrawiseOptions;
-  public readonly configuredDevices: { [index: string]: HydrawiseController | undefined };
+  public readonly configuredDevices: Record<string, HydrawiseController | undefined>;
   public readonly hap: HAP;
   public readonly log: Logging;
   public readonly mqtt: Nullable<MqttClient>;
+  private readonly shutdownController: AbortController;
+  public readonly signal: AbortSignal;
 
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
+
+    // PlatformConfig exposes user values through an any-typed index signature, so we read each value through a bracket-access cast to its declared type and keep the
+    // reads type-checked rather than any. We resolve the options list once and share it between the feature-options engine and our own config snapshot.
+    const options = (config?.["options"] as string[] | undefined) ?? [];
 
     this.accessories = [];
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
     this.configuredDevices = {};
-    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, config?.options ?? []);
+    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
     this.hap = api.hap;
     this.log = log;
     this.log.debug = this.debug.bind(this);
     this.mqtt = null;
 
+    // Scope an AbortController to the platform's lifetime. We assign it and its signal at the top of the constructor, before the missing-API-key early return below,
+    // because strict definite-assignment checking requires every constructor path to initialize these readonly fields. Aborting the controller on Homebridge shutdown
+    // tears down every signal-aware resource we own through one composed signal.
+    this.shutdownController = new AbortController();
+    this.signal = this.shutdownController.signal;
+
     this.config = {
 
-      apiKey: config?.apiKey ?? "",
-      debug: config?.debug === true,
-      mqttTopic: config?.mqttTopic ?? HYDRAWISE_MQTT_TOPIC,
-      mqttUrl: config?.mqttUrl,
-      options: config?.options ?? []
+      apiKey: (config?.["apiKey"] as string | undefined) ?? "",
+      debug: config?.["debug"] === true,
+      mqttTopic: (config?.["mqttTopic"] as string | undefined) ?? HYDRAWISE_MQTT_TOPIC,
+      mqttUrl: config?.["mqttUrl"] as string | undefined,
+      options
     };
 
     // No Hydrawise API key, we're done.
@@ -60,16 +73,34 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Initialize our network connectivity.
     this.initNetworking();
 
-    // Initialize MQTT, if needed.
+    // Initialize MQTT, if needed. The HBPU MqttClient throws synchronously on an invalid broker URL, so we wrap construction in a try/catch and degrade gracefully -
+    // a single bad MQTT entry should not block the rest of the plugin from loading. The composed shutdown signal ties the client's lifetime to ours.
     if(this.config.mqttUrl) {
 
-      this.mqtt = new MqttClient(this.config.mqttUrl, this.config.mqttTopic, this.log);
+      try {
+
+        this.mqtt = new MqttClient({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { signal: this.signal });
+      } catch(error) {
+
+        this.log.error("Unable to initialize MQTT client: %s", util.inspect(error, { depth: null }));
+      }
     }
 
     this.log.debug("Debug logging on. Expect a lot of data.");
 
-    // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each.
-    api.on(APIEvent.DID_FINISH_LAUNCHING, () => void this.configureHydrawise());
+    // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each. We supervise the
+    // discovery loop so a genuine configuration fault surfaces once through the reporter, while a shutdown abort unwinds it silently.
+    api.on(APIEvent.DID_FINISH_LAUNCHING, () => void superviseLoop({ loop: () => this.configureHydrawise(), onError: loopFaultReporter(this.log, "controller discovery"),
+      signal: this.signal }));
+
+    // Tear ourselves down cleanly when Homebridge shuts down. This is the single owner of platform shutdown: aborting the signal cancels every signal-aware resource we
+    // own (the MQTT client, the retry waits, the polling loops), and destroying the undici dispatcher closes the keep-alive Pool connection so it does not outlive us.
+    api.on(APIEvent.SHUTDOWN, () => {
+
+      this.shutdownController.abort("shutdown");
+
+      void this.dispatcher?.destroy();
+    });
   }
 
   // This gets called when homebridge restores cached accessories at startup. We intentionally avoid doing anything significant here, and save all that logic for
@@ -83,48 +114,54 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Configure and connect to the Hydrawise API.
   private async configureHydrawise(): Promise<void> {
 
-    // Keep retrying until we're successful at regular intervals.
-    await retry(async (): Promise<boolean> => {
+    // Retrieve the account's controllers, retrying forever at a fixed 60-second cadence against the rate-limited API. The retried operation covers only the network
+    // truth - the request and the JSON parse - and throws on any failure so retry loops; a resolved value is a successful fetch. Everything downstream runs once,
+    // outside the retry, so a genuine configuration fault escapes to the supervisor's reporter rather than becoming a silent 60-second retry.
+    this.account = await retry(async (): Promise<CustomerDetailsResponse> => {
 
       // Get our list of controllers.
       const response = await this.retrieve("customerdetails.php");
 
-      // Not found, let's retry again.
+      // A null response is a recoverable API error (or a shutdown abort) that retrieve() already classified and logged. Throw so retry waits and tries again.
       if(!response) {
 
-        return false;
+        throw new Error("Unable to retrieve the list of controllers.");
       }
 
       try {
 
-        this.account = await response.body.json() as CustomerDetailsResponse;
+        return await response.body.json() as CustomerDetailsResponse;
       } catch(error) {
+
+        // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds through its own signal without logging a spurious parse failure.
+        if(this.signal.aborted) {
+
+          throw error;
+        }
 
         this.log.error("Unable to retrieve the list of controllers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
 
-        return false;
+        throw error;
       }
+    }, { attempts: Infinity, backoff: (): number => HYDRAWISE_API_RETRY_INTERVAL * 1000, signal: this.signal });
 
-      this.log.info("Successfully connected to the Hydrawise API.");
+    this.log.info("Successfully connected to the Hydrawise API.");
 
-      this.log.debug(util.inspect(this.account, { colors: true, depth: null, sorted: true }));
+    this.log.debug(util.inspect(this.account, { colors: true, depth: null, sorted: true }));
 
-      // Trim whitespace on irrigation controller names.
-      this.account.controllers = this.account.controllers.map(x => ({ ...x, name: x.name.trim() }));
+    // Trim whitespace on irrigation controller names.
+    this.account.controllers = this.account.controllers.map(x => ({ ...x, name: x.name.trim() }));
 
-      for(const controller of this.account.controllers) {
+    for(const controller of this.account.controllers) {
 
-        this.log.info("Discovered irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
+      this.log.info("Discovered irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-        this.configureController(controller);
-      }
+      this.configureController(controller);
+    }
 
-      // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
-      this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
-        .map(accessory => this.removeAccessory(accessory));
-
-      return true;
-    }, HYDRAWISE_API_RETRY_INTERVAL * 1000);
+    // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
+    this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
+      .map(accessory => this.removeAccessory(accessory));
   }
 
   // Configure a discovered irrigation controller.
@@ -226,16 +263,14 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     let response: Dispatcher.ResponseData<unknown>;
 
-    // Create a signal handler to deliver the abort operation.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), HYDRAWISE_API_TIMEOUT * 1000);
-    const signal = controller.signal;
+    // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
+    // through one signal handed to undici.
+    const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
 
     params ??= {};
 
     // Set our API key.
-    // eslint-disable-next-line camelcase
-    params.api_key = this.config.apiKey;
+    params["api_key"] = this.config.apiKey;
 
     const queryParams = new URLSearchParams(params);
 
@@ -245,7 +280,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     try {
 
       // Execute the API call.
-      response = await request(url, { signal: signal });
+      response = await request(url, { signal });
 
       // Bad username and password.
       if(response.statusCode === 404) {
@@ -267,7 +302,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if(!(response.statusCode >= 200) && (response.statusCode < 300)) {
 
         this.log.error(serverErrors.has(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
-          STATUS_CODES[response.statusCode]);
+          (STATUS_CODES[response.statusCode] ?? ""));
 
         return null;
       }
@@ -275,8 +310,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return response;
     } catch(error) {
 
-      // We aborted the connection.
-      if((error instanceof DOMException) && (error.name === "AbortError")) {
+      // A shutdown abort supersedes every other classification. Near the timeout boundary the composed rejection's shape is ambiguous, so the platform signal's own
+      // aborted flag is the truth: we exit quietly here, which also guarantees the timeout branch below can never re-arm the Pool after shutdown.
+      if(this.signal.aborted) {
+
+        return null;
+      }
+
+      // The request exceeded our timeout budget.
+      if((error instanceof DOMException) && (error.name === "TimeoutError")) {
 
         this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
         this.log.debug("Original request was: %s", url);
@@ -342,10 +384,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true}));
 
       return null;
-    } finally {
-
-      // Clear out our response timeout if needed.
-      clearTimeout(timeout);
     }
   }
 

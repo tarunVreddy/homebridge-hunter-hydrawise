@@ -1,19 +1,21 @@
-/* Copyright(C) 2020-2025, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2020-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-types.ts: Interface and type definitions for Hydrawise.
  */
 // HBHH reserved names.
-export enum HydrawiseReservedNames {
+export const HydrawiseReservedNames = {
 
   // Manage our switch types.
-  SWITCH_SUSPEND_ALL = "All"
-}
+  SWITCH_SUSPEND_ALL: "All"
+} as const;
+
+export type HydrawiseReservedNames = typeof HydrawiseReservedNames[keyof typeof HydrawiseReservedNames];
 
 // Hydrawise API: Hydrawise irrigation controller configuration.
 export interface HydrawiseControllerConfig {
 
   controller_id: number;
-  last_contact: string;
+  last_contact: number;
   name: string;
   serial_number: string;
   status: string;
@@ -27,7 +29,7 @@ export interface HydrawiseZoneConfig {
   name: string;
   relay: number;
   relay_id: number;
-  run: string;
+  run: number;
   time: number;
   timestr: string;
 }
