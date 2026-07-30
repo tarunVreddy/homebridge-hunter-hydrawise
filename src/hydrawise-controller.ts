@@ -7,7 +7,7 @@ import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RE
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
   StatusScheduleResponse } from "./hydrawise-types.ts";
-import type { HydrawiseControllerOption, HydrawiseOptions, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./hydrawise-options.ts";
+import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./hydrawise-options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
@@ -34,7 +34,6 @@ export class HydrawiseController {
 
   private readonly accessory: HydrawiseAccessory;
   private readonly api: API;
-  private readonly config: HydrawiseOptions;
   public readonly controller: HydrawiseControllerConfig;
   private enabledZones: HydrawiseZoneConfig[];
   private readonly hap: HAP;
@@ -52,7 +51,6 @@ export class HydrawiseController {
     this.api = platform.api;
     this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
     this.enabledZones = [];
-    this.config = platform.config;
     this.hap = this.api.hap;
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
