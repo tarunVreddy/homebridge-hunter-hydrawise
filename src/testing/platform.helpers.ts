@@ -8,6 +8,11 @@
  * returns fixture-programmed response shapes. Platform tests construct a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the
  * global dispatcher after construction, so the real status-code classification and error taxonomy run unchanged.
  */
+// The entry point's polyfill gesture, mirrored for the suites that construct a platform without ever loading src/index.ts. Every platform and controller test
+// reaches production through this module, so installing here is what keeps the explicit-resource-management globals present for a contributor running the suite on
+// a Node below the release that ships them. It is a no-op on a runtime that already has them, and the runtime-floor conformance test enumerates it among the lines
+// the sunset deletes.
+import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";

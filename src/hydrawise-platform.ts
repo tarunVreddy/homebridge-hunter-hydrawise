@@ -34,6 +34,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
 
+  /* Everything shutdown has to undo, declared in one place and disposed in one call. A DisposableStack runs its registered work in reverse registration order, so
+   * the ordering teardown depends on is expressed by the order things are registered rather than by a handler body that has to be read to be trusted, and the
+   * order and the work stay together at each registration site.
+   *
+   * The SYNCHRONOUS variant, deliberately: every teardown this platform registers completes synchronously, and Homebridge's shutdown is observable within the
+   * single frame that fires it, so the asynchronous stack would insert a microtask gap between disposers and buy nothing in return. The class is reached as a
+   * platform global, which the entry point's polyfill import guarantees exists on every runtime this package supports.
+   */
+  private readonly teardown = new DisposableStack();
+
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
     // PlatformConfig exposes user values through an any-typed index signature, so we read each value through a bracket-access cast to its declared type and keep the
@@ -104,14 +114,20 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     api.on(APIEvent.DID_FINISH_LAUNCHING, () => void superviseLoop({ loop: () => this.configureHydrawise(), onError: loopFaultReporter(this.log, "controller discovery"),
       signal: this.signal }));
 
-    // Tear ourselves down cleanly when Homebridge shuts down. This is the single owner of platform shutdown: aborting the signal cancels every signal-aware resource we
-    // own (the MQTT client, the retry waits, the polling loops), and destroying the undici dispatcher closes the keep-alive Pool connection so it does not outlive us.
-    api.on(APIEvent.SHUTDOWN, () => {
+    // Tear ourselves down cleanly when Homebridge shuts down. This is the single owner of platform shutdown, and it is one call: disposing the stack runs every
+    // registered teardown, synchronously, inside this frame.
+    api.on(APIEvent.SHUTDOWN, () => this.teardown.dispose());
 
-      this.shutdownController.abort("shutdown");
-
-      void this.dispatcher?.destroy();
-    });
+    /* Register that teardown work last, once everything it undoes has actually been built. Disposal is reverse registration order, so the dispatcher destroy named
+     * first here runs LAST and the signal abort named second runs FIRST: the abort cancels every signal-aware resource we own - the MQTT client, the retry waits,
+     * the polling loops, the rate-budget waits - and the destroy then closes the keep-alive Pool connection so it does not outlive us.
+     *
+     * The dispatcher is read live at disposal time rather than captured here, which keeps this registration correct across initNetworking's destroy-and-rearm. The
+     * MQTT client gets no registration of its own: its lifetime IS the composed shutdown signal the abort above already ends, so registering it here would tear it
+     * down a second time.
+     */
+    this.teardown.defer(() => void this.dispatcher?.destroy());
+    this.teardown.defer(() => this.shutdownController.abort("shutdown"));
   }
 
   // This gets called when homebridge restores cached accessories at startup. We intentionally avoid doing anything significant here, and save all that logic for

@@ -11,6 +11,7 @@ import { describe, test } from "node:test";
 import { makeCustomerDetails, normalSchedule } from "./hydrawise-api.helpers.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
+import { onAbort } from "homebridge-plugin-utils";
 import { syntheticController } from "./hydrawise-api.fixtures.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
@@ -243,5 +244,33 @@ describe("HydrawisePlatform configure", () => {
 
     assert.equal(platform.signal.aborted, true, "the shutdown handler aborts the platform signal");
     assert.equal(dispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the platform dispatcher");
+  });
+
+  test("shutdown aborts the signal before it destroys the dispatcher", async () => {
+
+    const { emit, platform, registered } = buildPlatform();
+
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (registered.length >= 1) ? true : undefined);
+
+    let destroyedAtAbort: boolean | undefined;
+
+    /* Sample the dispatcher AT ABORT TIME. Abort listeners run synchronously inside abort(), so this captures the world between the two teardown steps, which is
+     * the only place their order is observable: the end state after shutdown is the same either way, and converging flags cannot tell a correct registration from
+     * an inverted one.
+     */
+    onAbort(platform.signal, () => {
+
+      destroyedAtAbort = dispatcherOf(platform)?.destroyed;
+    });
+
+    emit(SHUTDOWN);
+
+    assert.equal(destroyedAtAbort, false, "the abort runs first, while the dispatcher is still live");
+    assert.equal(dispatcherOf(platform)?.destroyed, true, "the dispatcher is destroyed by the time the shutdown handler returns, in the same synchronous frame");
   });
 });
