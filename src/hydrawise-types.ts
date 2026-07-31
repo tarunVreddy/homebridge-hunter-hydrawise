@@ -13,6 +13,11 @@ export const HydrawiseReservedNames = {
 
 export type HydrawiseReservedNames = typeof HydrawiseReservedNames[keyof typeof HydrawiseReservedNames];
 
+// Hydrawise API: the endpoints this plugin calls. Naming them as a union rather than a bare string keeps the platform's rate-ceiling classification total: a call
+// site can only name an endpoint the platform has already decided which budgets to draw against, so a typo or a newly added endpoint is a compile error rather
+// than a call that quietly slips past the stricter command ceiling.
+export type HydrawiseEndpoint = "customerdetails.php" | "setzone.php" | "statusschedule.php";
+
 // Hydrawise API: Hydrawise irrigation controller configuration.
 export interface HydrawiseControllerConfig {
 

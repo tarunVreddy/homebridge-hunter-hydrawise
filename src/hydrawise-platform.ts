@@ -3,10 +3,11 @@
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, MqttClient, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
-import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig,
-  HydrawiseControllerIdentity } from "./hydrawise-types.ts";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+import { APIEvent, FeatureOptions, MqttClient, RateBudget, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
+import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity,
+  HydrawiseEndpoint } from "./hydrawise-types.ts";
+import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
 import type { Dispatcher } from "undici";
@@ -20,7 +21,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   private readonly accessories: HydrawiseAccessory[];
   private account: CustomerDetailsResponse;
+  private readonly accountBudget: RateBudget;
   public readonly api: API;
+  private readonly commandBudget: RateBudget;
   private dispatcher?: Dispatcher;
   public readonly featureOptions: FeatureOptions;
   public config: HydrawiseOptions;
@@ -52,6 +55,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // tears down every signal-aware resource we own through one composed signal.
     this.shutdownController = new AbortController();
     this.signal = this.shutdownController.signal;
+
+    // Make the two ceilings Hydrawise publishes structural rather than advisory. Each window is stated in seconds by its own constant and converted to the
+    // milliseconds a RateBudget takes right here, so the conversion sits once, immediately beside the constant it applies to. Both budgets carry the platform's
+    // shutdown signal, so a caller still waiting for a slot when Homebridge stops is rejected rather than left pending forever. Construction schedules nothing, so
+    // both are built here alongside the signal, ahead of the missing-API-key return below that leaves the rest of the platform unbuilt.
+    this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
+    this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
 
     this.config = {
 
@@ -258,7 +268,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   // Communicate HTTP requests with the Hydrawise API.
-  public async retrieve(endpoint: string, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
+  public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
     // Catch Hydrawise server-side issues:
     //
@@ -273,21 +283,45 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     let response: Dispatcher.ResponseData<unknown>;
 
-    // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
-    // through one signal handed to undici.
-    const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
-
-    params ??= {};
-
-    // Set our API key.
-    params["api_key"] = this.config.apiKey;
-
-    const queryParams = new URLSearchParams(params);
-
-    // Construct our API call.
-    const url = "https://api.hydrawise.com/api/v1/" + endpoint + "?" + queryParams.toString();
+    // The request URL, assembled inside the try below once the budgets have admitted this call. It is declared out here because the timeout branch of the catch
+    // reports it, and a variable assigned only inside a try cannot be read from its own catch. The empty starting value is never what reaches that log: the only
+    // steps preceding the assignment are the two budget waits, and the sole way either ends early is a shutdown rejection, which the catch answers above the
+    // timeout branch.
+    let url = "";
 
     try {
+
+      /* Pace this call against both ceilings Hydrawise publishes, at the one place every request to the API passes through. A zone command draws the stricter
+       * command budget first and the account-wide budget second, so a command queued behind a saturated command window is not also holding an account slot while
+       * it waits. Both waits sit inside this try, which is what makes an escaping budget rejection unrepresentable: a shutdown while a caller is queued rejects
+       * into the classification below, whose aborted-signal branch returns the same quiet null every other teardown path returns.
+       *
+       * Two limits on what these budgets can promise, stated plainly. They admit LOGICAL calls and sit above undici's retry interceptor, so one admitted call can
+       * still put up to four requests on the wire during a failure storm - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is
+       * not the cause of. And they account only for this process: the Homebridge config UI runs its own server process against the same account, one
+       * customerdetails call per refresh plus one statusschedule call per controller it holds no cached context for, which an in-process window cannot see.
+       */
+      if(endpoint === HYDRAWISE_COMMAND_ENDPOINT) {
+
+        await this.commandBudget.acquire();
+      }
+
+      await this.accountBudget.acquire();
+
+      params ??= {};
+
+      // Set our API key.
+      params["api_key"] = this.config.apiKey;
+
+      const queryParams = new URLSearchParams(params);
+
+      // Construct our API call.
+      url = "https://api.hydrawise.com/api/v1/" + endpoint + "?" + queryParams.toString();
+
+      // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
+      // through one signal handed to undici. The timeout is armed only now, after both budgets have admitted the call, so a wait for a rate-limit slot never eats
+      // into the time the request itself is allowed.
+      const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
 
       // Execute the API call.
       response = await request(url, { signal });

@@ -2,6 +2,7 @@
  *
  * settings.ts: Settings and constants for homebridge-hunter-hydrawise.
  */
+import type { HydrawiseEndpoint } from "./hydrawise-types.ts";
 
 // Hydrawise API response timeout, in seconds.
 export const HYDRAWISE_API_TIMEOUT = 7;
@@ -11,6 +12,24 @@ export const HYDRAWISE_API_RETRY_INTERVAL = 60;
 
 // How much, in seconds, jitter should we inject into the API polling interval. This helps ensure we stay clear of the Hydrawise API rate limits.
 export const HYDRAWISE_API_JITTER = 0.2;
+
+// The account-wide Hydrawise API ceiling, as a COUNT OF CALLS rather than a duration: Hydrawise documents at most this many API calls of any kind against an
+// account inside the trailing window below.
+export const HYDRAWISE_API_BUDGET_CALLS = 30;
+
+// The trailing window, in seconds, the account-wide call ceiling above is measured over.
+export const HYDRAWISE_API_BUDGET_WINDOW = 300;
+
+// The zone-command ceiling, as a COUNT OF CALLS rather than a duration: Hydrawise documents at most this many zone commands inside the trailing window below,
+// which is far stricter than the account-wide ceiling and applies on top of it.
+export const HYDRAWISE_COMMAND_BUDGET_CALLS = 3;
+
+// The trailing window, in seconds, the zone-command ceiling above is measured over.
+export const HYDRAWISE_COMMAND_BUDGET_WINDOW = 30;
+
+// The one Hydrawise endpoint that carries a zone command, and therefore the one that draws against the stricter command ceiling as well as the account-wide one.
+// The platform's draw branch and the controller's command dispatch both read this constant, so the endpoint identity has a single home.
+export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
 
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;

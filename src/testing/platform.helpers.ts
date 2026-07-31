@@ -9,7 +9,7 @@
  * global dispatcher after construction, so the real status-code classification and error taxonomy run unchanged.
  */
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
-import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../hydrawise-options.ts";
@@ -440,6 +440,23 @@ export function dispatcherOf(platform: HydrawisePlatform): { destroyed: boolean 
   return (platform as unknown as { dispatcher?: { destroyed: boolean } }).dispatcher;
 }
 
+/**
+ * Read the platform's two rate budgets through their private fields, so a wiring test can assert on the capacities they were constructed with and on the slots a
+ * sequence of retrieve() calls consumed. The privacy this reaches past is compile-time only, which is this codebase's posture for every private member, so the
+ * cast is confined here exactly as dispatcherOf confines its own: no production code outside the platform can name these budgets without deliberately repeating
+ * the same cast.
+ *
+ * @param platform - The constructed HydrawisePlatform.
+ *
+ * @returns The account-wide budget and the zone-command budget.
+ */
+export function budgetsOf(platform: HydrawisePlatform): { account: RateBudget; command: RateBudget } {
+
+  const budgets = platform as unknown as { accountBudget: RateBudget; commandBudget: RateBudget };
+
+  return { account: budgets.accountBudget, command: budgets.commandBudget };
+}
+
 // Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter.
 export interface BuildPlatformOptions {
 
@@ -528,6 +545,32 @@ export function installMockDispatcher(): MockDispatcherHandle {
 export function programJsonReply(agent: MockAgent, endpoint: string, body: object | string, statusCode = 200): void {
 
   agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes(endpoint) }).reply(statusCode, body).persist();
+}
+
+/**
+ * Program a persisted JSON reply for a Hydrawise endpoint that also counts the requests it serves. undici invokes the body callback once per matched request, so
+ * the returned reader measures WIRE calls rather than logical retrieve() calls. That is the distinction a rate-budget pin rests on: a draw that was dispatched
+ * instead of awaited lets its caller fall straight through to the request, which shows up here as a request the ceiling should have withheld.
+ *
+ * @param agent    - The MockAgent returned by installMockDispatcher.
+ * @param endpoint - The endpoint filename to match (for example "setzone.php").
+ * @param body     - The JSON body to answer with.
+ *
+ * @returns A reader for the number of requests served so far.
+ */
+export function programCountedReply(agent: MockAgent, endpoint: string, body: object): () => number {
+
+  let served = 0;
+
+  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes(endpoint) })
+    .reply(200, (): object => {
+
+      served++;
+
+      return body;
+    }).persist();
+
+  return (): number => served;
 }
 
 /**

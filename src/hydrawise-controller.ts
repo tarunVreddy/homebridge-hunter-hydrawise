@@ -3,7 +3,8 @@
  * hydrawise-controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT,
+  HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
   StatusScheduleResponse } from "./hydrawise-types.ts";
@@ -623,7 +624,7 @@ export class HydrawiseController {
     }
 
     // Request the change in zone state.
-    return this.platform.retrieve("setzone.php", params);
+    return this.platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT, params);
   }
 
   // Utility to return the status of a zone to a user.
