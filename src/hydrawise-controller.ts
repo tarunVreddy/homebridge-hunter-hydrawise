@@ -23,6 +23,22 @@ interface HydrawiseHints {
   suspendAll: boolean;
 }
 
+/* One completed poll, as it crosses from the wire half of the polling loop to the HomeKit half: whether this is the controller's first completed poll, and the
+ * status body that poll fetched.
+ *
+ * isFirstRun travels here because it cannot be recovered on the far side. It is read from the pre-fetch nextpoll sentinel, before the fetch overwrites the status
+ * it describes, and the zone walk reads it to decide whether to attach a valve's set handler - the warm-restart case, where the valve service comes back from the
+ * accessory cache but this process has never bound a handler to it.
+ *
+ * The status field is deliberately the same object the controller holds, not a defensive copy. The projection reads instance state directly throughout, and it is
+ * the only consumer in the process, so a copy would hand it one object while every other read in the same pass saw another.
+ */
+interface HydrawisePollUpdate {
+
+  readonly isFirstRun: boolean;
+  readonly status: StatusScheduleResponse;
+}
+
 // Per-zone state we track across polling cycles so we can detect and report start, stop, and rain-sensor transitions.
 interface HydrawiseZoneHints {
 
@@ -86,9 +102,17 @@ export class HydrawiseController {
     this.configureSuspendSwitches();
     this.configureMqtt();
 
-    // Kick off our state updates under supervision so a genuine fault in the polling loop surfaces once through the reporter, while a shutdown abort unwinds the loop
-    // silently.
-    void superviseLoop({ loop: (signal): Promise<void> => this.updateState(signal), onError: loopFaultReporter(this.log, "zone status"), signal: this.platform.signal });
+    /* Kick off our state updates under supervision so a genuine fault in the polling loop surfaces once through the reporter, while a shutdown abort unwinds the
+     * loop silently. The wire half and the HomeKit half sit inside this ONE envelope because they are one fault domain: a throw from either ends the same loop and
+     * owes the operator the same single report, so the generator needs no supervision of its own - its throws land here.
+     */
+    void superviseLoop({ loop: async (signal): Promise<void> => {
+
+      for await (const update of this.pollStatus(signal)) {
+
+        this.applyStatus(update);
+      }
+    }, onError: loopFaultReporter(this.log, "zone status"), signal: this.platform.signal });
   }
 
   // Configure controller-specific settings.
@@ -266,11 +290,12 @@ export class HydrawiseController {
     return true;
   }
 
-  // Update the irrigation system state from the Hydrawise API to HomeKit.
-  private async updateState(signal: AbortSignal): Promise<void> {
+  // Poll the Hydrawise API forever, yielding one update per completed poll. This is the wire half of the loop: it owns the fetch, the retry policy that rides
+  // out a failed poll, and the pacing the API asks for, and it touches no HomeKit service. A shutdown abort unwinds it through the signal, which superviseLoop
+  // treats as the expected exit; a throw that outlives the retry policy propagates out of the generator into the same envelope, ending the loop as a terminal
+  // fault.
+  private async *pollStatus(signal: AbortSignal): AsyncGenerator<HydrawisePollUpdate, void, undefined> {
 
-    // We loop forever, updating our irrigation system state at regular intervals. A shutdown abort unwinds the loop through the signal, which superviseLoop treats as
-    // the expected exit.
     for(;;) {
 
       const isFirstRun = this.status.nextpoll === -1;
@@ -286,266 +311,279 @@ export class HydrawiseController {
       // Trim whitespace on zone names.
       this.status.relays = this.status.relays.map(x => ({ ...x, name: x.name.trim() }));
 
-      // Persist the full reported zone roster to the accessory context when it changes. We run this before the enablement projection below so the persisted roster
-      // carries every reported zone, feature-disabled or not - the complete listing the webUI reads back from cache with no cloud call.
-      this.persistZoneRoster();
-
-      // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
-      // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
-      this.enabledZones = this.status.relays.filter(zone => this.hasZoneFeature("Device", zone.relay_id.toString()));
-
-      // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive both prunes from it. The hints map tracks
-      // only zones in the current poll's enabled projection, so a zone that vanishes and later reappears starts fresh instead of resurrecting its old manual and
-      // rain-stopped flags.
-      const liveZoneIds = new Set(this.enabledZones.map(zone => zone.relay_id.toString()));
-
-      for(const relayId of this.zoneHints.keys()) {
-
-        if(!liveZoneIds.has(relayId.toString())) {
-
-          this.zoneHints.delete(relayId);
-        }
-      }
-
-      // Remove valves for zones that no longer exist or that the user has disabled.
-      this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !liveZoneIds.has(x.subtype ?? ""))
-        .map(x => this.accessory.removeService(x));
-
-      let irrigationRemaining = 0;
-
-      // Find the irrigation system service.
-      const irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
-
-      // Discover any new zones and update our zone state.
-      for(const zone of this.enabledZones) {
-
-        // The name this zone's valve carries: the user's Name option when set, otherwise the name Hydrawise reports. Resolved once per zone iteration, because both
-        // the acquisition below and the synchronization that follows it answer to the same name.
-        const override = this.zoneNameOverride("Device.Name", zone.relay_id.toString());
-        const effectiveName = override ?? zone.name;
-
-        // Acquire the valve service.
-        let isNewValve = false;
-        const valveService = acquireService(this.accessory, this.hap.Service.Valve, effectiveName, zone.relay_id.toString(), (newService: Service) => {
-
-          // Enumerate the valve service to align with the irrigation controller's zone numbering.
-          newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
-
-          // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
-          newService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
-
-          // All valves attached to an irrigation system must have their type set accordingly.
-          newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
-
-          // Ensure that we inform the user of the new valve.
-          isNewValve = true;
-        });
-
-        if(!valveService) {
-
-          this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
-
-          continue;
-        }
-
-        // While name synchronization holds for this zone, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is
-        // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
-        // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
-        // because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name option exists to correct them where
-        // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists.
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        if(!isNewValve && this.hasZoneFeature("Device.SyncName", zone.relay_id.toString()) && (getServiceName(valveService) !== sanitizeName(effectiveName))) {
-
-          setServiceName(valveService, effectiveName);
-        }
-
-        // See if the zone has been stopped due to a rain sensor event. We compute this before resolving the hint entry so a first-sighted zone seeds its stored rain
-        // state with the live sensor value rather than a static default, which would otherwise fire a spurious rain-sensor transition on the zone's first appearance
-        // during a rain delay.
-        const isStopped = this.isStoppedBySensor(zone);
-
-        // Resolve this zone's hint entry, creating it on first sighting seeded with the live sensor state and the falsy manual and on defaults. An existing entry is
-        // left untouched here so its manual and on flags survive across refreshes.
-        let hints = this.zoneHints.get(zone.relay_id);
-
-        if(!hints) {
-
-          hints = { isManual: false, isOn: false, isStopped };
-          this.zoneHints.set(zone.relay_id, hints);
-        }
-
-        // Inform the user.
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        if(isFirstRun || isNewValve) {
-
-          // Refresh our stopped state unconditionally on a first sighting or valve rediscovery, seeding the stored value with the live sensor reading so the
-          // transition check below does not fire on the zone's first appearance.
-          hints.isStopped = isStopped;
-
-          this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
-
-          // Manually control the zone valve.
-          valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue): Promise<void> => {
-
-            const setOn = value === this.hap.Characteristic.Active.ACTIVE;
-            const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
-            let response;
-
-            // Request the change in zone state.
-            if(setOn) {
-
-              response = await this.sendCommand(zone, "run", duration);
-            } else {
-
-              response = await this.sendCommand(zone, "stop");
-            }
-
-            // Something went wrong in communicating with the Hydrawise API.
-            if(!response) {
-
-              // Revert our state for this zone.
-              setTimeout(() => valveService.updateCharacteristic(this.hap.Characteristic.Active,
-                setOn ? this.hap.Characteristic.Active.INACTIVE : this.hap.Characteristic.Active.ACTIVE), 50);
-
-              return;
-            }
-
-            // Resolve this zone's hint entry live at invocation time rather than capturing a reference at registration time, so this handler always acts on the current
-            // entry. A missing entry is a no-op we simply skip past.
-            const hint = this.zoneHints.get(zone.relay_id);
-
-            // Update our valve state accordingly.
-            if(setOn) {
-
-              valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
-              valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
-              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
-              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
-
-              // Mark this zone as manually activated.
-              if(hint) {
-
-                hint.isManual = true;
-              }
-            } else {
-
-              valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
-              valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
-
-              // Clear out the manual activation tracker for this zone.
-              if(hint) {
-
-                hint.isManual = false;
-              }
-
-              // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state at invocation time so this
-              // handler always acts on the current poll's enabled zones.
-              if(!this.enabledZones.some(x => this.zoneHints.get(x.relay_id)?.isManual)) {
-
-                irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
-              }
-
-              // If this was the only enabled zone currently running on the irrigation controller, let's set the system state to no longer in use.
-              if(!this.enabledZones.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
-
-                irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
-              }
-            }
-
-            this.log.info("%s: Manually %s%s.", this.getValveName(valveService, zone), setOn ? "started" : "stopped",
-              setOn ? " (duration: " + this.getMinutes(duration) + ")" : "");
-          });
-        }
-
-        // Determine whether the zone is currently running from the Hydrawise API.
-        hints.isOn = zone.time === 1;
-
-        // Retrieve whether the valve service is in use from HomeKit's perspective.
-        const isValveInUse = valveService.getCharacteristic(this.hap.Characteristic.InUse).value === this.hap.Characteristic.InUse.IN_USE;
-
-        // Get the duration of the next run time (if we aren't running currently) or the time remaining in this run if we're running.
-        const duration = zone.run;
-
-        // If a zone is on, then our irrigation system is in use and we update the remaining runtime duration.
-        if(hints.isOn) {
-
-          irrigationRemaining += duration;
-
-          // Update the duration of the remaining runtime of this valve, in seconds.
-          valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, 3600));
-        } else {
-
-          // Clear out the manual activation tracker for this zone.
-          hints.isManual = false;
-
-          // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
-          valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
-        }
-
-        // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
-        if((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR)) {
-
-          valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
-          this.log.debug("Setting %s as active.", this.getValveName(valveService, zone));
-        } else {
-
-          valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.INACTIVE);
-        }
-
-        // InUse represents whether there is water flowing through the valve currently.
-        valveService.updateCharacteristic(this.hap.Characteristic.InUse, hints.isOn ?
-          this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
-
-        // Log our activity, if configured to do so.
-        if(this.hasZoneFeature("Log.Zone", zone.relay_id.toString())) {
-
-          // Inform the user if the zone has been started or stopped.
-          if(isValveInUse !== hints.isOn) {
-
-            this.log.info("%s: %s %s", this.getValveName(valveService, zone), hints.isOn ? "Started" : "Stopped.",
-              hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone));
-          }
-
-          // Inform the user if the zone has been stopped due to a rain sensor.
-          if(isStopped !== hints.isStopped) {
-
-            this.log.info("%s: Rain sensor is %s irrigation.", this.getValveName(valveService, zone), isStopped ? "stopping" : "allowing");
-          }
-        }
-
-        // Save the new setting.
-        hints.isStopped = isStopped;
-      }
-
-      // Update the irrigation system state.
-      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse,
-        (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
-      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
-
-      // Update the irrigation system's program mode when no enabled zone is manually running: if every enabled zone is currently stopped by a rain sensor,
-      // no program is scheduled; otherwise we're on our normal scheduled program.
-      const enabledHints = this.enabledZones.map(zone => this.zoneHints.get(zone.relay_id)).filter(hints => hints !== undefined);
-
-      if(!enabledHints.some(x => x.isManual)) {
-
-        irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
-          (enabledHints.filter(x => x.isStopped).length === this.enabledZones.length) ?
-            this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED : this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
-      }
-
-      // Publish our status to MQTT if configured to do so, routing through guardedDispatch so a rejected publish - the broker vanishing mid-write, a teardown race -
-      // lands in the log instead of floating as an unhandled rejection.
-      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson); },
-        label: "MQTT publish (controller)", log: this.log });
-
-      // Update our suspend status.
-      this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
-        this.isAllSuspended);
+      // Hand the completed poll to whoever is consuming this generator. isFirstRun rides along because it was read from the pre-fetch sentinel above and can no
+      // longer be derived from the status now in hand.
+      yield { isFirstRun, status: this.status };
 
       // Sleep until our next polling interval due to the Hydrawise API being rate-limited. A shutdown abort interrupts the wait and unwinds the loop.
       // eslint-disable-next-line no-await-in-loop
       await setTimeoutAsync((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000, undefined, { signal });
     }
+  }
+
+  // Project one completed poll onto HomeKit. This is the HomeKit half of the loop and the only half that touches a service: the persisted zone roster, the
+  // enabled-zone projection and the prunes it drives, the per-zone valve state, the irrigation-system aggregates, the MQTT publish, and the suspend-all switch.
+  // It is synchronous by design - the MQTT publish is dispatched fire-and-forget through guardedDispatch - so one poll's projection lands in a single frame with
+  // nothing awaited partway through it.
+  private applyStatus(update: HydrawisePollUpdate): void {
+
+    const { isFirstRun, status } = update;
+
+    // Persist the full reported zone roster to the accessory context when it changes. We run this before the enablement projection below so the persisted roster
+    // carries every reported zone, feature-disabled or not - the complete listing the webUI reads back from cache with no cloud call.
+    this.persistZoneRoster();
+
+    // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
+    // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
+    this.enabledZones = status.relays.filter(zone => this.hasZoneFeature("Device", zone.relay_id.toString()));
+
+    // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive both prunes from it. The hints map tracks
+    // only zones in the current poll's enabled projection, so a zone that vanishes and later reappears starts fresh instead of resurrecting its old manual and
+    // rain-stopped flags.
+    const liveZoneIds = new Set(this.enabledZones.map(zone => zone.relay_id.toString()));
+
+    for(const relayId of this.zoneHints.keys()) {
+
+      if(!liveZoneIds.has(relayId.toString())) {
+
+        this.zoneHints.delete(relayId);
+      }
+    }
+
+    // Remove valves for zones that no longer exist or that the user has disabled.
+    this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !liveZoneIds.has(x.subtype ?? ""))
+      .map(x => this.accessory.removeService(x));
+
+    let irrigationRemaining = 0;
+
+    // Find the irrigation system service.
+    const irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
+
+    // Discover any new zones and update our zone state.
+    for(const zone of this.enabledZones) {
+
+      // The name this zone's valve carries: the user's Name option when set, otherwise the name Hydrawise reports. Resolved once per zone iteration, because both
+      // the acquisition below and the synchronization that follows it answer to the same name.
+      const override = this.zoneNameOverride("Device.Name", zone.relay_id.toString());
+      const effectiveName = override ?? zone.name;
+
+      // Acquire the valve service.
+      let isNewValve = false;
+      const valveService = acquireService(this.accessory, this.hap.Service.Valve, effectiveName, zone.relay_id.toString(), (newService: Service) => {
+
+        // Enumerate the valve service to align with the irrigation controller's zone numbering.
+        newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
+
+        // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
+        newService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
+
+        // All valves attached to an irrigation system must have their type set accordingly.
+        newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
+
+        // Ensure that we inform the user of the new valve.
+        isNewValve = true;
+      });
+
+      if(!valveService) {
+
+        this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
+
+        continue;
+      }
+
+      // While name synchronization holds for this zone, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is
+      // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
+      // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
+      // because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name option exists to correct them where
+      // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if(!isNewValve && this.hasZoneFeature("Device.SyncName", zone.relay_id.toString()) && (getServiceName(valveService) !== sanitizeName(effectiveName))) {
+
+        setServiceName(valveService, effectiveName);
+      }
+
+      // See if the zone has been stopped due to a rain sensor event. We compute this before resolving the hint entry so a first-sighted zone seeds its stored rain
+      // state with the live sensor value rather than a static default, which would otherwise fire a spurious rain-sensor transition on the zone's first appearance
+      // during a rain delay.
+      const isStopped = this.isStoppedBySensor(zone);
+
+      // Resolve this zone's hint entry, creating it on first sighting seeded with the live sensor state and the falsy manual and on defaults. An existing entry is
+      // left untouched here so its manual and on flags survive across refreshes.
+      let hints = this.zoneHints.get(zone.relay_id);
+
+      if(!hints) {
+
+        hints = { isManual: false, isOn: false, isStopped };
+        this.zoneHints.set(zone.relay_id, hints);
+      }
+
+      // Inform the user.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if(isFirstRun || isNewValve) {
+
+        // Refresh our stopped state unconditionally on a first sighting or valve rediscovery, seeding the stored value with the live sensor reading so the
+        // transition check below does not fire on the zone's first appearance.
+        hints.isStopped = isStopped;
+
+        this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
+
+        // Manually control the zone valve.
+        valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue): Promise<void> => {
+
+          const setOn = value === this.hap.Characteristic.Active.ACTIVE;
+          const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
+          let response;
+
+          // Request the change in zone state.
+          if(setOn) {
+
+            response = await this.sendCommand(zone, "run", duration);
+          } else {
+
+            response = await this.sendCommand(zone, "stop");
+          }
+
+          // Something went wrong in communicating with the Hydrawise API.
+          if(!response) {
+
+            // Revert our state for this zone.
+            setTimeout(() => valveService.updateCharacteristic(this.hap.Characteristic.Active,
+              setOn ? this.hap.Characteristic.Active.INACTIVE : this.hap.Characteristic.Active.ACTIVE), 50);
+
+            return;
+          }
+
+          // Resolve this zone's hint entry live at invocation time rather than capturing a reference at registration time, so this handler always acts on the current
+          // entry. A missing entry is a no-op we simply skip past.
+          const hint = this.zoneHints.get(zone.relay_id);
+
+          // Update our valve state accordingly.
+          if(setOn) {
+
+            valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
+            valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
+            irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
+            irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
+
+            // Mark this zone as manually activated.
+            if(hint) {
+
+              hint.isManual = true;
+            }
+          } else {
+
+            valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
+            valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
+
+            // Clear out the manual activation tracker for this zone.
+            if(hint) {
+
+              hint.isManual = false;
+            }
+
+            // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state at invocation time so this
+            // handler always acts on the current poll's enabled zones.
+            if(!this.enabledZones.some(x => this.zoneHints.get(x.relay_id)?.isManual)) {
+
+              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
+            }
+
+            // If this was the only enabled zone currently running on the irrigation controller, let's set the system state to no longer in use.
+            if(!this.enabledZones.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
+
+              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
+            }
+          }
+
+          this.log.info("%s: Manually %s%s.", this.getValveName(valveService, zone), setOn ? "started" : "stopped",
+            setOn ? " (duration: " + this.getMinutes(duration) + ")" : "");
+        });
+      }
+
+      // Determine whether the zone is currently running from the Hydrawise API.
+      hints.isOn = zone.time === 1;
+
+      // Retrieve whether the valve service is in use from HomeKit's perspective.
+      const isValveInUse = valveService.getCharacteristic(this.hap.Characteristic.InUse).value === this.hap.Characteristic.InUse.IN_USE;
+
+      // Get the duration of the next run time (if we aren't running currently) or the time remaining in this run if we're running.
+      const duration = zone.run;
+
+      // If a zone is on, then our irrigation system is in use and we update the remaining runtime duration.
+      if(hints.isOn) {
+
+        irrigationRemaining += duration;
+
+        // Update the duration of the remaining runtime of this valve, in seconds.
+        valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, 3600));
+      } else {
+
+        // Clear out the manual activation tracker for this zone.
+        hints.isManual = false;
+
+        // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
+        valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
+      }
+
+      // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
+      if((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR)) {
+
+        valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
+        this.log.debug("Setting %s as active.", this.getValveName(valveService, zone));
+      } else {
+
+        valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.INACTIVE);
+      }
+
+      // InUse represents whether there is water flowing through the valve currently.
+      valveService.updateCharacteristic(this.hap.Characteristic.InUse, hints.isOn ?
+        this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
+
+      // Log our activity, if configured to do so.
+      if(this.hasZoneFeature("Log.Zone", zone.relay_id.toString())) {
+
+        // Inform the user if the zone has been started or stopped.
+        if(isValveInUse !== hints.isOn) {
+
+          this.log.info("%s: %s %s", this.getValveName(valveService, zone), hints.isOn ? "Started" : "Stopped.",
+            hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone));
+        }
+
+        // Inform the user if the zone has been stopped due to a rain sensor.
+        if(isStopped !== hints.isStopped) {
+
+          this.log.info("%s: Rain sensor is %s irrigation.", this.getValveName(valveService, zone), isStopped ? "stopping" : "allowing");
+        }
+      }
+
+      // Save the new setting.
+      hints.isStopped = isStopped;
+    }
+
+    // Update the irrigation system state.
+    irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse,
+      (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
+    irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
+
+    // Update the irrigation system's program mode when no enabled zone is manually running: if every enabled zone is currently stopped by a rain sensor,
+    // no program is scheduled; otherwise we're on our normal scheduled program.
+    const enabledHints = this.enabledZones.map(zone => this.zoneHints.get(zone.relay_id)).filter(hints => hints !== undefined);
+
+    if(!enabledHints.some(x => x.isManual)) {
+
+      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode,
+        (enabledHints.filter(x => x.isStopped).length === this.enabledZones.length) ?
+          this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED : this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
+    }
+
+    // Publish our status to MQTT if configured to do so, routing through guardedDispatch so a rejected publish - the broker vanishing mid-write, a teardown race -
+    // lands in the log instead of floating as an unhandled rejection.
+    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson); },
+      label: "MQTT publish (controller)", log: this.log });
+
+    // Update our suspend status.
+    this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
+      this.isAllSuspended);
   }
 
   // Send a command to the Hydrawise API.
@@ -666,7 +704,7 @@ export class HydrawiseController {
     try {
 
       // Parse the body into a local and validate its shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast
-      // and crash updateState outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
+      // and crash applyStatus outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
       const parsed = await response.body.json();
 
       if(!this.isStatusSchedule(parsed)) {
@@ -693,7 +731,7 @@ export class HydrawiseController {
     }
   }
 
-  // Guard that a parsed status body carries the shape updateState relies on: relays and sensors arrays and a numeric nextpoll. A body that fails this check is
+  // Guard that a parsed status body carries the shape applyStatus relies on: relays and sensors arrays and a numeric nextpoll. A body that fails this check is
   // treated as a failed poll rather than being adopted as our status.
   private isStatusSchedule(value: unknown): value is StatusScheduleResponse {
 
