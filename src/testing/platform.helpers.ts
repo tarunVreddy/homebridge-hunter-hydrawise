@@ -14,13 +14,13 @@
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
+import { FeatureOptions, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../hydrawise-options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
-import { FeatureOptions } from "homebridge-plugin-utils";
 import { HydrawiseController } from "../hydrawise-controller.ts";
 import type { HydrawiseOptions } from "../hydrawise-options.ts";
 import { HydrawisePlatform } from "../hydrawise-platform.ts";
@@ -28,6 +28,7 @@ import { capturingLog } from "../testing.helpers.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { syntheticController } from "../hydrawise-api.fixtures.ts";
 import util from "node:util";
+import { zoneAccessoryId } from "../hydrawise-types.ts";
 
 /**
  * Scan captured log lines for one at the given level whose fully-formatted text contains the substring. The plugin logs printf-style (a format string plus
@@ -221,8 +222,13 @@ interface TestHap {
 
 const testHap: TestHap = { Characteristic, Service, uuid: { generate: (data: string): string => data } };
 
+// One recorded reconcileZoneAccessories call: the whole argument object the controller passed. Typed off the production signature, so a test reads the request the
+// projection actually built - which zones it named standalone, the display name each carried, and the pre-enablement relay-id population.
+export type RecordedReconcileCall = Parameters<HydrawisePlatform["reconcileZoneAccessories"]>[0];
+
 // The platform double's read surface, as the controller and its configure chain consume it. The construction-boundary cast to HydrawisePlatform happens in
 // buildController. The api carries updatePlatformAccessories because the controller flushes its persisted zone roster through it; the double records each flush.
+// reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here rather than a silent mismatch.
 export interface TestPlatform {
 
   api: { hap: TestHap; updatePlatformAccessories: (accessories: TestAccessory[]) => void };
@@ -231,6 +237,7 @@ export interface TestPlatform {
   hap: TestHap;
   log: HomebridgePluginLogging;
   mqtt: Nullable<TestMqttClient>;
+  reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
   signal: AbortSignal;
 }
@@ -254,8 +261,15 @@ export interface MakeTestPlatformResult {
   lines: () => CapturedLogLine[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
+
+  // Every reconcileZoneAccessories call the controller made, in order.
+  reconciles: RecordedReconcileCall[];
   retrieve: RetrieveRecorder;
   signalController: AbortController;
+
+  // The zone accessories the reconcile stub owns, keyed by relay id. It is both the stub's own store and the seeding hook a warm-restart test pre-populates, so a
+  // test can hand the first poll an accessory that already carries a cache-restored valve.
+  zoneAccessories: Map<number, TestAccessory>;
 }
 
 /* Build a platform double around a REAL FeatureOptions engine seeded with the supplied userOptions, so the production feature-option logic (test / logFeature)
@@ -276,7 +290,49 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const mqtt = options.mqtt ? new TestMqttClient() : null;
   const retrieve = new RetrieveRecorder();
   const flushes: TestAccessory[][] = [];
+  const reconciles: RecordedReconcileCall[] = [];
+  const zoneAccessories = new Map<number, TestAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
+
+  /* A THIN EXECUTOR standing in for the platform's zone-accessory reconcile, not a second copy of its policy. It records the call, keeps one accessory per
+   * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and drops the entries the request does not name. The grace window,
+   * the context writes, and the promotion-failure containment are the platform's contract and are pinned in its own suite, so nothing of them is reimplemented
+   * here: the stub honors exactly what each call asks for.
+   *
+   * It NEVER calls updatePlatformAccessories. The roster suite asserts exact flush counts across multi-poll runs, so a stub that flushed would break that net
+   * without any production change behind it.
+   */
+  const reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"] = (request) => {
+
+    reconciles.push(request);
+
+    const requestedIds = new Set(request.zones.map(zone => zone.identity.relayId));
+
+    for(const relayId of zoneAccessories.keys()) {
+
+      if(!requestedIds.has(relayId)) {
+
+        zoneAccessories.delete(relayId);
+      }
+    }
+
+    const hosts = new Map<number, HydrawiseAccessory>();
+
+    for(const zone of request.zones) {
+
+      // The display name is sanitized on creation exactly as the production reconcile sanitizes it, so a test measuring name-synchronization writes sees the same
+      // starting state the real platform would hand the controller.
+      const accessory = zoneAccessories.get(zone.identity.relayId) ??
+        new TestPlatformAccessory(sanitizeName(zone.displayName), zoneAccessoryId(request.controller.controller_id, zone.identity.relayId));
+
+      zoneAccessories.set(zone.identity.relayId, accessory);
+
+      // The double-to-production cast is confined to this workhorse, exactly as the construction-boundary casts below are.
+      hosts.set(zone.identity.relayId, accessory as unknown as HydrawiseAccessory);
+    }
+
+    return hosts;
+  };
   const config: HydrawiseOptions = {
 
     apiKey: "test-api-key",
@@ -294,11 +350,13 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     hap: testHap,
     log: logger,
     mqtt,
+    reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
     signal: signalController.signal
   };
 
-  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, retrieve, signalController };
+  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, reconciles, retrieve,
+    signalController, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -365,7 +423,11 @@ export interface TestApiResult {
 
   api: unknown;
   emit: (event: string) => void;
-  makeAccessory: (displayName: string, uuid: string) => TestAccessory;
+
+  // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
+  // succeeding exactly as before.
+  failRegistrationUuids: Set<string>;
+  makeAccessory: (displayName: string, uuid: string, category?: number) => TestAccessory;
   registered: TestAccessory[];
   unregistered: TestAccessory[];
   updated: TestAccessory[][];
@@ -378,6 +440,7 @@ export interface TestApiResult {
 export function makeTestApi(): TestApiResult {
 
   const handlers = new Map<string, ApiEventHandler[]>();
+  const failRegistrationUuids = new Set<string>();
   const registered: TestAccessory[] = [];
   const unregistered: TestAccessory[] = [];
   const updated: TestAccessory[][] = [];
@@ -395,7 +458,19 @@ export function makeTestApi(): TestApiResult {
       return api;
     },
     platformAccessory: TestPlatformAccessory,
-    registerPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => { registered.push(...accessories); },
+    registerPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => {
+
+      // The failure knob, checked before anything is recorded so a rejected registration leaves the buffer exactly as a real failure would.
+      for(const accessory of accessories) {
+
+        if(failRegistrationUuids.has(accessory.UUID)) {
+
+          throw new Error("Registration rejected for " + accessory.UUID + ".");
+        }
+      }
+
+      registered.push(...accessories);
+    },
     unregisterPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => { unregistered.push(...accessories); },
     updatePlatformAccessories: (accessories: TestAccessory[]): void => { updated.push(accessories); }
   };
@@ -408,7 +483,8 @@ export function makeTestApi(): TestApiResult {
     }
   };
 
-  return { api, emit, makeAccessory: (displayName: string, uuid: string): TestAccessory => new TestPlatformAccessory(displayName, uuid), registered,
+  return { api, emit, failRegistrationUuids,
+    makeAccessory: (displayName: string, uuid: string, category?: number): TestAccessory => new TestPlatformAccessory(displayName, uuid, category), registered,
     unregistered, updated };
 }
 

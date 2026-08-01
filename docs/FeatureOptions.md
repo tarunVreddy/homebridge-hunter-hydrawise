@@ -44,12 +44,13 @@ Options whose key ends in `=<value>` take a value - replace `=<value>` with your
 
 #### <A NAME="device"></A>Device feature options.
 
-| Option                                           | Description
-|--------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Device"></A>`Device`                    | Make this device available in HomeKit. At the controller scope, this makes the whole controller and all its zones available; at the zone scope, it makes this zone's valve available. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
-| <A NAME="Device.Name"></A>`Device.Name=<value>`  | Set a custom HomeKit name for this zone's valve. When empty, the zone name reported by Hydrawise is used. **(default: none)**. <BR>*Configurable at each zone.*
-| <A NAME="Device.Suspend"></A>`Device.Suspend`    | Enable a switch accessory to control suspending all zones. **(default: disabled)**. <BR>*Configurable at the whole controller and globally, across every controller.*
-| <A NAME="Device.SyncName"></A>`Device.SyncName`  | Synchronize zone names with HomeKit. Synchronization is one-way only, syncing the effective zone name - the Name option when set, otherwise the name reported by Hydrawise - to HomeKit. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| Option                                               | Description
+|------------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Device"></A>`Device`                        | Make this device available in HomeKit. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| <A NAME="Device.Name"></A>`Device.Name=<value>`      | Set a custom HomeKit name for this zone's valve. When empty, the zone name reported by Hydrawise is used. **(default: none)**. <BR>*Configurable at each zone.*
+| <A NAME="Device.Standalone"></A>`Device.Standalone`  | Expose a zone as its own standalone HomeKit accessory that can be assigned to any room. Enabling or disabling this option gives the zone a new HomeKit identity, so automations, scenes, and room assignments referencing its previous accessory must be set up again in the Home app. **(default: disabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| <A NAME="Device.Suspend"></A>`Device.Suspend`        | Enable a switch accessory to control suspending all zones. **(default: disabled)**. <BR>*Configurable at the whole controller and globally, across every controller.*
+| <A NAME="Device.SyncName"></A>`Device.SyncName`      | Synchronize zone names with HomeKit. Synchronization is one-way only, syncing the effective zone name - the Name option when set, otherwise the name reported by Hydrawise - to HomeKit. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
 
 #### <A NAME="log"></A>Logging feature options.
 

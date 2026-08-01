@@ -467,22 +467,36 @@ export const Service = {
 /* One accessory. Carries an AccessoryInformation service from construction (every HomeKit accessory has one); subsequent addService calls append more. getService
  * / getServiceById mirror HAP's distinction between "the bare service of this type" and "the service of this type with a specific subtype". The mutable context
  * and displayName are the fields the production controller path reads and writes; the _associatedHAPAccessory mirror is retained for HAP-shape parity because the
- * accessoryName setter assigns through it.
+ * display-name write assigns through it.
  */
 export class TestAccessory {
 
+  // The HAP accessory category, kept as a plain number so a test asserts against the production constant rather than against a second literal. Optional exactly as
+  // the real PlatformAccessory's third constructor argument is.
+  public readonly category?: number;
   public context: Record<string, unknown> = {};
   public displayName: string;
   public readonly UUID: string;
   public readonly _associatedHAPAccessory: { displayName: string };
   public readonly services: TestService[] = [];
 
-  public constructor(displayName: string, uuid: string) {
+  public constructor(displayName: string, uuid: string, category?: number) {
 
+    this.category = category;
     this.displayName = displayName;
     this.UUID = uuid;
     this._associatedHAPAccessory = { displayName };
     this.services.push(new TestService(Service.AccessoryInformation, displayName, undefined));
+  }
+
+  // Mirror the real PlatformAccessory.updateDisplayName: write the display-name pair, ignoring an empty name exactly as Homebridge does.
+  public updateDisplayName(name: string): void {
+
+    if(name) {
+
+      this.displayName = name;
+      this._associatedHAPAccessory.displayName = name;
+    }
   }
 
   /* Add a new service in either form HAP's real addService accepts: a service INSTANCE (what acquireService passes after constructing a namespace marker), or the

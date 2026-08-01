@@ -111,6 +111,14 @@ const isControllerIdentity = (value) => (typeof value === "object") && (value !=
 const isZoneIdentity = (value) => (typeof value === "object") && (value !== null) && (typeof value.name === "string") && (typeof value.relay === "number") &&
   (typeof value.relayId === "number");
 
+/* Whether a persisted accessory context belongs to a standalone zone accessory - the accessory that hosts one zone's valve on its own so the user can assign the
+ * zone to a room. This is a PRESENCE check on the identity pair, deliberately simpler than the runtime's own predicate, which additionally requires every
+ * controller-accessory field to be absent. At this consumer an ambiguous context - one carrying the controller shape and the zone pair at once - is already
+ * excluded where it matters: the notice heuristic's other arm tests isControllerIdentity itself, and such a context passes that arm and is excluded regardless
+ * of what this one answers.
+ */
+const isZoneAccessoryLike = (context) => isControllerIdentity(context?.ownerController) && isZoneIdentity(context?.zone);
+
 /* Extract the controller serials named by the config floor. A floor entry names a whole controller as "Enable/Disable.Device.<serial>"; the same grammar also carries
  * a zone-scope disable ("Disable.Device.<relayId>") and the distinct suspend option ("Disable.Device.Suspend.<serial>"), so we keep only single-segment ids and let the
  * caller drop any id that matches a known zone. The action prefixes and the Device key are derived through the engine's own expandOption grammar, so a rename of the
@@ -456,7 +464,7 @@ const getDevices = async (controller, { config } = {}) => {
       if(!enabled) {
 
         notice = NOTICE_DISABLED;
-      } else if(matched || cached.some((accessory) => !isControllerIdentity(accessory?.context?.controller))) {
+      } else if(matched || cached.some((accessory) => !isZoneAccessoryLike(accessory?.context) && !isControllerIdentity(accessory?.context?.controller))) {
 
         notice = NOTICE_UNPUBLISHED;
       }
@@ -505,9 +513,23 @@ const getDevices = async (controller, { config } = {}) => {
    * the name HomeKit last showed, then the name Hydrawise reported. The number is a sidebar affordance only; it is never part of a HomeKit name, and the controller
    * pseudo-entry carries no number at all.
    */
+  /* The cached standalone accessories hosting this controller's zones, keyed by relay id. A zone the user has given its own accessory carries its last-flushed
+   * HomeKit name on that accessory rather than on the controller accessory, so the label arm below has to read the accessory the valve actually lives on.
+   * Ownership is matched on the folded serial, exactly as the controller match above matches its own.
+   */
+  const zoneHosts = new Map();
+
+  for(const accessory of cached) {
+
+    if(isZoneAccessoryLike(accessory?.context) && (foldSerial(accessory.context.ownerController.serialNumber) === targetSerial)) {
+
+      zoneHosts.set(accessory.context.zone.relayId, accessory);
+    }
+  }
+
   const zoneRows = zones.slice().sort((a, b) => a.relay - b.relay).map((zone) => ({ kind: "zone",
-    name: zone.relay.toString() + ". " + (overrides.get(zone.relayId) ?? cachedValveName(matched, zone.relayId) ?? zone.name), relay: zone.relay,
-    relayId: zone.relayId, serialNumber: zone.relayId.toString() }));
+    name: zone.relay.toString() + ". " + (overrides.get(zone.relayId) ?? cachedValveName(zoneHosts.get(zone.relayId) ?? matched, zone.relayId) ?? zone.name),
+    relay: zone.relay, relayId: zone.relayId, serialNumber: zone.relayId.toString() }));
   const controllerEntry = { kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
     serialNumber: controller.serialNumber, sidebarGroup: "hidden", zoneCount: zoneRows.length };
 

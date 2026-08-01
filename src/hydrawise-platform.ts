@@ -2,13 +2,15 @@
  *
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, MqttClient, RateBudget, composeSignals, loopFaultReporter, retry, superviseLoop } from "homebridge-plugin-utils";
-import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity,
-  HydrawiseEndpoint } from "./hydrawise-types.ts";
+import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import { APIEvent, FeatureOptions, MqttClient, RateBudget, composeSignals, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
+import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint,
+  HydrawiseZoneIdentity } from "./hydrawise-types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS,
+  PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
+import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./hydrawise-types.ts";
 import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./hydrawise-controller.ts";
@@ -43,6 +45,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * platform global, which the entry point's polyfill import guarantees exists on every runtime this package supports.
    */
   private readonly teardown = new DisposableStack();
+
+  /* The wire-absence grace state behind reconcileZoneAccessories, keyed by zone-accessory UUID and holding that accessory's count of consecutive polls whose report
+   * omitted its zone. It lives in memory only and is deliberately not persisted: a restart clears it, which errs toward RETAINING a HomeKit identity the user
+   * placed in a room rather than toward destroying one, and the count rebuilds from the next few polls at no cost.
+   */
+  private readonly zoneAccessoryGrace = new Map<string, number>();
 
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
@@ -181,8 +189,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     // Map the trimmed account to the persisted controller-identity shape once, so every controller we configure seeds the same denormalized roster into its accessory
     // context - each accessory then knows every sibling, enabled or not, which is what lets the webUI list the whole account from any one accessory with no cloud call.
-    const roster: HydrawiseControllerIdentity[] = this.account.controllers.map(controller => ({ controllerId: controller.controller_id, name: controller.name,
-      serialNumber: controller.serial_number }));
+    const roster: HydrawiseControllerIdentity[] = this.account.controllers.map(controller => controllerIdentity(controller));
 
     for(const controller of this.account.controllers) {
 
@@ -191,9 +198,46 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.configureController(controller, roster);
     }
 
-    // Find all the orphaned irrigation controller accessories that aren't in the authoritative list provided by Hydrawise for this account and remove them.
-    this.accessories.filter(controller => !this.account.controllers.some(accessory => this.hap.uuid.generate(accessory.controller_id.toString()) === controller.UUID))
-      .map(accessory => this.removeAccessory(accessory));
+    // Find all the orphaned accessories this account does not claim and remove them, clearing any grace state a removed accessory carried. We walk a filtered
+    // SNAPSHOT of the tracked array so the removal splice never races the walk that drives it.
+    for(const accessory of this.accessories.filter(entry => this.isOrphanedAccessory(entry))) {
+
+      this.zoneAccessoryGrace.delete(accessory.UUID);
+      this.removeAccessory(accessory);
+    }
+  }
+
+  /* Whether discovery should sweep an accessory away, dispatched by accessory KIND. Each kind answers to a different authority, which is the whole reason this is
+   * a dispatch rather than one predicate.
+   *
+   * A standalone zone accessory is judged on its OWNER alone - gone from the account, or turned off by the device gate - because discovery cannot know zones at
+   * all: customerdetails.php carries no relays, so the only reader that ever sees a zone roster is the poll-cadence reconcile, and zone-level staleness is that
+   * reconcile's job. Attempting to re-derive zone truth here would mean guessing.
+   *
+   * Every other accessory is a controller accessory and keeps the existing rule: it survives only while the account still claims its generated UUID. An accessory
+   * whose cached context is malformed or ambiguous fails the zone-kind predicate and is therefore judged by this controller rule - a corrupt zone accessory is
+   * removed here and, if its zone is still standalone, promoted again at the next poll. That is self-healing churn, which we prefer to leaving an accessory whose
+   * identity we cannot read in place.
+   */
+  private isOrphanedAccessory(accessory: HydrawiseAccessory): boolean {
+
+    const context = accessory.context;
+
+    if(isZoneAccessoryContext(context)) {
+
+      return !this.account.controllers.some(controller => controller.controller_id === context.ownerController.controllerId) ||
+        !this.isControllerEnabled(context.ownerController.serialNumber);
+    }
+
+    return !this.account.controllers.some(controller => this.hap.uuid.generate(controller.controller_id.toString()) === accessory.UUID);
+  }
+
+  // Whether the user has left a controller enabled. The controller-wide Device gate is keyed on the serial number in the canonical controller position, with the
+  // device slot left undefined, matching the runtime's hasFeature convention so the whole plugin resolves controller-scope options against one identity. Discovery
+  // and the orphan sweep both ask this question, so it is asked in one place.
+  private isControllerEnabled(serialNumber: string): boolean {
+
+    return this.featureOptions.test("Device", undefined, serialNumber);
   }
 
   // Configure a discovered irrigation controller. The account roster is threaded through to the controller so it can seed its accessory context with every sibling's
@@ -206,9 +250,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // See if we already know about this accessory or if it's truly new.
     let accessory = this.accessories.find(x => x.UUID === uuid);
 
-    // Check to see if the user has disabled the device. We key the controller-wide Device gate on the serial number in the canonical controller position, with the
-    // device slot left undefined, matching the runtime's hasFeature convention so the whole plugin resolves controller-scope options against one identity.
-    if(!this.featureOptions.test("Device", undefined, controller.serial_number)) {
+    // Check to see if the user has disabled the device.
+    if(!this.isControllerEnabled(controller.serial_number)) {
 
       // If the accessory already exists, let's remove it.
       if(accessory) {
@@ -227,14 +270,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     }
 
     // It's a new device - let's add it to HomeKit.
-    if(!accessory) {
-
-      accessory = new this.api.platformAccessory<HydrawiseAccessoryContext>(controller.name, uuid);
-
-      // Register this accessory with Homebridge and add it to the accessory array so we can track it.
-      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      this.accessories.push(accessory);
-    }
+    accessory ??= this.addAccessory(controller.name, uuid);
 
     // Inform the user.
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
@@ -248,16 +284,182 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     return this.configuredDevices[uuid];
   }
 
-  // Remove the accessory from HomeKit.
+  /* The one creation path for every accessory this platform registers: construct it, register it with Homebridge, and track it. Every creation cadence -
+   * discovery-time controller accessories and poll-time standalone zone accessories alike - lands here, so the registration and the tracked array can never
+   * disagree about what exists. The category is optional: a controller accessory takes the PlatformAccessory constructor's own default, while a zone accessory
+   * declares itself a sprinkler so the Home app renders a lone valve correctly.
+   */
+  private addAccessory(displayName: string, uuid: string, category?: Categories): HydrawiseAccessory {
+
+    const accessory = new this.api.platformAccessory<HydrawiseAccessoryContext>(displayName, uuid, category);
+
+    // Register this accessory with Homebridge and add it to the accessory array so we can track it. Registration comes first so a failed registration leaves
+    // nothing in the tracked array to clean up.
+    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    this.accessories.push(accessory);
+
+    return accessory;
+  }
+
+  /* Remove the accessory from HomeKit. Removal is reachable from more than one cadence, so it opens with a presence guard: an accessory that is not in the tracked
+   * array must be a no-op here, because an indexOf miss would otherwise splice(-1, 1) and silently delete the LAST accessory in the array. The guard precedes the
+   * log line too, so a no-op never narrates a removal that did not happen.
+   */
   private removeAccessory(accessory: PlatformAccessory): void {
+
+    const index = this.accessories.indexOf(accessory);
+
+    if(index === -1) {
+
+      return;
+    }
 
     // Inform the user.
     this.log.info("%s: Removing device from HomeKit.", accessory.displayName);
 
     // Unregister the accessory and delete it's remnants from HomeKit.
     this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-    this.accessories.splice(this.accessories.indexOf(accessory), 1);
+    this.accessories.splice(index, 1);
     this.api.updatePlatformAccessories(this.accessories);
+  }
+
+  /* Reconcile this controller's standalone zone accessories against one poll's truth - the single chokepoint through which every zone-accessory creation, context
+   * write, and removal passes, so the platform stays the sole registrar and the accessory roster the orphan sweep reads can never fork. The controller calls it
+   * once per poll and hosts each zone's valve from the map it returns, so the hosting decision and the pruning decision read one source of truth.
+   *
+   * The inputs are deliberately different populations, and the difference is what makes configuration intent and wire absence tellable apart. `zones` is the
+   * REQUEST - one entry per zone that should be standalone right now, carrying the zone's effective display name and its wire identity. `presentRelayIds` is
+   * EVERY zone the poll's report carried, before any enablement filtering. A zone the wire still reports but the request omits can only be a configuration
+   * change, so it is demoted at once; a zone missing from both is a wire absence, which is graced for a few polls because a transient flake must never destroy a
+   * HomeKit identity the user placed in a room.
+   *
+   * The flush shape differs by arm, and every one of them is strictly on-change. A demotion flushes the whole array through removeAccessory's own tail, while a
+   * creation or a context refresh flushes just its accessory. A poll on which a zone is renamed on the wire can therefore produce this context flush and the
+   * controller's own accessory-name flush for the same accessory - two flushes on one rename poll, self-limiting and accepted.
+   *
+   * This method never touches a service: what lands on a hosted accessory is the controller's business.
+   *
+   * @param options - The owning controller, the id set of every zone the poll reported, and the standalone request.
+   *
+   * @returns The hosting map, from relay id to accessory, carrying one entry per requested zone that exists and seeded cleanly.
+   */
+  public reconcileZoneAccessories({ controller, presentRelayIds, zones }: { controller: HydrawiseControllerConfig; presentRelayIds: Set<number>;
+    zones: { displayName: string; identity: HydrawiseZoneIdentity }[]; }): Map<number, HydrawiseAccessory> {
+
+    const hosts = new Map<number, HydrawiseAccessory>();
+    const requestedIds = new Set(zones.map(zone => zone.identity.relayId));
+
+    /* Derive this controller's own zone accessories, projected to the pair each arm below reads. Filtering on the owning controller id is what keeps a
+     * multi-controller account isolated: another controller's zone accessories are never this call's business. The projection is a SNAPSHOT, so the removals the
+     * arms perform - which splice the tracked array - never race the walk that drives them.
+     */
+    const owned = this.accessories.flatMap(entry => (isZoneAccessoryContext(entry.context) &&
+      (entry.context.ownerController.controllerId === controller.controller_id)) ? [{ accessory: entry, relayId: entry.context.zone.relayId }] : []);
+
+    // One pass maintains both membership and the grace state, branching on where each owned accessory's zone turns up: in the request, on the wire alone, or in
+    // neither.
+    for(const { accessory, relayId } of owned) {
+
+      // REQUESTED: the zone is still standalone and still reported. Clearing its counter here - in the arm every healthy zone visits - is what makes a
+      // reappearance reset the grace window, so a later absence always counts from zero.
+      if(requestedIds.has(relayId)) {
+
+        this.zoneAccessoryGrace.delete(accessory.UUID);
+
+        continue;
+      }
+
+      // PRESENT BUT NOT REQUESTED: the wire still reports this zone, so its absence from the request is configuration intent - the Standalone or the Device
+      // option resolved off - and the demotion is immediate. The user asked for this identity change, so there is nothing to grace.
+      if(presentRelayIds.has(relayId)) {
+
+        this.demoteZoneAccessory(accessory);
+
+        continue;
+      }
+
+      // WIRE-ABSENT: the report carried no such zone. Count the absence and hold the accessory until the count says the zone is genuinely gone rather than
+      // momentarily missing.
+      const absences = (this.zoneAccessoryGrace.get(accessory.UUID) ?? 0) + 1;
+
+      if(absences < HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS) {
+
+        this.zoneAccessoryGrace.set(accessory.UUID, absences);
+
+        continue;
+      }
+
+      this.demoteZoneAccessory(accessory);
+    }
+
+    // Promote each requested zone, establishing its accessory when it has none and keeping its persisted identity current.
+    for(const zone of zones) {
+
+      const uuid = this.hap.uuid.generate(zoneAccessoryId(controller.controller_id, zone.identity.relayId));
+      let accessory = this.accessories.find(entry => entry.UUID === uuid);
+
+      // The accessory this call itself registered, if any. It is the only thing a fault below may undo: an accessory that already existed is not this call's to
+      // remove, and one whose registration threw was never tracked in the first place.
+      let created: Nullable<HydrawiseAccessory> = null;
+
+      /* The whole per-zone sequence sits in one try. A fault establishing one zone must never end the controller's polling loop, and must leave no ghost behind:
+       * we undo a registration this call performed, omit the zone from the returned map - which sends the controller's hosting back to the controller accessory
+       * for this poll - and carry on with the remaining zones. The next poll retries.
+       */
+      try {
+
+        if(!accessory) {
+
+          accessory = this.addAccessory(sanitizeName(zone.displayName), uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
+          created = accessory;
+
+          // A fresh accessory starts with a fresh grace window even when an earlier accessory at this UUID was removed for sustained absence, so an inherited
+          // count can never truncate the new one.
+          this.zoneAccessoryGrace.delete(uuid);
+
+          this.log.info("%s: Added a standalone HomeKit accessory for this zone so it can be assigned to a room. Automations, scenes, and room assignments " +
+            "that referenced this zone on the controller accessory must be set up again in the Home app.", zone.displayName);
+        }
+
+        /* Seed or refresh the persisted identity pair. The comparison is field-wise because both halves are freshly built projections, so a reference check would
+         * differ every poll and flush every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache
+         * entry heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write.
+         */
+        const ownerController = controllerIdentity(controller);
+        const context = accessory.context;
+
+        if(!isZoneAccessoryContext(context) || !sameControllerIdentity(context.ownerController, ownerController) ||
+          !sameZoneIdentity(context.zone, zone.identity)) {
+
+          accessory.context = { ownerController, zone: zone.identity };
+          this.api.updatePlatformAccessories([accessory]);
+        }
+
+        hosts.set(zone.identity.relayId, accessory);
+      } catch(error) {
+
+        this.log.error("%s: Unable to establish a standalone accessory for this zone: %s", zone.displayName,
+          util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+        if(created) {
+
+          this.removeAccessory(created);
+        }
+      }
+    }
+
+    return hosts;
+  }
+
+  // Remove one standalone zone accessory and clear the grace state it carried, so the counter map never holds an entry for an accessory that is gone. The removal
+  // itself narrates through removeAccessory; the line here carries what the user has to act on, since a HomeKit identity is going away.
+  private demoteZoneAccessory(accessory: HydrawiseAccessory): void {
+
+    this.removeAccessory(accessory);
+    this.zoneAccessoryGrace.delete(accessory.UUID);
+
+    this.log.info("%s: Automations, scenes, and room assignments that referenced this zone's standalone accessory must be set up again in the Home app.",
+      accessory.displayName);
   }
 
   // Initialize our network stack.

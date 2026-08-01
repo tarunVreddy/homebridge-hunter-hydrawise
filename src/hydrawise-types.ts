@@ -109,20 +109,95 @@ export interface HydrawiseZoneIdentity {
   relayId: number;
 }
 
-/* The typed HomeKit accessory context this plugin persists on every controller accessory. Homebridge round-trips this object verbatim through its on-disk cache, so
- * it holds only plain, JSON-serializable identity data the webUI can read back with zero cloud calls: the owning controller's own identity (the self-identity the
- * webUI's zone lookup keys on), the denormalized account roster (every account controller, enabled or not, so any one accessory knows all its siblings), and the
- * owning controller's zone roster. Every field is optional because this is the honest boundary type: an accessory restored from a pre-roster cache carries none of
- * them, and the runtime seeds them on the first configure pass before any reader relies on them.
+// The protocol and persistence infix joining a controller id to a relay id to form a standalone zone accessory's unique device id. This value is persistence-critical
+// identity: it seeds the cached HomeKit UUID of every standalone zone accessory, so any drift here orphans every cached zone accessory on every install in the field.
+// Treat it as immutable.
+export const HYDRAWISE_ZONE_ACCESSORY_ID_INFIX = ".Zone.";
+
+// Compose the unique device identifier of a zone's standalone accessory from its owning controller's id and its own relay id. Every consumer that mints or matches a
+// zone accessory's UUID derives it here, so the seed has exactly one home. The compound controller-plus-relay seed is also what makes relay-id uniqueness ACROSS
+// controllers irrelevant: two controllers reporting the same relay id still compose to different device ids.
+export function zoneAccessoryId(controllerId: number, relayId: number): string {
+
+  return controllerId.toString() + HYDRAWISE_ZONE_ACCESSORY_ID_INFIX + relayId.toString();
+}
+
+// Project a wire controller onto its persisted identity shape. This is the single derivation every writer of a controller identity - the platform's account roster,
+// the controller's own context seed, the zone accessory's owner stamp - goes through, so the persisted shape cannot drift between the sites that write it.
+export function controllerIdentity(controller: HydrawiseControllerConfig): HydrawiseControllerIdentity {
+
+  return { controllerId: controller.controller_id, name: controller.name, serialNumber: controller.serial_number };
+}
+
+// Project a wire zone onto its persisted identity shape, naming each field explicitly rather than spreading the wire zone so no volatile schedule field leaks into
+// persisted context. Like the controller projection above, this is the one home for the derivation.
+export function zoneIdentity(zone: HydrawiseZoneConfig): HydrawiseZoneIdentity {
+
+  return { name: zone.name, relay: zone.relay, relayId: zone.relay_id };
+}
+
+// Validate a persisted controller identity read back from the accessory cache: an object carrying every identity field with the right type. A malformed value counts
+// as absent, so a corrupt cache entry is classified rather than trusted.
+export function isControllerIdentity(value: unknown): value is HydrawiseControllerIdentity {
+
+  return (typeof value === "object") && (value !== null) && (typeof (value as HydrawiseControllerIdentity).controllerId === "number") &&
+    (typeof (value as HydrawiseControllerIdentity).name === "string") && (typeof (value as HydrawiseControllerIdentity).serialNumber === "string");
+}
+
+// Validate a persisted zone identity, with the same rigor and for the same reason as the controller guard above.
+export function isZoneIdentity(value: unknown): value is HydrawiseZoneIdentity {
+
+  return (typeof value === "object") && (value !== null) && (typeof (value as HydrawiseZoneIdentity).name === "string") &&
+    (typeof (value as HydrawiseZoneIdentity).relay === "number") && (typeof (value as HydrawiseZoneIdentity).relayId === "number");
+}
+
+// Compare two controller identities field-wise. Never by reference: every writer builds a fresh projection through controllerIdentity above, so a reference check
+// would report every comparison as differing and drive a write the values do not justify.
+export function sameControllerIdentity(a: HydrawiseControllerIdentity, b: HydrawiseControllerIdentity): boolean {
+
+  return (a.controllerId === b.controllerId) && (a.name === b.name) && (a.serialNumber === b.serialNumber);
+}
+
+// Compare two zone identities field-wise, for the same reason as the controller comparison above.
+export function sameZoneIdentity(a: HydrawiseZoneIdentity, b: HydrawiseZoneIdentity): boolean {
+
+  return (a.relayId === b.relayId) && (a.relay === b.relay) && (a.name === b.name);
+}
+
+/* The typed HomeKit accessory context this plugin persists on every accessory it owns. Homebridge round-trips this object verbatim through its on-disk cache, so it
+ * holds only plain, JSON-serializable identity data the webUI can read back with zero cloud calls.
+ *
+ * The fields divide by accessory KIND, and the kinds are mutually exclusive. A controller accessory carries its own identity (the self-identity the webUI's zone
+ * lookup keys on), the denormalized account roster (every account controller, enabled or not, so any one accessory knows all its siblings), and its own zone roster;
+ * it never carries the zone-accessory pair. A standalone zone accessory carries exactly that pair - the owning controller's identity and the zone's own - and never
+ * any controller-accessory field. That split is what the webUI's controller match rests on: it finds a controller by reading `controller`, so a zone accessory
+ * carrying that field would shadow the real controller accessory and blank the zone listing. isZoneAccessoryContext below is the one place the split is asserted.
+ *
+ * Every field is optional, and the interface is deliberately flat rather than a union of the kinds. This shape round-trips the on-disk cache and is field-written by
+ * paths whose flush cadence is pinned (persistZoneRoster writes the zones field alone), which a union would force into whole-object writes. Exclusivity is therefore
+ * enforced by the predicate below and re-asserted by every zone-context write, which assigns a complete fresh object rather than a field.
  */
 export interface HydrawiseAccessoryContext {
 
   controller?: HydrawiseControllerIdentity;
   controllers?: HydrawiseControllerIdentity[];
+  ownerController?: HydrawiseControllerIdentity;
+  zone?: HydrawiseZoneIdentity;
   zones?: HydrawiseZoneIdentity[];
 }
 
-// A Hydrawise controller accessory: a Homebridge PlatformAccessory whose context is our typed HydrawiseAccessoryContext. This alias is the single name threaded
+// Whether a persisted accessory context belongs to a standalone zone accessory. Exclusivity is checked in BOTH directions - the zone-accessory pair present and
+// well-formed, and every controller-accessory field absent - so an ambiguous context carrying both shapes at once classifies as NOT a zone accessory and takes the
+// non-zone arm wherever it is read, which is the self-healing direction. This predicate is the single vocabulary every consumer branches on, so the exclusivity rule
+// is asserted in exactly one place instead of being re-derived at each read site.
+export function isZoneAccessoryContext(context: HydrawiseAccessoryContext):
+  context is HydrawiseAccessoryContext & { ownerController: HydrawiseControllerIdentity; zone: HydrawiseZoneIdentity } {
+
+  return isControllerIdentity(context.ownerController) && isZoneIdentity(context.zone) && (context.controller === undefined) &&
+    (context.controllers === undefined) && (context.zones === undefined);
+}
+
+// A Hydrawise accessory of either kind: a Homebridge PlatformAccessory whose context is our typed HydrawiseAccessoryContext. This alias is the single name threaded
 // through every accessory field, parameter, and creation site, so the context contract lives in exactly one place. Because every context field is optional the alias
 // stays assignable both ways with the platform's bare PlatformAccessory (the wide UnknownContext) without a cast at the construction and configure boundaries.
 export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;

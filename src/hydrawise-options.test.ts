@@ -69,7 +69,7 @@ describe("hydrawise feature options", () => {
 
     // This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time HydrawiseControllerOption union.
     // A catalog scope change that is not mirrored in the union surfaces here.
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
       "every controller-scoped option should be named in the controller union");
   });
 
@@ -77,7 +77,7 @@ describe("hydrawise feature options", () => {
 
     // The framework's "device" level is the zone level in this plugin's projection, so this set is the mirror of HydrawiseZoneOption plus the value-centric
     // HydrawiseZoneValueOption. The suspend option is controller-only and stays out of it.
-    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.Standalone", "Device.SyncName", "Log.Zone" ],
       "every zone-scoped option should be named in one of the zone unions");
   });
 
@@ -85,7 +85,7 @@ describe("hydrawise feature options", () => {
 
     // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
     // zone, so it resolves at the zone alone.
-    assert.deepEqual(scopedOptions("global"), [ "Device", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("global"), [ "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
       "the zone name override is the only option that does not resolve globally");
   });
 
