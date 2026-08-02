@@ -109,7 +109,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     assert.equal(h.flushes.length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
   });
 
-  test("a zone rename flushes exactly once", async (t) => {
+  test("the schedule seed and a zone rename each flush exactly once", async (t) => {
 
     const alpha = makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const beta = makeZone({ name: "Beta", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
@@ -126,11 +126,11 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
     h.abort();
 
-    assert.equal(h.flushes.length, 1, "the matching first poll does not flush; the rename flushes exactly once");
+    assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the rename then flushes exactly once");
     assert.equal(firstOf(contextOf(h.accessory).zones ?? [], "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 
-  test("a zone disappearance flushes exactly once", async (t) => {
+  test("the schedule seed and a zone disappearance each flush exactly once", async (t) => {
 
     const first = makeZone({ name: "First", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const second = makeZone({ name: "Second", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
@@ -147,7 +147,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
     h.abort();
 
-    assert.equal(h.flushes.length, 1, "the matching first poll does not flush; the vanished zone flushes exactly once");
+    assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the vanished zone then flushes exactly once");
     assert.equal(contextOf(h.accessory).zones?.length, 1, "the persisted roster dropped the vanished zone");
   });
 

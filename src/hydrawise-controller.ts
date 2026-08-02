@@ -5,11 +5,12 @@
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT,
   HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
+import { HYDRAWISE_SUSPENDED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
+  sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity } from "./hydrawise-types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
   StatusScheduleResponse } from "./hydrawise-types.ts";
 import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./hydrawise-options.ts";
-import { HydrawiseReservedNames, controllerIdentity, isZoneIdentity, sameZoneIdentity, zoneIdentity } from "./hydrawise-types.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
@@ -83,8 +84,10 @@ export class HydrawiseController {
   // Configure an irrigation system accessory for HomeKit.
   private configureDevice(roster: HydrawiseControllerIdentity[]): void {
 
-    // Capture the prior persisted zone roster before we wipe the context. We restore it below so a restart does not blank the zone list during the window between this
-    // configure pass and the first completed poll, when the runtime has not yet rebuilt the roster from a fresh status body.
+    // Capture the prior persisted zone roster and schedule projection before we wipe the context. We restore both below so a restart does not blank the zone list or
+    // the schedule panel during the window between this configure pass and the first completed poll, when the runtime has not yet rebuilt either from a fresh status
+    // body.
+    const priorSchedule = this.accessory.context.schedule;
     const priorZones = this.accessory.context.zones;
 
     // Clean out the context object, then reseed the identity rosters this controller owns. The controller is the single writer of accessory context: it seeds its own
@@ -94,6 +97,15 @@ export class HydrawiseController {
     this.accessory.context.controller = controllerIdentity(this.controller);
     this.accessory.context.controllers = roster;
     this.accessory.context.zones = this.isZoneRoster(priorZones) ? priorZones : [];
+
+    /* Restore the prior schedule projection on the same terms as the roster above: a well-formed prior value carries over, and a malformed one degrades to absent so
+     * the panel renders identity alone rather than a corrupt entry. A restored projection keeps the asOf it was written with, which is deliberately conservative -
+     * if the first poll's facts still match it, those facts held then and hold now, and the only surface that reads asOf is the display's staleness notice.
+     */
+    if(isScheduleStatus(priorSchedule)) {
+
+      this.accessory.context.schedule = priorSchedule;
+    }
 
     // Configure ourselves.
     this.configureHints();
@@ -335,9 +347,17 @@ export class HydrawiseController {
 
     const { isFirstRun, status } = update;
 
-    // Persist the full reported zone roster to the accessory context when it changes. We run this before the enablement projection below so the persisted roster
-    // carries every reported zone, feature-disabled or not - the complete listing the webUI reads back from cache with no cloud call.
-    this.persistZoneRoster();
+    /* Persist the identity roster and the schedule projection, each on change, through one flush: whichever moved this poll rides a single updatePlatformAccessories
+     * call, so a poll costs at most one cache write no matter how many projections it advanced. Both run before the enablement projection below, so what is persisted
+     * covers every reported zone, feature-disabled or not - the complete listing and schedule the webUI reads back from cache with no cloud call.
+     */
+    const rosterChanged = this.persistZoneRoster();
+    const scheduleChanged = this.persistScheduleStatus();
+
+    if(rosterChanged || scheduleChanged) {
+
+      this.api.updatePlatformAccessories([this.accessory]);
+    }
 
     // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
     // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
@@ -805,48 +825,50 @@ export class HydrawiseController {
     return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number");
   }
 
-  // Persist the reported zone roster to the accessory context, writing and flushing only when it changed since the last poll. We project every reported zone to the
-  // identity-only shape, naming each field explicitly rather than spreading the wire zone so no volatile schedule field leaks into persisted context, ordered by relay
-  // for a stable comparison. The comparison is field-wise because the projection is a fresh array every poll, so a reference check would differ every time and flush on
-  // every poll; a single flush persists the change to Homebridge's cache so the roster survives an unclean shutdown. A rare single-poll flap that flips a field and
-  // back across two polls costs two flushes, which we accept - roster changes are rare and a flush is cheap.
-  private persistZoneRoster(): void {
+  /* Write the reported zone roster to the accessory context when it changed since the last poll, and report whether it wrote. We project every reported zone to the
+   * identity-only shape, naming each field explicitly rather than spreading the wire zone, ordered by relay for a stable comparison. The comparison is field-wise
+   * because the projection is a fresh array every poll, so a reference check would differ every time and write on every poll. A rare single-poll flap that flips a
+   * field and back across two polls costs two writes, which we accept - roster changes are rare and a write is cheap.
+   *
+   * The return value is the change signal the applyStatus chokepoint reads: this method persists to the context but never flushes, because the chokepoint is the one
+   * consumer that turns any projection's change into the poll's single cache write. A future caller that discards the signal forfeits that write, and the fresh-seed
+   * cadence pin reds when it does, since the seed's flush would never land.
+   */
+  private persistZoneRoster(): boolean {
 
     const zones = this.status.relays.map(zone => zoneIdentity(zone)).sort((a, b) => a.relay - b.relay);
 
     // After configureDevice's seed the context always carries a zones array, so the nullish fallback is a defensive floor for a context that predates the seed rather
     // than an expected path.
-    if(this.sameZoneRoster(this.accessory.context.zones ?? [], zones)) {
-
-      return;
-    }
-
-    this.accessory.context.zones = zones;
-    this.api.updatePlatformAccessories([this.accessory]);
-  }
-
-  // Compare two zone rosters entry by entry, delegating each pair to the shared field-wise identity comparison. We never compare by reference because the projection
-  // persistZoneRoster builds is a fresh array every poll, so a reference check would always differ and flush needlessly.
-  private sameZoneRoster(previous: HydrawiseZoneIdentity[], next: HydrawiseZoneIdentity[]): boolean {
-
-    if(previous.length !== next.length) {
+    if(sameEntries(this.accessory.context.zones ?? [], zones, sameZoneIdentity)) {
 
       return false;
     }
 
-    // We capture the paired entry and guard it before the field comparison. The equal-length check above guarantees a paired entry exists; the guard narrows the
-    // strict indexed-access `| undefined` so the comparison reads the fields directly, and a defensively-absent entry simply reports the rosters as differing.
-    return previous.every((entry, index) => {
+    this.accessory.context.zones = zones;
 
-      const other = next[index];
+    return true;
+  }
 
-      if(!other) {
+  /* Write the schedule projection to the accessory context when it changed since the last poll, and report whether it wrote - the roster's discipline above applied
+   * to the volatile half of what this accessory persists. The projection stores absolute instants, so an unchanged schedule projects byte-identically poll after
+   * poll and the comparison takes the no-change return; a projection compared before any has been persisted is a change by definition and seeds the context.
+   *
+   * Like the roster it never flushes, and the applyStatus chokepoint is the single consumer of the signal it returns.
+   */
+  private persistScheduleStatus(): boolean {
 
-        return false;
-      }
+    const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+    const previous = this.accessory.context.schedule;
 
-      return sameZoneIdentity(entry, other);
-    });
+    if(previous && sameScheduleStatus(previous, schedule)) {
+
+      return false;
+    }
+
+    this.accessory.context.schedule = schedule;
+
+    return true;
   }
 
   // Guard that a persisted context value is a well-formed zone roster: an array whose every entry passes the shared zone-identity shape check. A malformed prior
@@ -856,11 +878,11 @@ export class HydrawiseController {
     return Array.isArray(value) && value.every(entry => isZoneIdentity(entry));
   }
 
-  // Utility to test for whether a zone has been stopped due to a rain sensor.
+  // Utility to test for whether a zone has been stopped due to a rain sensor, delegating to the shared predicate in the types module against this poll's sensor
+  // block, so the operator's log and the persisted schedule projection answer from one rule.
   private isStoppedBySensor(zone: HydrawiseZoneConfig): boolean {
 
-    return !zone.run && !zone.timestr && (zone.time === 1576800000) &&
-      this.status.sensors.filter(sensor => sensor.type === 1).some(sensor => sensor.relays.some(relay => relay.id === zone.relay_id));
+    return isZoneStoppedBySensor(zone, this.status.sensors);
   }
 
   // Utility to conver the duration from seconds to minutes, with the correct plural marker.
@@ -914,7 +936,7 @@ export class HydrawiseController {
   // Utility to return whether all zones are suspended or not.
   private get isAllSuspended(): boolean {
 
-    return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== 1576800000) || this.isStoppedBySensor(zone));
+    return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== HYDRAWISE_SUSPENDED_SENTINEL) || this.isStoppedBySensor(zone));
   }
 
   // Utility to return our status as a JSON for MQTT.

@@ -1,0 +1,447 @@
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * hydrawise-controller.schedule.test.ts: The zone schedule projection the runtime persists into accessory context - the classifier that turns one wire zone into a
+ * schedule state, the whole-body projection and its self-describing header, the guards that classify a cache read, and the single flush chokepoint that carries
+ * both persisted projections. These pins fix the zero-cloud-call source the webUI's schedule display reads back, and above all its change-shaped cost: a poll whose
+ * facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
+ */
+
+// The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
+/* eslint-disable camelcase */
+import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_SUSPENDED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
+  scheduleStatus } from "./hydrawise-types.ts";
+import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
+  StatusScheduleResponse } from "./hydrawise-types.ts";
+import { bareSensors, normalZoneMatrix, rainSensors, syntheticController } from "./hydrawise-api.fixtures.ts";
+import { buildController, buildPlatform, waitFor } from "./testing/platform.helpers.ts";
+import { describe, test } from "node:test";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
+import assert from "node:assert/strict";
+import { firstOf } from "./testing.helpers.ts";
+import { zoneIdentity } from "./hydrawise-types.ts";
+
+// The wire root time the bespoke scenarios stamp, and the one-poll-interval step the drift scenarios advance it by. A nominal Hydrawise poll is sixty seconds, so
+// stepping the root clock by sixty while the zones' countdowns fall by the same sixty is exactly the steady state a live controller reports.
+const ROOT_TIME = 1715480009;
+const POLL_STEP = 60;
+
+// The relay ids the bespoke matrices use. The shared fixture matrix owns 700001 through 700019, and these scenarios stay inside that range so a relay id always
+// reads as this account's.
+const ALPHA_RELAY_ID = 700001;
+const BETA_RELAY_ID = 700002;
+
+// Compose a fast-cadence schedule around a zone list and a sensor block, so a live-loop test cycles in roughly 250ms rather than the wire-realistic minute.
+function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors, time = ROOT_TIME): StatusScheduleResponse {
+
+  return fastPolling(makeStatusSchedule({ relays: zones, sensors, time }));
+}
+
+// The identity-only roster projection, so a scenario can seed the context with a roster its first poll matches and isolate the schedule half of the chokepoint.
+function zoneRoster(zones: readonly HydrawiseZoneConfig[]): HydrawiseZoneIdentity[] {
+
+  return zones.map(zone => zoneIdentity(zone)).toSorted((a, b) => a.relay - b.relay);
+}
+
+// Read the accessory context back through its typed shape.
+function contextOf(accessory: { context: unknown }): HydrawiseAccessoryContext {
+
+  return accessory.context as HydrawiseAccessoryContext;
+}
+
+// Read the persisted schedule projection, failing the test rather than returning undefined when nothing was persisted, so every downstream assertion reads a real
+// value instead of passing vacuously against an absent one.
+function scheduleOf(accessory: { context: unknown }): HydrawiseScheduleStatus {
+
+  const persisted = contextOf(accessory).schedule;
+
+  assert.ok(persisted, "the accessory context carries a persisted schedule projection");
+
+  return persisted;
+}
+
+// Wait until the controller has completed more than the given number of polls, which is what guarantees the poll before it fully ran its comparisons before a test
+// reads the flush count.
+async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
+
+  await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > count) ? true : undefined);
+}
+
+// The all-scheduled drift matrix: two zones whose countdowns fall by exactly one poll interval per step while their run durations hold. The scheduled arm's stored
+// absolutes are the sums of the root time and these countdowns, so every step of this matrix projects to the identical facts.
+function scheduledDrift(step: number): HydrawiseZoneConfig[] {
+
+  return [
+
+    makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000 - (step * POLL_STEP), timestr: "16:00" }),
+    makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 300, time: 69000 - (step * POLL_STEP), timestr: "16:08" })
+  ];
+}
+
+// The running drift matrix: one zone running now, its remaining run falling by one poll interval per step while the wire's running marker holds. The running arm
+// stores the end instant, which the root clock and the remaining run sum to identically at every step.
+function runningDrift(step: number): HydrawiseZoneConfig[] {
+
+  return [makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 600 - (step * POLL_STEP), time: 1, timestr: "" })];
+}
+
+describe("HydrawiseController schedule classification", () => {
+
+  test("classifies each zone of the shared matrix by its own reported state", () => {
+
+    const status = normalSchedule();
+    const projection = scheduleStatus(status, HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+    const running = firstOf(projection.zones, "zone");
+
+    // Relay 1 is the matrix's running zone: its end instant is the root time plus the run remaining, and the arm carries no duration at all - persisting the live
+    // countdown is exactly what the absolute-time shape exists to avoid, so its absence is asserted on the key set rather than merely on a value.
+    assert.deepEqual(running, { endsAt: status.time + 600, relayId: 700001, state: "running" }, "the running zone projects its end instant");
+    assert.deepEqual(Object.keys(running).toSorted(), [ "endsAt", "relayId", "state" ], "the running arm carries no duration field");
+
+    // Every other zone of the matrix is scheduled, whether inside the active window or far beyond it: the window is a display concern the projection describes
+    // rather than a classification the projection makes.
+    for(const zone of normalZoneMatrix.slice(1)) {
+
+      const entry = projection.zones.find(candidate => candidate.relayId === zone.relay_id);
+
+      assert.deepEqual(entry, { durationSeconds: zone.run, nextRunAt: status.time + zone.time, relayId: zone.relay_id, state: "scheduled" },
+        "a scheduled zone projects its absolute next run and its duration");
+    }
+  });
+
+  test("classifies a sensor-covered sentinel zone as sensor-stopped and an uncovered one as suspended", () => {
+
+    const covered = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
+    const uncovered = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
+
+    // The rain sensor's relay list names every zone of the shared matrix, which includes Alpha's relay id but not Beta's own sentinel-carrying identity being
+    // excluded any other way: the two zones differ only in whether a type-1 sensor claims them.
+    const sensors: StatusScheduleResponse["sensors"] = [{ input: 0, mode: 1, relays: [{ id: ALPHA_RELAY_ID }], type: HYDRAWISE_RAIN_SENSOR_TYPE }];
+    const projection = scheduleStatus(makeStatusSchedule({ relays: [ covered, uncovered ], sensors, time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones, [ { relayId: ALPHA_RELAY_ID, state: "sensor-stopped" }, { relayId: BETA_RELAY_ID, state: "suspended" } ],
+      "the sensor block is what tells a rain stop from a suspension, since both carry the same sentinel");
+  });
+
+  test("a sensor-covered sentinel zone still reporting a run or a schedule string is suspended, not sensor-stopped", () => {
+
+    // Each of these zones carries the sentinel AND sits in the rain sensor's relay list, so only the remaining conjuncts of the sensor predicate can tell them
+    // apart from a genuine rain stop. A build that drops either conjunct classifies them as sensor-stopped and reds here.
+    const withRun = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
+    const withTimestr = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "16:00" });
+    const projection = scheduleStatus(makeStatusSchedule({ relays: [ withRun, withTimestr ], sensors: rainSensors, time: ROOT_TIME }),
+      HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "suspended", "suspended" ] as HydrawiseZoneScheduleState[],
+      "a covered zone that still reports a run or a start time is suspended, so every conjunct of the sensor predicate is carried");
+  });
+
+  test("orders the projected zones by relay regardless of the order the wire reported them", () => {
+
+    const shuffled = [
+
+      makeZone({ name: "Third", relay: 9, relay_id: 700003, run: 480, time: 68000, timestr: "16:00" }),
+      makeZone({ name: "First", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" }),
+      makeZone({ name: "Second", relay: 4, relay_id: BETA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" })
+    ];
+    const projection = scheduleStatus(makeStatusSchedule({ relays: shuffled, sensors: bareSensors, time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.notDeepEqual(shuffled.map(zone => zone.relay_id), [ ALPHA_RELAY_ID, BETA_RELAY_ID, 700003 ], "the input order must differ from relay order to mean anything");
+    assert.deepEqual(projection.zones.map(zone => zone.relayId), [ ALPHA_RELAY_ID, BETA_RELAY_ID, 700003 ], "the projection orders its zones by relay");
+  });
+
+  test("describes itself with the active window and the wire's own root time", () => {
+
+    const status = normalSchedule();
+    const projection = scheduleStatus(status, HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.equal(projection.activeWindowSeconds, HYDRAWISE_ACTIVE_ZONE_INDICATOR, "the active window travels with the data rather than being hardcoded by consumers");
+    assert.equal(projection.asOf, status.time, "asOf is the wire's own root time, never a local clock read");
+  });
+});
+
+describe("HydrawiseController schedule guards", () => {
+
+  test("rejects a zone entry whose state is valid but whose own arm field is missing or mistyped", () => {
+
+    assert.ok(isZoneScheduleStatus({ endsAt: ROOT_TIME, relayId: ALPHA_RELAY_ID, state: "running" }), "a well-formed running entry passes");
+    assert.ok(!isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "running" }), "a running entry missing its end instant fails");
+    assert.ok(!isZoneScheduleStatus({ endsAt: "soon", relayId: ALPHA_RELAY_ID, state: "running" }), "a running entry whose end instant is not numeric fails");
+
+    assert.ok(isZoneScheduleStatus({ durationSeconds: 480, nextRunAt: ROOT_TIME, relayId: ALPHA_RELAY_ID, state: "scheduled" }), "a well-formed scheduled entry passes");
+    assert.ok(!isZoneScheduleStatus({ nextRunAt: ROOT_TIME, relayId: ALPHA_RELAY_ID, state: "scheduled" }), "a scheduled entry missing its duration fails");
+    assert.ok(!isZoneScheduleStatus({ durationSeconds: 480, relayId: ALPHA_RELAY_ID, state: "scheduled" }), "a scheduled entry missing its next run fails");
+    assert.ok(!isZoneScheduleStatus({ durationSeconds: 480, nextRunAt: "later", relayId: ALPHA_RELAY_ID, state: "scheduled" }),
+      "a scheduled entry whose next run is not numeric fails");
+
+    assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "sensor-stopped" }), "a sensor-stopped entry needs nothing beyond its state");
+    assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "suspended" }), "a suspended entry needs nothing beyond its state");
+    assert.ok(!isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "watering" }), "a state the union does not declare fails");
+    assert.ok(!isZoneScheduleStatus({ endsAt: ROOT_TIME, state: "running" }), "an entry with no relay id fails");
+    assert.ok(!isZoneScheduleStatus(null), "a non-object fails");
+  });
+
+  test("rejects a projection whose header is malformed or whose zones do not all pass", () => {
+
+    const zones = [{ endsAt: ROOT_TIME, relayId: ALPHA_RELAY_ID, state: "running" }];
+
+    assert.ok(isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME, zones }), "a well-formed projection passes");
+    assert.ok(!isScheduleStatus({ asOf: ROOT_TIME, zones }), "a projection missing its active window fails");
+    assert.ok(!isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, zones }), "a projection missing its timestamp fails");
+    assert.ok(!isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME, zones: "none" }), "a non-array zone list fails");
+    assert.ok(!isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME,
+      zones: [ ...zones, { relayId: BETA_RELAY_ID, state: "running" } ] }), "one malformed entry fails the whole projection");
+    assert.ok(!isScheduleStatus(null), "a non-object fails");
+  });
+});
+
+describe("HydrawiseController schedule persistence (poll)", () => {
+
+  test("a fresh first poll seeds both projections through a single flush", async (t) => {
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    const persisted = scheduleOf(h.accessory);
+
+    assert.equal(h.flushes.length, 1, "the roster seed and the schedule seed ride one flush, and the unchanged second poll adds none");
+    assert.equal(persisted.zones.length, normalZoneMatrix.length, "the projection carries every reported zone");
+    assert.equal(persisted.asOf, normalSchedule().time, "the seeded projection carries the wire's root time");
+  });
+
+  test("a feature-disabled zone still appears in the persisted projection", async (t) => {
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
+      signalAborted: false, userOptions: ["Disable.Device.700002"] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
+
+    // The projection takes no feature parameter and structurally cannot exclude a zone, so this pin guards a future writer who threads the enabled-zone set into
+    // it rather than distinguishing what the code does today.
+    assert.ok(scheduleOf(h.accessory).zones.some(zone => zone.relayId === 700002), "the persisted projection is the complete reported set, feature options aside");
+  });
+
+  test("falling countdowns on a stable schedule cost no flush at all", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(scheduledDrift(0)), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(scheduledDrift(1), bareSensors, ROOT_TIME + POLL_STEP), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    // The two wire bodies genuinely differ - the root clock advanced and every countdown fell - yet they describe the same scheduled instants, so the change gate
+    // takes its no-change return and the seed remains the only flush of the run.
+    assert.equal(h.flushes.length, 1, "a poll whose facts did not move costs no cache write, however far the wire's countdowns fell");
+    assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "asOf holds at the poll that last changed the facts rather than tracking the wire clock");
+  });
+
+  test("a running zone's falling remaining time costs no flush at all", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(runningDrift(0)), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(runningDrift(1), bareSensors, ROOT_TIME + POLL_STEP), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    const persisted = firstOf(scheduleOf(h.accessory).zones, "zone");
+
+    assert.equal(h.flushes.length, 1, "a running zone whose remaining time fell in lockstep with the clock costs no cache write");
+    assert.deepEqual(persisted, { endsAt: ROOT_TIME + 600, relayId: ALPHA_RELAY_ID, state: "running" },
+      "the stored fact is the end instant, which held across both polls");
+  });
+
+  test("a genuine schedule move flushes once and advances asOf to the poll that moved it", async (t) => {
+
+    // The second body breaks the drift pattern: the root clock advances a poll interval while Alpha's countdown falls by twice that, which is a schedule that
+    // genuinely moved earlier rather than a countdown ticking down.
+    const moved = scheduledDrift(1);
+
+    moved[0] = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000 - (2 * POLL_STEP), timestr: "16:00" });
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(scheduledDrift(0)), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(moved, bareSensors, ROOT_TIME + POLL_STEP), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    const persisted = scheduleOf(h.accessory);
+    const alpha = firstOf(persisted.zones, "zone");
+
+    assert.equal(h.flushes.length, 2, "the seed flushes once and the moved schedule flushes once");
+    assert.deepEqual(alpha, { durationSeconds: 480, nextRunAt: ROOT_TIME + 68000 - POLL_STEP, relayId: ALPHA_RELAY_ID, state: "scheduled" },
+      "the persisted next run adopted the moved instant");
+    assert.equal(persisted.asOf, ROOT_TIME + POLL_STEP, "asOf advanced to the root time of the poll that moved the facts");
+  });
+
+  test("one zone swapped for another at the same zone count is a change, not a match", async (t) => {
+
+    const before = scheduledDrift(0);
+    const after = [ firstOf(before, "zone"), makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 300, time: 69000, timestr: "16:08" }) ];
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(before), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(after), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    // The two projections carry the same zone count and the same schedule facts at every index but one, so a comparison that stopped at the length - or that
+    // compared only the arm's own facts without the relay id - would call these equal and never write the swap.
+    assert.equal(h.flushes.length, 2, "the seed flushes once and the swapped zone flushes once");
+    assert.deepEqual(scheduleOf(h.accessory).zones.map(zone => zone.relayId), [ ALPHA_RELAY_ID, 700003 ], "the persisted projection adopted the swapped zone");
+  });
+
+  test("a roster-only change flushes exactly once and leaves the schedule value untouched", async (t) => {
+
+    const alpha = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
+    const beta = makeZone({ name: "Beta", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
+    const seeded = scheduleStatus(schedule([alpha]), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    // Seed BOTH projections with what poll 1 reports, so poll 1 moves neither and the rename on poll 2 is the only change the run contains.
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([alpha]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([beta]), kind: "response" });
+    }, seedContext: (seed) => { seed.context = { schedule: seeded, zones: zoneRoster([alpha]) }; }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    // A flush count alone cannot say which projection moved, because both ride the one channel, so the schedule half's no-change claim is asserted on the
+    // persisted value itself: a rename changes no schedule fact, and asOf therefore holds too.
+    assert.equal(h.flushes.length, 1, "the matching first poll flushes nothing and the rename flushes exactly once");
+    assert.deepEqual(scheduleOf(h.accessory), seeded, "a zone rename moves no schedule fact, asOf included");
+    assert.equal(firstOf(contextOf(h.accessory).zones ?? [], "zone").name, "Beta", "the persisted roster adopted the renamed zone");
+  });
+});
+
+describe("HydrawiseController schedule restore (restart)", () => {
+
+  test("a well-formed prior projection survives the context wipe and a matching first poll neither flushes nor re-times it", async (t) => {
+
+    const zones = scheduledDrift(0);
+    const prior: HydrawiseScheduleStatus = { ...scheduleStatus(schedule(zones), HYDRAWISE_ACTIVE_ZONE_INDICATOR), asOf: ROOT_TIME - 3600 };
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
+      seedContext: (seed) => { seed.context = { schedule: prior, zones: zoneRoster(zones) }; }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.deepEqual(contextOf(h.accessory).schedule, prior, "the prior projection survives the constructor's wipe-then-seed pass");
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    // Retaining the restored asOf is the deliberate conservatism of the design: the facts held when they were written and they still hold, and the only surface
+    // that reads asOf is the display's staleness notice.
+    assert.equal(h.flushes.length, 0, "a first poll that matches the restored projection writes nothing at all");
+    assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME - 3600, "the restored timestamp is retained, because the facts it dates have not moved");
+  });
+
+  test("a malformed prior projection degrades to absent and the first poll writes fresh through one flush", async (t) => {
+
+    const malformed = [
+
+      { label: "a zone entry missing its arm field", value: { activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME,
+        zones: [{ relayId: ALPHA_RELAY_ID, state: "running" }] } },
+      { label: "a zone entry whose arm field is mistyped", value: { activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME,
+        zones: [{ durationSeconds: 480, nextRunAt: "later", relayId: ALPHA_RELAY_ID, state: "scheduled" }] } },
+      { label: "a state the union does not declare", value: { activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME,
+        zones: [{ relayId: ALPHA_RELAY_ID, state: "watering" }] } },
+      { label: "a non-array zone list", value: { activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME, zones: "none" } }
+    ];
+
+    for(const { label, value } of malformed) {
+
+      const zones = scheduledDrift(0);
+      const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
+        seedContext: (seed) => { seed.context = { schedule: value, zones: zoneRoster(zones) }; }, signalAborted: false });
+
+      t.after(() => h.abort());
+
+      // eslint-disable-next-line no-await-in-loop
+      await pollsCompleted(h, 2);
+      h.abort();
+
+      assert.equal(h.flushes.length, 1, "a first poll after " + label + " writes the projection fresh through exactly one flush");
+      assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "the freshly written projection carries this poll's root time");
+    }
+  });
+
+  test("a prior projection corrupt only in its timestamp is dropped at restore rather than surviving the first poll's compare", async (t) => {
+
+    // This is the one corruption shape the first poll cannot heal: every compared fact matches what the poll will project, and the damage sits entirely in
+    // asOf, the field the equality deliberately excludes. An unguarded restore would judge the projections equal, skip the flush, and persist the corrupt
+    // timestamp indefinitely, so the restore guard is the only line between this value and the cache - which is exactly what this case distinguishes.
+    const zones = scheduledDrift(0);
+    const corrupt = { ...scheduleStatus(schedule(zones), HYDRAWISE_ACTIVE_ZONE_INDICATOR), asOf: "yesterday" };
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
+      seedContext: (seed) => { seed.context = { schedule: corrupt, zones: zoneRoster(zones) }; }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    assert.equal(h.flushes.length, 1, "the corrupt-timestamp prior is dropped at restore, so the first poll seeds the projection through exactly one flush");
+    assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "the freshly written projection carries this poll's numeric root time, never the corrupt value");
+  });
+});
+
+describe("HydrawiseController schedule exclusivity", () => {
+
+  test("a context carrying a schedule is not a zone accessory context", () => {
+
+    const ownerController = { controllerId: 500001, name: "Test Controller", serialNumber: syntheticController.serial_number };
+    const zone: HydrawiseZoneIdentity = { name: "Alpha", relay: 1, relayId: ALPHA_RELAY_ID };
+    const projection = scheduleStatus(schedule(scheduledDrift(0)), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.ok(isZoneAccessoryContext({ ownerController, zone }), "the schedule-free zone pair is a zone accessory context");
+    assert.ok(!isZoneAccessoryContext({ ownerController, schedule: projection, zone }),
+      "a schedule leaking onto a zone accessory makes it classify as not-a-zone, the self-healing direction");
+  });
+
+  test("a reconciled standalone accessory's context carries the zone pair alone", () => {
+
+    const zone = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
+    const { platform, registered } = buildPlatform();
+
+    platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([ALPHA_RELAY_ID]),
+      zones: [{ displayName: zone.name, identity: zoneIdentity(zone) }] });
+
+    // Declared reach: the reconcile assigns a complete fresh two-field object today, so this pin guards a future writer who reaches for a field write rather than
+    // distinguishing what the code does now.
+    assert.deepEqual(Object.keys(firstOf(registered, "accessory").context).toSorted(), [ "ownerController", "zone" ],
+      "no schedule projection reaches a standalone zone accessory's context");
+  });
+});
