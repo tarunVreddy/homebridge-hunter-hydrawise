@@ -54,6 +54,25 @@ The topics and messages that `homebridge-hunter-hydrawise` publishes are:
 |-----------------------|----------------------------------
 | `controller`          | JSON containing the current status of the irrigation controller and all the zones associated with it.
 
+The `controller` payload is a JSON array with one entry per zone, in the order Hydrawise reports them. Each entry carries:
+
+| Field                 | Description
+|-----------------------|----------------------------------
+| **name**              | The name of the zone, as reported by Hydrawise.
+| **relay**             | The zone number, as shown on the irrigation controller.
+| **run**               | Seconds: the time remaining when the zone is running, otherwise the duration of its next scheduled run.
+| **time**              | Seconds until the next scheduled run. `1` means the zone is running now, and `1576800000` means the zone is suspended.
+| **timestr**           | The start time of the next scheduled run, in the irrigation controller's own local time.
+
+For example:
+
+> ```json
+> [
+>   { "name": "Front Lawn", "relay": 1, "run": 600, "time": 1, "timestr": "" },
+>   { "name": "Rear Lawn", "relay": 2, "run": 480, "time": 1800, "timestr": "16:00" }
+> ]
+> ```
+
 Messages are published to MQTT when an action occurs on a device that triggers the respective event, or when an MQTT message is received for one of the topics `homebridge-hunter-hydrawise` subscribes to.
 
 ### <A NAME="subscribe"></A>Topics Subscribed
