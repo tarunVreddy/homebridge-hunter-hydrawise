@@ -6,7 +6,7 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { SUSPENDED_SENTINEL, allRelayIds } from "./hydrawise-api.fixtures.ts";
+import { UNSCHEDULED_SENTINEL, allRelayIds } from "./hydrawise-api.fixtures.ts";
 import { allSuspended, fastPolling, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./hydrawise-api.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
@@ -91,7 +91,7 @@ describe("scenario composers", () => {
 
     const schedule = rainStopped();
 
-    assert.ok(schedule.relays.every(zone => zone.time === SUSPENDED_SENTINEL), "every rain-stopped zone carries the suspend sentinel");
+    assert.ok(schedule.relays.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every rain-stopped zone carries the unscheduled sentinel");
     assert.deepEqual(firstOf(schedule.sensors, "sensor").relays.map(relay => relay.id), [...allRelayIds], "the rain sensor references every zone relay");
   });
 
@@ -99,7 +99,7 @@ describe("scenario composers", () => {
 
     const schedule = allSuspended();
 
-    assert.ok(schedule.relays.every(zone => zone.time === SUSPENDED_SENTINEL), "every suspended zone carries the suspend sentinel");
+    assert.ok(schedule.relays.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every suspended zone carries the unscheduled sentinel");
     assert.equal(firstOf(schedule.sensors, "sensor").relays.length, 0, "the bare sensor references no zone, distinguishing suspend from a rain stop");
   });
 

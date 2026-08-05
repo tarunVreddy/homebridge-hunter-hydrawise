@@ -6,16 +6,16 @@
  * Provenance: the wire shapes mirror captured Hydrawise cloud API v1 responses (customerdetails.php and statusschedule.php) recorded in May 2024 and retained
  * as the repo-root development references. Every identifier here is synthesized - the controller and customer ids, the serial number, the relay ids, and every
  * zone display name are invented values that appear nowhere in those captures - so no real account data reaches the tracked test tree. The numeric field types
- * are wire-accurate: ids and timestamps are numbers, the sentinel far-future timestamp is the literal Hydrawise uses to mark a suspended zone.
+ * are wire-accurate: ids and timestamps are numbers, the sentinel far-future timestamp is the literal Hydrawise uses to mark a zone with no upcoming run.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { CustomerDetailsResponse, HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
 
-// The far-future timestamp Hydrawise stamps on a zone's `time` field to mark it suspended. Fixed by the upstream API, so it is a named constant rather than a
-// magic literal scattered through the sentinel matrix below.
-export const SUSPENDED_SENTINEL = 1576800000;
+// The far-future timestamp Hydrawise stamps on a zone's `time` field when it reports no upcoming run. Fixed by the upstream API, so it is a named constant rather
+// than a magic literal scattered through the sentinel matrix below.
+export const UNSCHEDULED_SENTINEL = 1576800000;
 
 // The synthetic controller identity every fixture shares. Distinct from the captured account's real controller id and serial number.
 export const syntheticController: HydrawiseControllerConfig = {
@@ -63,31 +63,31 @@ export const normalZoneMatrix: readonly HydrawiseZoneConfig[] = [
   { name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 840, time: 114991, timestr: "Mon" }
 ];
 
-/* The all-suspended zone matrix: the same 19 synthetic identities, each stamped with the suspend sentinel `time` and an empty run and schedule string. Combined
- * with a sensor block that does or does not reference the relay ids, this shape distinguishes an all-zones-suspended controller (bare sensors) from a
- * rain-sensor stop (relay-referencing sensors).
+/* The all-sentinel zone matrix: the same 19 synthetic identities, each stamped with the unscheduled sentinel `time` and an empty run and schedule string. Combined
+ * with a sensor block that does or does not reference the relay ids, this shape distinguishes a controller with nothing scheduled - a suspend-all included, since
+ * the wire normalizes one to this exact shape (bare sensors) - from a rain-sensor stop (relay-referencing sensors).
  */
 export const sentinelZoneMatrix: readonly HydrawiseZoneConfig[] = [
 
-  { name: "Front Lawn North", relay: 1, relay_id: 700001, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Front Lawn South", relay: 2, relay_id: 700002, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Driveway Border", relay: 3, relay_id: 700003, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Walkway Edge", relay: 4, relay_id: 700004, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Rear Lawn North", relay: 9, relay_id: 700005, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Rear Lawn South", relay: 10, relay_id: 700006, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Rear Planter Bed", relay: 11, relay_id: 700007, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Rear Center Bed", relay: 12, relay_id: 700008, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Rose Garden", relay: 13, relay_id: 700009, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "East Path A", relay: 17, relay_id: 700010, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "East Path B", relay: 18, relay_id: 700011, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "East Border", relay: 22, relay_id: 700012, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "West Border", relay: 23, relay_id: 700013, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "East Drip Line", relay: 27, relay_id: 700014, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "West Drip Line", relay: 28, relay_id: 700015, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "North Strip", relay: 29, relay_id: 700016, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "South Strip", relay: 30, relay_id: 700017, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "South Planter", relay: 31, relay_id: 700018, run: 0, time: SUSPENDED_SENTINEL, timestr: "" },
-  { name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 0, time: SUSPENDED_SENTINEL, timestr: "" }
+  { name: "Front Lawn North", relay: 1, relay_id: 700001, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Front Lawn South", relay: 2, relay_id: 700002, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Driveway Border", relay: 3, relay_id: 700003, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Walkway Edge", relay: 4, relay_id: 700004, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Rear Lawn North", relay: 9, relay_id: 700005, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Rear Lawn South", relay: 10, relay_id: 700006, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Rear Planter Bed", relay: 11, relay_id: 700007, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Rear Center Bed", relay: 12, relay_id: 700008, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Rose Garden", relay: 13, relay_id: 700009, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "East Path A", relay: 17, relay_id: 700010, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "East Path B", relay: 18, relay_id: 700011, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "East Border", relay: 22, relay_id: 700012, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "West Border", relay: 23, relay_id: 700013, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "East Drip Line", relay: 27, relay_id: 700014, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "West Drip Line", relay: 28, relay_id: 700015, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "North Strip", relay: 29, relay_id: 700016, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "South Strip", relay: 30, relay_id: 700017, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "South Planter", relay: 31, relay_id: 700018, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" },
+  { name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" }
 ];
 
 // The full set of synthetic relay ids, in matrix order. The rain-sensor block references these so isStoppedBySensor resolves true for the sentinel matrix.
@@ -99,7 +99,7 @@ export const rainSensors: StatusScheduleResponse["sensors"] = [
   { input: 0, mode: 1, relays: allRelayIds.map(id => ({ id })), type: 1 }
 ];
 
-// A type-1 sensor whose relay list references no zone. On the sentinel matrix this leaves isStoppedBySensor false, the all-suspended state distinct from a rain stop.
+// A type-1 sensor whose relay list references no zone. On the sentinel matrix this leaves isStoppedBySensor false, the all-unscheduled state distinct from a rain stop.
 export const bareSensors: StatusScheduleResponse["sensors"] = [
 
   { input: 0, mode: 1, relays: [], type: 1 }

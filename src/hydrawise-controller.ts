@@ -5,8 +5,8 @@
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT,
   HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
-import { HYDRAWISE_SUSPENDED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
-  sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity } from "./hydrawise-types.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
+  sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity, zoneScheduleStatus } from "./hydrawise-types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
   StatusScheduleResponse } from "./hydrawise-types.ts";
@@ -745,22 +745,35 @@ export class HydrawiseController {
     return this.platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT, params);
   }
 
-  // Utility to return the status of a zone to a user.
+  /* Utility to return the status of a zone to a user. The sentence comes from the schedule classifier's own reading of this poll, which is the same reading the
+   * persisted projection and the webUI display are built from, so a zone's log line and its displayed status can never tell different stories. Each arm then
+   * composes its sentence from the wire fields the classifier already weighed.
+   *
+   * Every state the union declares is named here with no default arm, so a state added to the union surfaces as a compile error - a return path the analysis can
+   * see falling off the end - rather than as a zone silently rendering someone else's sentence.
+   */
   private zoneStatus(zone: HydrawiseZoneConfig): string {
 
-    if(this.isStoppedBySensor(zone)) {
+    switch(zoneScheduleStatus(zone, this.status).state) {
 
-      return "Rain sensor is preventing irrigation.";
-    }
+      case "running":
 
-    // If we're currently running, inform the user of the remaining duration. Otherwise, inform the user of the next runtime.
-    if(zone.time === 1) {
+        return "Currently running with " + this.getMinutes(zone.run) + " remaining.";
 
-      return "Currently running with " + this.getMinutes(zone.run) + " remaining.";
-    } else {
+      case "scheduled":
 
-      return "Next run will be " + (zone.timestr.includes(":") ? "at " + this.formatStartTime(zone.timestr) : "on " + zone.timestr) + " for " +
-        this.getMinutes(zone.run) + ".";
+        return "Next run will be " + (zone.timestr.includes(":") ? "at " + this.formatStartTime(zone.timestr) : "on " + zone.timestr) + " for " +
+          this.getMinutes(zone.run) + ".";
+
+      case "sensor-stopped":
+
+        return "Rain sensor is preventing irrigation.";
+
+      case "unscheduled":
+
+        // The wire reports no upcoming run, and that is the whole claim: a zone between schedule computations and a zone the owner suspended read identically, so
+        // the sentence states the absence rather than guessing at its cause.
+        return "No runs are currently scheduled.";
     }
   }
 
@@ -878,11 +891,11 @@ export class HydrawiseController {
     return Array.isArray(value) && value.every(entry => isZoneIdentity(entry));
   }
 
-  // Utility to test for whether a zone has been stopped due to a rain sensor, delegating to the shared predicate in the types module against this poll's sensor
-  // block, so the operator's log and the persisted schedule projection answer from one rule.
+  // Utility to test for whether a zone has been stopped due to a rain sensor, delegating to the shared predicate in the types module against this poll's whole
+  // status body - the sensor block and the zones those sensors cover alike - so the operator's log and the persisted schedule projection answer from one rule.
   private isStoppedBySensor(zone: HydrawiseZoneConfig): boolean {
 
-    return isZoneStoppedBySensor(zone, this.status.sensors);
+    return isZoneStoppedBySensor(zone, this.status);
   }
 
   // Utility to conver the duration from seconds to minutes, with the correct plural marker.
@@ -933,10 +946,14 @@ export class HydrawiseController {
     return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
   }
 
-  // Utility to return whether all zones are suspended or not.
+  /* Utility to return whether the account reads as fully suspended, which is what drives the suspend-all switch's state. Every zone carrying the unscheduled
+   * sentinel with no sensor stop is the strongest evidence the v1 wire offers for a suspend-all, and it is what the API itself normalizes a suspend-all command to.
+   * The wire cannot distinguish that from an account whose every zone merely sits between runs, so the switch can read on without a suspension having been
+   * commanded - the standing v1 ambiguity, resolved here in favor of reflecting the commanded state whenever one was issued.
+   */
   private get isAllSuspended(): boolean {
 
-    return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== HYDRAWISE_SUSPENDED_SENTINEL) || this.isStoppedBySensor(zone));
+    return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== HYDRAWISE_UNSCHEDULED_SENTINEL) || this.isStoppedBySensor(zone));
   }
 
   // Utility to return our status as a JSON for MQTT.

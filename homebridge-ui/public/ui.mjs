@@ -169,7 +169,7 @@ const isZoneScheduleStatus = (value) => {
       return (typeof value.durationSeconds === "number") && (typeof value.nextRunAt === "number");
 
     case "sensor-stopped":
-    case "suspended":
+    case "unscheduled":
 
       // These states carry no facts beyond the state itself, so a well-formed relay id and a known state are the whole shape.
       return true;
@@ -743,7 +743,9 @@ const deriveZoneDisplay = (entry, meta, nowSeconds) => {
 
     default:
 
-      return { rows: [[ "Status", "Suspended" ]], stale: false };
+      // The unscheduled state claims exactly what the wire supports - no upcoming run - because a zone between schedule computations and a zone the owner
+      // suspended carry identical bodies, and labeling either one "Suspended" would routinely misreport a healthy zone.
+      return { rows: [[ "Status", "Not scheduled" ]], stale: false };
   }
 };
 
@@ -751,8 +753,8 @@ const deriveZoneDisplay = (entry, meta, nowSeconds) => {
  * This is a pure read of the same persisted entries the zone panels read, at the same shared instant, so the controller panel and its zones can never tell
  * different stories.
  *
- * A projection that is absent OR names no zone at all renders no schedule rows, deliberately: an account with no zones is not an account whose zones are all
- * suspended, and folding an empty set to "Suspended" would say exactly that.
+ * A projection that is absent OR names no zone at all renders no schedule rows, deliberately: an account with no zones is not an account with nothing scheduled,
+ * and folding an empty set to "Not scheduled" would say exactly that.
  */
 const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
 
@@ -782,7 +784,7 @@ const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
     rows.push([ "Status", "Rain delay" ]);
   } else {
 
-    rows.push([ "Status", "Suspended" ]);
+    rows.push([ "Status", "Not scheduled" ]);
   }
 
   // Every running zone is named, not just the first: the runtime genuinely runs zones concurrently, so a single-zone row would hide water that is flowing.

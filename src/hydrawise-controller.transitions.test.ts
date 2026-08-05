@@ -9,7 +9,7 @@
 /* eslint-disable camelcase */
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
 import { bareSensors, rainSensors } from "./hydrawise-api.fixtures.ts";
-import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, countLogged, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
 import { Service } from "./testing/hap.helpers.ts";
@@ -33,7 +33,9 @@ function runningZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZon
   return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 600, time: 1, timestr: "", ...overrides });
 }
 
-// A single zone stopped by a rain sensor (suspend sentinel, no run, no schedule string).
+// A zone carrying the unscheduled sentinel with no run and no schedule string. A rain-sensor stop, an owner's suspension, and a zone between runs present this
+// shape identically, so which one a scenario describes rests on the covering sensor's group: every covered zone sentineled reads as a rain stop, a scheduled
+// sibling among them leaves the rest merely unscheduled.
 function rainZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
 
   return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: 1576800000, timestr: "", ...overrides });
@@ -90,6 +92,87 @@ describe("HydrawiseController updateState transitions", () => {
 
     assert.ok(loggedAt(h.lines(), "info", "Rain sensor is stopping irrigation"), "a rain stop should be logged");
     assert.ok(loggedAt(h.lines(), "info", "Rain sensor is allowing irrigation"), "a rain clear should be logged");
+  });
+
+  test("names each zone's own state at its first sighting", async (t) => {
+
+    // One covered zone carrying the sentinel while a covered sibling still holds a schedule, plus a zone running now, so a single first poll reports a suspended,
+    // a scheduled, and a running zone side by side - each of which must reach the operator in its own sentence.
+    const zones = [ rainZone(), scheduledZone({ name: "Beta", relay: 2, relay_id: 700002 }), runningZone({ name: "Gamma", relay: 3, relay_id: 700003 }) ];
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones, rainSensors), kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => loggedAt(h.lines(), "info", "Gamma [Zone 3]: Currently running") ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "info", "Alpha [Zone 1]: No runs are currently scheduled."), "an unscheduled zone states the absence rather than guessing a cause");
+    assert.ok(loggedAt(h.lines(), "info", "Beta [Zone 2]: Next run will be at 4:00 PM for 8 minutes."), "a scheduled zone reports the run its wire fields describe");
+    assert.ok(loggedAt(h.lines(), "info", "Gamma [Zone 3]: Currently running with 10 minutes remaining."), "a running zone reports the time it has left");
+  });
+
+  test("names a genuinely rain-stopped zone at its first sighting", async (t) => {
+
+    const zones = [ rainZone(), rainZone({ name: "Beta", relay: 2, relay_id: 700002 }) ];
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones, rainSensors), kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => loggedAt(h.lines(), "info", "Beta [Zone 2]:") ? true : undefined);
+
+    // Every zone the sensor covers carries the sentinel, so the sensor itself is the evidence and both zones read as rain-stopped rather than merely unscheduled.
+    assert.ok(loggedAt(h.lines(), "info", "Alpha [Zone 1]: Rain sensor is preventing irrigation."), "a fully sentineled covered group reads as a rain stop");
+    assert.ok(loggedAt(h.lines(), "info", "Beta [Zone 2]: Rain sensor is preventing irrigation."), "every zone of that group reads the same way");
+  });
+
+  test("a zone losing its schedule while a covered sibling still has one logs no rain transition", async (t) => {
+
+    const before = [ rainZone(), scheduledZone({ name: "Beta", relay: 2, relay_id: 700002 }), scheduledZone({ name: "Gamma", relay: 3, relay_id: 700003 }) ];
+    const after = [ rainZone(), rainZone({ name: "Beta", relay: 2, relay_id: 700002 }), scheduledZone({ name: "Gamma", relay: 3, relay_id: 700003 }) ];
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(before, rainSensors), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(after, rainSensors), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // Wait past the poll that moves Beta so the transition has certainly been processed, then confirm it produced no rain line. Gamma still holds a schedule under
+    // the same sensor, so the sensor is demonstrably not tripping and Beta is merely without a run - a state the rain sentence would misreport.
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "info", "Alpha [Zone 1]: No runs are currently scheduled."), "the first poll's mixed body was processed");
+    assert.equal(countLogged(h.lines(), "info", "Rain sensor is stopping irrigation"), 0, "suspending a zone under a sensor that is not tripping is not a rain stop");
+  });
+
+  test("the last covered sibling losing its schedule flips the whole group, and regaining it flips the group back", async (t) => {
+
+    const mixed = [ rainZone(), scheduledZone({ name: "Beta", relay: 2, relay_id: 700002 }) ];
+    const stopped = [ rainZone(), rainZone({ name: "Beta", relay: 2, relay_id: 700002 }) ];
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(mixed, rainSensors), kind: "response" });
+      recorder.program("statusschedule.php", { body: schedule(stopped, rainSensors), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(mixed, rainSensors), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => loggedAt(h.lines(), "info", "Beta [Zone 2]: Rain sensor is allowing irrigation.") ? true : undefined);
+
+    /* Alpha's own wire body never moves across these three polls - it carries the sentinel throughout - so both of its lines are driven entirely by Beta, the last
+     * covered sibling holding a schedule. Each line is asserted name-qualified because a bare substring cannot tell both zones logging from only the zone whose
+     * own body changed, and Alpha's line is precisely the sibling-driven flip worth pinning.
+     */
+    assert.ok(loggedAt(h.lines(), "info", "Alpha [Zone 1]: Rain sensor is stopping irrigation."), "the group completing stops the zone that never moved");
+    assert.ok(loggedAt(h.lines(), "info", "Beta [Zone 2]: Rain sensor is stopping irrigation."), "the group completing stops the zone that moved");
+    assert.ok(loggedAt(h.lines(), "info", "Alpha [Zone 1]: Rain sensor is allowing irrigation."), "the group breaking again releases the zone that never moved");
+    assert.ok(loggedAt(h.lines(), "info", "Beta [Zone 2]: Rain sensor is allowing irrigation."), "the group breaking again releases the zone that moved");
   });
 
   test("prunes a valve when its zone disappears from the response", async (t) => {

@@ -87,7 +87,7 @@ export function normalSchedule(): StatusScheduleResponse {
 }
 
 /**
- * The rain-stopped schedule: every zone carries the suspend sentinel and the rain sensor references every relay, so isStoppedBySensor resolves true across the
+ * The rain-stopped schedule: every zone carries the unscheduled sentinel and the rain sensor references every relay, so isStoppedBySensor resolves true across the
  * matrix.
  *
  * @returns A fresh StatusScheduleResponse describing a rain-sensor stop.
@@ -99,7 +99,7 @@ export function rainStopped(): StatusScheduleResponse {
 }
 
 /**
- * The all-suspended schedule: every zone carries the suspend sentinel but the sensor references no relay, so the controller reads as all-zones-suspended rather
+ * The all-suspended schedule: every zone carries the unscheduled sentinel but the sensor references no relay, so the controller reads as all-zones-suspended rather
  * than rain-stopped.
  *
  * @returns A fresh StatusScheduleResponse describing an all-zones-suspended controller.

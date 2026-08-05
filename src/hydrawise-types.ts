@@ -41,10 +41,16 @@ export interface HydrawiseZoneConfig {
   timestr: string;
 }
 
-// Hydrawise API: the far-future `time` value Hydrawise reports for a zone whose watering is suspended. The value is fixed by the upstream API, so it is named once
-// here and read by everything that classifies a zone's schedule state. A zone carrying this sentinel that a rain-class sensor's relay list also names is stopped by
-// that sensor rather than suspended, and the sensor check takes precedence wherever both could apply.
-export const HYDRAWISE_SUSPENDED_SENTINEL = 1576800000;
+/* Hydrawise API: the far-future `time` value Hydrawise reports for a zone with no upcoming run. `time` counts the seconds until a zone's next run, and this value is
+ * exactly fifty years of seconds - the wire's spelling of "never". The value is fixed by the upstream API, so the runtime's classification path names it once here
+ * and everything that classifies a zone's schedule state reads it from this one place.
+ *
+ * Live-wire evidence (2026-08-08) pins what this sentinel can and cannot claim: a zone routinely carries it on a healthy account simply because Hydrawise has not
+ * yet published its next run - most visibly in the hours after a zone's run completes - and that shape is byte-identical to a zone the owner suspended. The sentinel
+ * therefore supports only the claim "no run is scheduled", never "suspended". A zone carrying it that a rain-class sensor's relay list also names is stopped by that
+ * sensor when the group that sensor covers is evidently stopped, and the sensor check takes precedence wherever both could apply.
+ */
+export const HYDRAWISE_UNSCHEDULED_SENTINEL = 1576800000;
 
 // Hydrawise API: the `type` value Hydrawise assigns a rain or freeze sensor. A status body can carry sensors of several classes, and only one of this class can stop
 // a zone's irrigation, so this is the value every sensor walk filters on.
@@ -175,18 +181,21 @@ export function sameZoneIdentity(a: HydrawiseZoneIdentity, b: HydrawiseZoneIdent
 }
 
 /* The persisted schedule state of a single irrigation zone, as a discriminated union on `state`: each arm carries exactly the facts that exist in that state, so a
- * combination the wire cannot produce - a running zone with a next run time, a suspended zone with a duration - cannot be written at all rather than merely being
+ * combination the wire cannot produce - a running zone with a next run time, an unscheduled zone with a duration - cannot be written at all rather than merely being
  * left unwritten by convention.
  *
  * The running arm deliberately carries no duration. The wire's `run` field counts the remaining seconds down while a zone runs, so persisting it would move the
  * projection on every poll and defeat the change gate the flush discipline rests on. The stable fact is the instant the run ends; the remaining time is derived
  * from it at render.
+ *
+ * The unscheduled arm claims exactly what the wire supports: Hydrawise reports no upcoming run. A zone between schedule computations, a zone the owner suspended,
+ * and a rain-stopped zone whose sensor evidence falls short all present that same shape, so the arm never claims suspension - only the absence of a scheduled run.
  */
 export type HydrawiseZoneScheduleStatus =
   { endsAt: number; relayId: number; state: "running" } |
   { durationSeconds: number; nextRunAt: number; relayId: number; state: "scheduled" } |
   { relayId: number; state: "sensor-stopped" } |
-  { relayId: number; state: "suspended" };
+  { relayId: number; state: "unscheduled" };
 
 // The schedule-state vocabulary, derived from the union's own arms rather than written out a second time, so the two can never disagree about which states exist.
 export type HydrawiseZoneScheduleState = HydrawiseZoneScheduleStatus["state"];
@@ -203,19 +212,46 @@ export interface HydrawiseScheduleStatus {
   zones: HydrawiseZoneScheduleStatus[];
 }
 
-// Whether a zone is stopped by a rain sensor: no run time, no schedule string, the suspend sentinel on `time`, and a rain-class sensor whose relay list names this
-// zone. All four conditions together are what tells a sensor stop from a plain suspension, since both carry the sentinel. This is the one home for that rule - the
-// controller's own check and the schedule projection below both resolve here, so the log the operator reads and the projection the webUI reads cannot disagree.
-export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, sensors: StatusScheduleResponse["sensors"]): boolean {
+// The wire shape a zone with no upcoming run carries: no run time, no schedule string, and the unscheduled sentinel on `time`. A rain-sensor stop, an owner's
+// suspension, and a zone simply between schedule computations all present exactly this shape, which is why the sensor test below reads a whole group of zones
+// rather than reading this shape alone.
+function carriesUnscheduledSentinel(zone: HydrawiseZoneConfig): boolean {
 
-  return !zone.run && !zone.timestr && (zone.time === HYDRAWISE_SUSPENDED_SENTINEL) &&
-    sensors.filter(sensor => sensor.type === HYDRAWISE_RAIN_SENSOR_TYPE).some(sensor => sensor.relays.some(relay => relay.id === zone.relay_id));
+  return !zone.run && !zone.timestr && (zone.time === HYDRAWISE_UNSCHEDULED_SENTINEL);
+}
+
+/* Whether a zone is stopped by a rain sensor: the zone carries the unscheduled shape, and a rain-class sensor whose relay list names it is evidently stopping the
+ * zones it covers. Those two halves together are what tell a sensor stop from the shape's other producers, since the wire gives them all the identical zone body.
+ *
+ * The group rule is physical. A rain sensor stops every zone it covers, so a covered zone still carrying a live schedule proves that sensor is not tripping, and
+ * any covered zone beside it carrying the unscheduled shape is merely without a run rather than sensor-stopped. A sensor is evidently stopping when every zone of
+ * its group carries that shape.
+ *
+ * A running zone sits outside the group deliberately. Forcing a manual run during a genuine rain delay is plausible, so a running zone is evidence either way and
+ * settles nothing; leaving it out keeps sensor precedence - the standing tiebreak wherever this wire is ambiguous - rather than letting one manual run reclassify
+ * every covered sibling.
+ *
+ * Callers pass a zone drawn from the same response's relay list. A zone carrying the unscheduled shape is never running, so it always belongs to any covering
+ * sensor's group and the group walk is never empty. This is the one home for the rule: the controller's own check and the schedule projection below both resolve
+ * here, so the log the operator reads and the projection the webUI reads cannot disagree. One limit is worth naming - an account whose every covered zone carries
+ * the shape reads the same whether a sensor stopped it, the owner suspended all of it, or every zone merely sits between runs, and sensor precedence decides it.
+ */
+export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, status: StatusScheduleResponse): boolean {
+
+  if(!carriesUnscheduledSentinel(zone)) {
+
+    return false;
+  }
+
+  return status.sensors.some(sensor => (sensor.type === HYDRAWISE_RAIN_SENSOR_TYPE) && sensor.relays.some(relay => relay.id === zone.relay_id) &&
+    status.relays.filter(member => (member.time !== 1) && sensor.relays.some(relay => relay.id === member.relay_id))
+      .every(member => carriesUnscheduledSentinel(member)));
 }
 
 /* Project a wire zone onto its persisted schedule state. The precedence is what makes the classification total and unambiguous: a rain-sensor stop is tested first,
- * because it and a suspension carry the same sentinel and only the sensor block tells them apart; then a running zone, whose `time` of 1 is the wire's running
- * marker and whose end instant is the root time plus the seconds of run remaining; then a suspension; and everything else is scheduled, its next run being the root
- * time plus the seconds the wire reports until it.
+ * because it and the plain unscheduled shape carry the same sentinel and the sensor block read against its own group's evident state is what tells them apart; then
+ * a running zone, whose `time` of 1 is the wire's running marker and whose end instant is the root time plus the seconds of run remaining; then the unscheduled
+ * shape; and everything else is scheduled, its next run being the root time plus the seconds the wire reports until it.
  *
  * Both time-bearing arms store ABSOLUTE epoch seconds, and that is what makes the projection stable across polls: the wire's countdowns fall as the poll clock
  * rises, so each sum holds still until the schedule genuinely moves. Storing the countdowns themselves would move every field on every poll and turn each poll into
@@ -223,7 +259,7 @@ export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, sensors: Status
  */
 export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse): HydrawiseZoneScheduleStatus {
 
-  if(isZoneStoppedBySensor(zone, status.sensors)) {
+  if(isZoneStoppedBySensor(zone, status)) {
 
     return { relayId: zone.relay_id, state: "sensor-stopped" };
   }
@@ -233,9 +269,9 @@ export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusSche
     return { endsAt: status.time + zone.run, relayId: zone.relay_id, state: "running" };
   }
 
-  if(zone.time === HYDRAWISE_SUSPENDED_SENTINEL) {
+  if(zone.time === HYDRAWISE_UNSCHEDULED_SENTINEL) {
 
-    return { relayId: zone.relay_id, state: "suspended" };
+    return { relayId: zone.relay_id, state: "unscheduled" };
   }
 
   return { durationSeconds: zone.run, nextRunAt: status.time + zone.time, relayId: zone.relay_id, state: "scheduled" };
@@ -272,7 +308,7 @@ export function isZoneScheduleStatus(value: unknown): value is HydrawiseZoneSche
       return (typeof candidate.durationSeconds === "number") && (typeof candidate.nextRunAt === "number");
 
     case "sensor-stopped":
-    case "suspended":
+    case "unscheduled":
 
       // These states carry no facts beyond the state itself, so a well-formed relay id and a known state are the whole shape.
       return true;

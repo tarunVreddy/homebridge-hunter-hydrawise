@@ -29,15 +29,19 @@
 
 This documentation assumes you know what MQTT is, what an MQTT broker does, and how to configure it. Setting up an MQTT broker will not be covered here. There are plenty of guides available on how to do so just a search away.
 
-You can configure MQTT settings in the plugin webUI. The settings are:
+You configure MQTT through the plugin's feature options. The settings are:
 
-| Configuration Setting | Description
-|-----------------------|----------------------------------
-| **mqttUrl**           | The URL of your MQTT broker. **This must be in URL form**, e.g.: `mqtt://user:password@1.2.3.4`.
-| **mqttTopic**         | The base topic to publish to. The default is: `hydrawise`.
+| Feature Option  | Description
+|-----------------|----------------------------------
+| **Mqtt.Url**    | The URL of your MQTT broker. **This must be in URL form**, e.g.: `mqtt://user:password@1.2.3.4`. Configuring it is what turns MQTT on.
+| **Mqtt.Topic**  | The base topic to publish to. The default is: `hydrawise`.
+
+Set both in the plugin's Settings tab, under Global Options. If you prefer to edit your configuration directly, they are entries in the plugin's `options` array, written as `Enable.Mqtt.Url=mqtt://1.2.3.4` and `Enable.Mqtt.Topic=greenhouse`.
 
 > [!IMPORTANT]
-> **mqttUrl** must be a valid URL. Just entering a hostname will result in an error. The URL can use any of these protocols: `mqtt`, `mqtts`, `tcp`, `tls`, `ws`, `wss`.
+> **Mqtt.Url** must be a valid URL. Just entering a hostname will result in an error. The URL can use any of these protocols: `mqtt`, `mqtts`, `tcp`, `tls`, `ws`, `wss`.
+
+If your configuration carries the `mqttUrl` and `mqttTopic` settings from an earlier release, it keeps working exactly as it is. Those settings are migrated to the feature options above automatically the next time the plugin's settings are opened in the Homebridge webUI, with nothing for you to do.
 
 When events are published, by default, the topics look like:
 
@@ -61,7 +65,7 @@ The `controller` payload is a JSON array with one entry per zone, in the order H
 | **name**              | The name of the zone, as reported by Hydrawise.
 | **relay**             | The zone number, as shown on the irrigation controller.
 | **run**               | Seconds: the time remaining when the zone is running, otherwise the duration of its next scheduled run.
-| **time**              | Seconds until the next scheduled run. `1` means the zone is running now, and `1576800000` means the zone is suspended.
+| **time**              | Seconds until the next scheduled run. `1` means the zone is running now, and `1576800000` means no upcoming run is scheduled - the shape a zone between schedule computations and a suspended zone both carry.
 | **timestr**           | The start time of the next scheduled run, in the irrigation controller's own local time.
 
 For example:

@@ -3,7 +3,7 @@
  * hydrawise-types.test.ts: The reserved-name constants and the fixture-versus-interface conformance check. The interfaces are compile-time contracts; this file
  * pins the one runtime value the types module exports and verifies the synthetic fixtures carry the required wire fields with wire-accurate types.
  */
-import { SUSPENDED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./hydrawise-api.fixtures.ts";
+import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./hydrawise-api.fixtures.ts";
 import { describe, test } from "node:test";
 import { HydrawiseReservedNames } from "./hydrawise-types.ts";
 import assert from "node:assert/strict";
@@ -50,10 +50,10 @@ describe("fixture conformance", () => {
     assert.equal(typeof zone.timestr, "string", "timestr is a string");
   });
 
-  test("the sentinel matrix stamps every zone with the suspend sentinel and an empty schedule", () => {
+  test("the sentinel matrix stamps every zone with the unscheduled sentinel and an empty schedule", () => {
 
     assert.equal(sentinelZoneMatrix.length, 19, "the sentinel matrix carries 19 zones");
-    assert.ok(sentinelZoneMatrix.every(zone => zone.time === SUSPENDED_SENTINEL), "every sentinel zone carries the suspend timestamp");
+    assert.ok(sentinelZoneMatrix.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every sentinel zone carries the unscheduled sentinel");
     assert.ok(sentinelZoneMatrix.every(zone => (zone.run === 0) && (zone.timestr === "")), "every sentinel zone has no run and no schedule string");
   });
 });

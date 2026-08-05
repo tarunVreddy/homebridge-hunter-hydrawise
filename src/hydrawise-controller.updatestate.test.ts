@@ -1,14 +1,19 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-controller.updatestate.test.ts: Single-poll behavior of the HydrawiseController polling loop, driven live at the fast (~250ms) cadence against the
- * synthetic NORMAL matrix. Covers valve creation and enumeration, the Active / InUse mapping across running, active-soon, and inactive zones, and the
- * irrigation-system aggregate characteristics after one completed poll.
+ * synthetic zone matrices. Covers valve creation and enumeration, the Active / InUse mapping across running, active-soon, and inactive zones, and the
+ * irrigation-system aggregate characteristics - program mode included - after one completed poll.
  */
+
+// The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
+/* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./hydrawise-types.ts";
 import assert from "node:assert/strict";
+import { rainSensors } from "./hydrawise-api.fixtures.ts";
 
 describe("HydrawiseController updateState (single poll)", () => {
 
@@ -100,5 +105,32 @@ describe("HydrawiseController updateState (single poll)", () => {
     assert.equal(irrigation.getCharacteristic(Characteristic.RemainingDuration).value, 600, "the system remaining duration should sum the running zones");
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
       "with no manual run and not every zone rain-stopped the program mode stays scheduled");
+  });
+
+  test("keeps the program scheduled when a disabled zone still holds a schedule under the same sensor", async (t) => {
+
+    /* Every enabled zone carries the unscheduled sentinel under a sensor that covers all three zones, while the zone disabled at zone scope still holds a live
+     * schedule under that same sensor. The sensor is demonstrably not tripping, so no enabled zone is rain-stopped and the program stays scheduled. A
+     * classification that walked only the enabled zones - or that read each zone on its own - finds every enabled zone stopped and reports no program at all.
+     */
+    const relays = [ makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" }),
+      makeZone({ name: "Beta", relay: 2, relay_id: 700002, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" }),
+      makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 480, time: 68000, timestr: "16:00" }) ];
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: fastPolling(makeStatusSchedule({ relays, sensors: rainSensors })), kind: "response" }), signalAborted: false,
+    userOptions: ["Disable.Device.700003"] });
+
+    t.after(() => h.abort());
+
+    // The disabled zone never gets a valve, so the second enabled zone's valve plus a completed poll is what marks the pass as fully through.
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700002") ? true : undefined);
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "a zone HomeKit never sees still breaks the sensor's group, because the sensor stops zones regardless of what the plugin exposes");
   });
 });

@@ -8,14 +8,14 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_SUSPENDED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
+import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
   scheduleStatus } from "./hydrawise-types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./hydrawise-types.ts";
-import { bareSensors, normalZoneMatrix, rainSensors, syntheticController } from "./hydrawise-api.fixtures.ts";
+import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./hydrawise-api.fixtures.ts";
 import { buildController, buildPlatform, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./hydrawise-api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
@@ -36,6 +36,26 @@ const BETA_RELAY_ID = 700002;
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors, time = ROOT_TIME): StatusScheduleResponse {
 
   return fastPolling(makeStatusSchedule({ relays: zones, sensors, time }));
+}
+
+// Compose a rain-class sensor block from one relay-id group per sensor, so a scenario states which zones each sensor covers and nothing more. Coverage and the rain
+// class are the only sensor fields the classification reads.
+function sensorsCovering(...groups: number[][]): StatusScheduleResponse["sensors"] {
+
+  return groups.map(ids => ({ input: 0, mode: 1, relays: ids.map(id => ({ id })), type: HYDRAWISE_RAIN_SENSOR_TYPE }));
+}
+
+// A zone carrying the unscheduled sentinel. A rain-sensor stop, an owner's suspension, and a zone simply between runs present this shape identically, so which one
+// a scenario is describing rests entirely on the covering sensor's group rather than on anything in the zone itself.
+function sentinelZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "", ...overrides });
+}
+
+// A zone carrying a live schedule, which is what a covered sibling needs to prove its sensor is not tripping.
+function scheduledZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 480, time: 68000, timestr: "16:00", ...overrides });
 }
 
 // The identity-only roster projection, so a scenario can seed the context with a roster its first poll matches and isolate the schedule half of the chokepoint.
@@ -110,31 +130,101 @@ describe("HydrawiseController schedule classification", () => {
     }
   });
 
-  test("classifies a sensor-covered sentinel zone as sensor-stopped and an uncovered one as suspended", () => {
+  test("classifies a sensor-covered sentinel zone as sensor-stopped and an uncovered one as unscheduled", () => {
 
-    const covered = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
-    const uncovered = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
+    const covered = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
+    const uncovered = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
 
     // The rain sensor's relay list names every zone of the shared matrix, which includes Alpha's relay id but not Beta's own sentinel-carrying identity being
     // excluded any other way: the two zones differ only in whether a type-1 sensor claims them.
     const sensors: StatusScheduleResponse["sensors"] = [{ input: 0, mode: 1, relays: [{ id: ALPHA_RELAY_ID }], type: HYDRAWISE_RAIN_SENSOR_TYPE }];
     const projection = scheduleStatus(makeStatusSchedule({ relays: [ covered, uncovered ], sensors, time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
-    assert.deepEqual(projection.zones, [ { relayId: ALPHA_RELAY_ID, state: "sensor-stopped" }, { relayId: BETA_RELAY_ID, state: "suspended" } ],
+    assert.deepEqual(projection.zones, [ { relayId: ALPHA_RELAY_ID, state: "sensor-stopped" }, { relayId: BETA_RELAY_ID, state: "unscheduled" } ],
       "the sensor block is what tells a rain stop from a suspension, since both carry the same sentinel");
   });
 
-  test("a sensor-covered sentinel zone still reporting a run or a schedule string is suspended, not sensor-stopped", () => {
+  test("a sensor-covered sentinel zone still reporting a run or a schedule string is unscheduled, not sensor-stopped", () => {
 
     // Each of these zones carries the sentinel AND sits in the rain sensor's relay list, so only the remaining conjuncts of the sensor predicate can tell them
     // apart from a genuine rain stop. A build that drops either conjunct classifies them as sensor-stopped and reds here.
-    const withRun = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "" });
-    const withTimestr = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_SUSPENDED_SENTINEL, timestr: "16:00" });
+    const withRun = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
+    const withTimestr = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "16:00" });
     const projection = scheduleStatus(makeStatusSchedule({ relays: [ withRun, withTimestr ], sensors: rainSensors, time: ROOT_TIME }),
       HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
-    assert.deepEqual(projection.zones.map(zone => zone.state), [ "suspended", "suspended" ] as HydrawiseZoneScheduleState[],
-      "a covered zone that still reports a run or a start time is suspended, so every conjunct of the sensor predicate is carried");
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "unscheduled", "unscheduled" ] as HydrawiseZoneScheduleState[],
+      "a covered zone that still reports a run or a start time is unscheduled, so every conjunct of the sensor predicate is carried");
+  });
+
+  test("a covered sentinel zone beside a scheduled sibling under the same sensor is unscheduled, not sensor-stopped", () => {
+
+    const projection = scheduleStatus(makeStatusSchedule({ relays: [ sentinelZone(), scheduledZone() ],
+      sensors: sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ]), time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "unscheduled", "scheduled" ] as HydrawiseZoneScheduleState[],
+      "a sensor stops every zone it covers, so a covered sibling holding a schedule proves the sensor is not tripping");
+  });
+
+  test("the whole covered group carrying the sentinel projects every zone sensor-stopped", () => {
+
+    const projection = scheduleStatus(rainStopped(), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.equal(projection.zones.length, sentinelZoneMatrix.length, "the projection carries every reported zone");
+    assert.ok(projection.zones.every(zone => zone.state === "sensor-stopped"),
+      "a rain delay stops every covered zone, so a fully sentineled group is the sensor's own evidence that it is tripping");
+  });
+
+  test("a running zone under the same sensor leaves its covered sentinel siblings sensor-stopped", () => {
+
+    const relays = [ sentinelZone(), sentinelZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID }),
+      makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 600, time: 1, timestr: "" }) ];
+    const projection = scheduleStatus(makeStatusSchedule({ relays, sensors: sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID, 700003 ]), time: ROOT_TIME }),
+      HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "sensor-stopped", "sensor-stopped", "running" ] as HydrawiseZoneScheduleState[],
+      "a forced run during a genuine rain delay is plausible, so a running zone settles nothing and stays outside the group walk");
+  });
+
+  test("a covered sibling still reporting a run or a start time breaks the group its sensor covers", () => {
+
+    const cells = [
+
+      { label: "a run", sibling: scheduledZone({ run: 480, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" }) },
+      { label: "a start time", sibling: scheduledZone({ run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "16:00" }) }
+    ];
+
+    // Each sibling carries the sentinel on `time` and sits in the same relay list as the target, so only the run and schedule-string conjuncts of the member test
+    // keep it out of the stopped group. A member walk keyed to `time` alone reads the group as stopped and classifies the target sensor-stopped on both cells.
+    for(const { label, sibling } of cells) {
+
+      const projection = scheduleStatus(makeStatusSchedule({ relays: [ sentinelZone(), sibling ],
+        sensors: sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ]), time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+      assert.equal(firstOf(projection.zones, "zone").state, "unscheduled", "a sibling still reporting " + label + " leaves its sensor's group unstopped");
+    }
+  });
+
+  test("a healthy group under one sensor says nothing about the group under another", () => {
+
+    const relays = [ sentinelZone(), sentinelZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID }),
+      makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 480, time: 68000, timestr: "16:00" }) ];
+    const projection = scheduleStatus(makeStatusSchedule({ relays, sensors: sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ], [700003]), time: ROOT_TIME }),
+      HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "sensor-stopped", "sensor-stopped", "scheduled" ] as HydrawiseZoneScheduleState[],
+      "each sensor's group is walked on its own, so a scheduled zone another sensor covers is no evidence about this one");
+  });
+
+  test("a zone two sensors cover is stopped when either group is stopped", () => {
+
+    // Alpha rides both sensors: the first covers Alpha alone and is entirely sentineled, while the second also covers the scheduled Beta and is therefore not
+    // stopping anything. A walk that required every covering sensor to agree would read Alpha as unscheduled.
+    const projection = scheduleStatus(makeStatusSchedule({ relays: [ sentinelZone(), scheduledZone() ],
+      sensors: sensorsCovering([ALPHA_RELAY_ID], [ ALPHA_RELAY_ID, BETA_RELAY_ID ]), time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.deepEqual(projection.zones.map(zone => zone.state), [ "sensor-stopped", "scheduled" ] as HydrawiseZoneScheduleState[],
+      "one covering sensor evidently stopping is enough, so the walk answers across the sensors that cover a zone");
   });
 
   test("orders the projected zones by relay regardless of the order the wire reported them", () => {
@@ -176,7 +266,7 @@ describe("HydrawiseController schedule guards", () => {
       "a scheduled entry whose next run is not numeric fails");
 
     assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "sensor-stopped" }), "a sensor-stopped entry needs nothing beyond its state");
-    assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "suspended" }), "a suspended entry needs nothing beyond its state");
+    assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "unscheduled" }), "an unscheduled entry needs nothing beyond its state");
     assert.ok(!isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "watering" }), "a state the union does not declare fails");
     assert.ok(!isZoneScheduleStatus({ endsAt: ROOT_TIME, state: "running" }), "an entry with no relay id fails");
     assert.ok(!isZoneScheduleStatus(null), "a non-object fails");
