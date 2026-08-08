@@ -25,6 +25,75 @@
     padding: var(--fo-space-xs, 0.25rem) var(--fo-space-md, 0.75rem);
     white-space: normal;
   }
+
+  /* A zone's sidebar row: its state dot, its number, and its name. The dot and number columns are fixed widths, which is what makes every name in the list start
+   * at one shared edge no matter how many digits the numbers above and below it carry.
+   */
+  .hbhh-zone-row {
+    align-items: center;
+    column-gap: 0.15em;
+    display: grid;
+    grid-template-columns: 0.6em 3ch 1fr;
+  }
+
+  /* The name stands a word-space off the number while the dot hugs it: the shared grid gap is the tight half of that asymmetry, and this padding adds the other
+   * half back for the name alone.
+   */
+  .hbhh-zone-name {
+    padding-left: 0.15em;
+  }
+
+  /* The number reads right-aligned in digits of uniform width, so units sit under units and tens under tens rather than drifting with each glyph's natural width.
+   */
+  .hbhh-zone-number {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  /* The state dot, hugging the number column's edge so the indicator reads as part of the row rather than floating in its own gutter. It carries no color of its
+   * own, so a zone with nothing to report renders an invisible circle that still holds its column and keeps the names beside it aligned; a state class below is
+   * what makes it visible.
+   */
+  .hbhh-zone-dot {
+    border-radius: 50%;
+    height: 0.55em;
+    justify-self: end;
+    width: 0.55em;
+  }
+
+  /* The state colors. Blue for water actually flowing, and one green hue for what is coming - filling from a hollow ring to a solid dot as a run becomes imminent,
+   * so the progression itself reads as urgency rather than asking the eye to tell two greens apart. Amber marks a zone a rain sensor has stopped, and a dim gray
+   * marks one with nothing scheduled. These are mid-tones, which is what keeps them legible against both light and dark Homebridge themes.
+   */
+  .hbhh-dot-running {
+    background-color: #2196f3;
+  }
+
+  .hbhh-dot-starting-soon {
+    background-color: #43a047;
+  }
+
+  .hbhh-dot-scheduled {
+    background-color: transparent;
+    border: 2px solid #43a047;
+  }
+
+  .hbhh-dot-sensor-stopped {
+    background-color: #fb8c00;
+  }
+
+  .hbhh-dot-unscheduled {
+    background-color: #9e9e9e;
+    opacity: 0.6;
+  }
+
+  /* A zone the configuration disables is a real zone that simply is not published, so its name is set apart as an aside rather than negated: italic and muted.
+   * Muting through opacity rather than a fixed color keeps it correct under any host theme.
+   */
+  .hbhh-zone-disabled {
+    font-style: italic;
+    opacity: 0.65;
+  }
 </style>
 <p class="text-center">
   <img src="https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg" alt="homebridge-hunter-hydrawise logo" class="w-50" />

@@ -35,6 +35,15 @@ const NOTICE_UNPUBLISHED = "The plugin has not published this controller's detai
   "Restart Homebridge, and its zones will appear here after the first update from Hydrawise completes.";
 const NOTICE_UNDISCOVERED = "The plugin has not discovered this controller yet. Restart Homebridge to discover it.";
 
+/* The word each zone schedule state is shown as, in one place. The sidebar dot's tooltip, the zone panel's Status row, and the controller fold's own status all read
+ * from here, so no two of those surfaces can describe the same state with different words.
+ *
+ * The unscheduled word claims exactly what the wire supports - no upcoming run - because a zone between schedule computations and a zone the owner suspended carry
+ * identical bodies, and labeling either one "Suspended" would routinely misreport a healthy zone.
+ */
+const ZONE_STATE_LABELS = { running: "Running", scheduled: "Scheduled", "sensor-stopped": "Rain delay", "starting-soon": "Starting soon",
+  unscheduled: "Not scheduled" };
+
 // The upper bound in milliseconds on how long the refresh control stays held after a recovery re-entry, covering a re-entered cycle that dies before rendering.
 const REFRESH_REBUILD_WAIT = 10000;
 
@@ -74,10 +83,11 @@ const sessionZones = new Map();
  */
 let catalogPromise = null;
 
-/* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts:
+/* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts. The ticker serves two surfaces from one read - the sidebar's
+ * zone dots and the details panel - and only the panel needs tracking here, because the dots are found by query at the moment they are painted:
  *
  *   - renderContext: a fresh { device, panel } object minted on every render of the details panel. Its OBJECT IDENTITY is what a tick's read compares against on
- *     resolution, which is how a read dispatched for a view the user has since left repaints nothing.
+ *     resolution, which is how a read dispatched for a view the user has since left repaints no panel.
  *   - scheduleTimer: the interval handle, and the arm-once guard for this mount.
  *   - scheduleMountSignal: the mount signal the resume subscription was registered against, so one mount registers exactly one subscriber.
  *   - tickSequence / inFlightTick: the dispatch counter and the sequence number of the read currently in flight, which is how a slow read is superseded rather
@@ -630,14 +640,15 @@ const getDevices = async (controller, { config } = {}) => {
     }
   }
 
-  /* One consult answers both questions this listing asks of the configuration: whether the controller is published, and what name the user has set for each zone.
-   * A disabled controller can still list zones (a refresh stored them, or its accessory survives until the next restart), so the listing carries the disabled
-   * notice alongside the zone count. The whole consult is best-effort and all-or-nothing: a catalog or engine failure is treated as no consult at all - the
-   * controller reads as enabled and every zone label falls through to the arms below - so a failure can never break a healthy listing, and the two consumers
-   * cannot end up disagreeing about whether the engine answered.
+  /* One consult answers every question this listing asks of the configuration: whether the controller is published, whether each zone is published, and what name
+   * the user has set for each zone. A disabled controller can still list zones (a refresh stored them, or its accessory survives until the next restart), so the
+   * listing carries the disabled notice alongside the zone count. The whole consult is best-effort and all-or-nothing: a catalog or engine failure is treated as no
+   * consult at all - the controller and every zone read as enabled, and every zone label falls through to the arms below - so a failure can never break a healthy
+   * listing, and the consumers cannot end up disagreeing about whether the engine answered.
    */
   let enabled = true;
   const overrides = new Map();
+  const zoneEnabled = new Map();
 
   try {
 
@@ -653,11 +664,16 @@ const getDevices = async (controller, { config } = {}) => {
 
         overrides.set(zone.relayId, override.trim());
       }
+
+      // The zone-scope gate, asked with the relay id in the device position and the controller serial in the controller position - the runtime's own scoping
+      // convention, so the sidebar and the plugin agree on which zones reach HomeKit.
+      zoneEnabled.set(zone.relayId, engine.test(DEVICE_CATEGORY, zone.relayId.toString(), controller.serialNumber));
     }
   } catch {
 
     enabled = true;
     overrides.clear();
+    zoneEnabled.clear();
   }
 
   /* The zone rows, sorted by relay, keyed by the relay id the runtime scopes zone options against; then the controller-as-device pseudo-entry the two-level sidebar
@@ -666,6 +682,9 @@ const getDevices = async (controller, { config } = {}) => {
    * A zone's sidebar label is its relay number and its effective name: the user's configured override when set - so a just-saved edit reads back immediately - then
    * the name HomeKit last showed, then the name Hydrawise reported. The number is a sidebar affordance only; it is never part of a HomeKit name, and the controller
    * pseudo-entry carries no number at all.
+   *
+   * A zone row carries the bare name and its published state alongside that composed label, which is what the sidebar's own row renderer lays the number and the
+   * name out in aligned columns from. The composed name stays the row's identity surface and the fallback whenever that renderer declines a row.
    */
   /* The cached standalone accessories hosting this controller's zones, keyed by relay id. A zone the user has given its own accessory carries its last-flushed
    * HomeKit name on that accessory rather than on the controller accessory, so the label arm below has to read the accessory the valve actually lives on.
@@ -693,8 +712,9 @@ const getDevices = async (controller, { config } = {}) => {
    * whole projection as schedule - so no consumer can mistake one shape for the other.
    */
   const schedule = isScheduleStatus(matched?.context?.schedule) ? matched.context.schedule : null;
-  const zoneRows = zones.slice().sort((a, b) => a.relay - b.relay).map((zone) => ({ kind: "zone",
-    name: zone.relay.toString() + ". " + displayNames.get(zone.relayId), ownerSerial: controller.serialNumber, relay: zone.relay, relayId: zone.relayId,
+  const zoneRows = zones.slice().sort((a, b) => a.relay - b.relay).map((zone) => ({ displayName: displayNames.get(zone.relayId),
+    enabled: zoneEnabled.get(zone.relayId) ?? true, kind: "zone", name: zone.relay.toString() + ". " + displayNames.get(zone.relayId),
+    ownerSerial: controller.serialNumber, relay: zone.relay, relayId: zone.relayId,
     scheduleMeta: schedule ? { activeWindowSeconds: schedule.activeWindowSeconds, asOf: schedule.asOf } : undefined,
     serialNumber: zone.relayId.toString(), zoneSchedule: schedule?.zones.find((entry) => entry.relayId === zone.relayId) }));
   const controllerEntry = { kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
@@ -790,46 +810,76 @@ const formatRunTime = (epochSeconds, nowSeconds) => {
   return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + clock;
 };
 
-/* Derive one zone's schedule rows and its staleness verdict from its persisted entry, at the render pass's shared instant so every row of a pass answers to the
- * same "now". Every presentation decision lives here and nothing derived is ever persisted, which is what keeps a panel from disagreeing with its own inputs: the
- * pre-run active state, the running countdown, and the labels are all computed from stored facts at the moment they are shown.
+/* Classify one zone's persisted schedule entry into the display state it reads as - the one answer the sidebar dot and the zone panel both branch on, so a dot and
+ * the panel beside it can never disagree about what a zone is doing. A zone the projection does not name has no state to show, which is what a legacy cache and a
+ * zone the runtime has not yet reported both look like, so those answer null.
  *
- * A zone the projection does not name renders no schedule rows at all, which is what a legacy cache and a zone the runtime has not yet reported both look like.
+ * The wire's scheduled state splits in two here: a run inside the window the runtime marks a valve active on reads as imminent, and one beyond it as merely
+ * scheduled. That window travels with the projection rather than being hardcoded here, so this and the Home app agree on when a zone counts as imminent.
  */
-const deriveZoneDisplay = (entry, meta, nowSeconds) => {
+const zoneScheduleState = (entry, meta, nowSeconds) => {
 
   if(!entry) {
 
-    return { rows: [], stale: false };
+    return null;
   }
 
   switch(entry.state) {
 
     case "running":
 
-      // A running zone whose end instant has passed by more than the grace is evidence of a dead runtime: a live one would have reported the zone stopped.
-      return { rows: [ [ "Status", "Running" ], [ "Time Remaining", formatMinutes(entry.endsAt - nowSeconds) ] ],
-        stale: (nowSeconds - entry.endsAt) > STALE_GRACE };
+      return "running";
 
-    case "scheduled": {
+    case "scheduled":
 
-      // The same window the runtime marks a valve active on, read from the projection rather than hardcoded here, so the panel and the Home app agree on when a
-      // zone counts as imminent.
-      const startingSoon = (entry.nextRunAt - nowSeconds) <= (meta?.activeWindowSeconds ?? 0);
-
-      return { rows: [ [ "Status", startingSoon ? "Starting soon" : "Scheduled" ], [ "Next Run", formatRunTime(entry.nextRunAt, nowSeconds) ],
-        [ "Duration", formatMinutes(entry.durationSeconds) ] ], stale: (nowSeconds - entry.nextRunAt) > STALE_GRACE };
-    }
+      return ((entry.nextRunAt - nowSeconds) <= (meta?.activeWindowSeconds ?? 0)) ? "starting-soon" : "scheduled";
 
     case "sensor-stopped":
 
-      return { rows: [[ "Status", "Rain delay" ]], stale: false };
+      return "sensor-stopped";
 
     default:
 
-      // The unscheduled state claims exactly what the wire supports - no upcoming run - because a zone between schedule computations and a zone the owner
-      // suspended carry identical bodies, and labeling either one "Suspended" would routinely misreport a healthy zone.
-      return { rows: [[ "Status", "Not scheduled" ]], stale: false };
+      return "unscheduled";
+  }
+};
+
+/* Derive one zone's schedule rows and its staleness verdict from its persisted entry, at the render pass's shared instant so every row of a pass answers to the
+ * same "now". Every presentation decision lives here and nothing derived is ever persisted, which is what keeps a panel from disagreeing with its own inputs: the
+ * running countdown, the next-run instant, and the staleness verdict are all computed from stored facts at the moment they are shown, and the status word itself
+ * comes from the shared vocabulary rather than being spelled out again here.
+ *
+ * A zone with no state at all renders no schedule rows.
+ */
+const deriveZoneDisplay = (entry, meta, nowSeconds) => {
+
+  const state = zoneScheduleState(entry, meta, nowSeconds);
+
+  if(state === null) {
+
+    return { rows: [], stale: false };
+  }
+
+  const status = [ "Status", ZONE_STATE_LABELS[state] ];
+
+  switch(state) {
+
+    case "running":
+
+      // A running zone whose end instant has passed by more than the grace is evidence of a dead runtime: a live one would have reported the zone stopped.
+      return { rows: [ status, [ "Time Remaining", formatMinutes(entry.endsAt - nowSeconds) ] ], stale: (nowSeconds - entry.endsAt) > STALE_GRACE };
+
+    case "scheduled":
+    case "starting-soon":
+
+      // The two scheduled states describe the same upcoming run and differ only in the word above it, so one arm renders both.
+      return { rows: [ status, [ "Next Run", formatRunTime(entry.nextRunAt, nowSeconds) ], [ "Duration", formatMinutes(entry.durationSeconds) ] ],
+        stale: (nowSeconds - entry.nextRunAt) > STALE_GRACE };
+
+    default:
+
+      // Rain delay and the unscheduled state carry no facts beyond the word itself, so the status row is the whole display and there is no instant to age against.
+      return { rows: [status], stale: false };
   }
 };
 
@@ -854,21 +904,25 @@ const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
   const nameOf = (zone) => zoneNames?.[zone.relayId.toString()] ?? zone.relayId.toString();
   const rows = [];
 
+  /* The fold's own status word. Every arm but the first names a zone state and reads its word from the shared vocabulary, so a controller and the zones beneath it
+   * always use the same words; "Watering" is the fold's own summary of an account with water flowing, which no single zone state means, so it stays a word of its
+   * own.
+   */
   if(running.length) {
 
     rows.push([ "Status", "Watering" ]);
   } else if(soon.length) {
 
-    rows.push([ "Status", "Starting soon" ]);
+    rows.push([ "Status", ZONE_STATE_LABELS["starting-soon"] ]);
   } else if(scheduled.length) {
 
-    rows.push([ "Status", "Scheduled" ]);
+    rows.push([ "Status", ZONE_STATE_LABELS.scheduled ]);
   } else if(schedule.zones.some((zone) => zone.state === "sensor-stopped")) {
 
-    rows.push([ "Status", "Rain delay" ]);
+    rows.push([ "Status", ZONE_STATE_LABELS["sensor-stopped"] ]);
   } else {
 
-    rows.push([ "Status", "Not scheduled" ]);
+    rows.push([ "Status", ZONE_STATE_LABELS.unscheduled ]);
   }
 
   // Every running zone is named, not just the first: the runtime genuinely runs zones concurrently, so a single-zone row would hide water that is flowing.
@@ -982,17 +1036,106 @@ const renderDeviceDetails = ({ device, panel }) => {
   panel.replaceChildren(...nodes);
 };
 
-/* One tick of the schedule ticker: repaint the panel on screen from the accessory cache, so a poll that landed since the last render shows up and a running
- * countdown keeps counting down while the user watches. The read is homebridge.getCachedAccessories, a LOCAL call, so the webUI's zero-automatic-cloud-call
- * property is untouched by the cadence.
+/* Put a sidebar dot into the state given, the single writer of a dot's whole presentation - its color class, its tooltip, and how a screen reader treats it. The
+ * initial render and every repaint the ticker drives both come through here, so a dot's look and the word describing it can never be set by two code paths that
+ * have drifted apart.
+ *
+ * A null state is a zone with nothing to say. Such a dot keeps its column, so the numbers and names beside it stay aligned, but it carries no color, no tooltip,
+ * and no accessible name - an invisible spacer rather than a claim about the zone.
+ */
+const applyDotState = (dot, state) => {
+
+  dot.classList.remove(...[...dot.classList].filter((name) => name.startsWith("hbhh-dot-")));
+
+  if(state === null) {
+
+    dot.removeAttribute("aria-label");
+    dot.removeAttribute("role");
+    dot.removeAttribute("title");
+    dot.setAttribute("aria-hidden", "true");
+
+    return;
+  }
+
+  // A colored dot is genuinely information, so it is exposed as an image with the state's own word as its accessible name rather than being hidden from assistive
+  // technology as decoration would be. The tooltip carries the same word, which is what makes the color legible to anyone who has not memorized the palette.
+  dot.classList.add("hbhh-dot-" + state);
+  dot.removeAttribute("aria-hidden");
+  dot.setAttribute("aria-label", ZONE_STATE_LABELS[state]);
+  dot.setAttribute("role", "img");
+  dot.setAttribute("title", ZONE_STATE_LABELS[state]);
+};
+
+/* Compose a sidebar row's content. The framework asks this once per device per sidebar build, with the very device object our own listing produced, and renders
+ * whatever we return in place of the device name; a null return leaves the framework's default name rendering alone, which is how the controller pseudo-entry
+ * keeps its plain label.
+ *
+ * A zone renders as three aligned columns - its state dot, its number, and its name - because a right-aligned number column is what makes every name start at one
+ * shared edge, however many digits the numbers around it carry. A zone the configuration disables is still a real zone at Hydrawise, so it is set apart rather
+ * than struck out: an italic, muted name with a tooltip saying what is different about it.
+ *
+ * Every value reaches the DOM through textContent, the same trust boundary buildStatRow holds - a name reported by Hydrawise or typed by the user renders as text
+ * and is never parsed as markup. The framework owns the link element around this content, so nothing here is interactive: an interactive element would fight the
+ * link's own delegated click.
+ */
+const renderDeviceContent = (device) => {
+
+  if(device.kind !== "zone") {
+
+    return null;
+  }
+
+  const row = document.createElement("span");
+
+  row.className = "hbhh-zone-row";
+
+  const dot = document.createElement("span");
+
+  dot.className = "hbhh-zone-dot";
+  dot.dataset.ownerSerial = device.ownerSerial;
+  dot.dataset.relayId = device.relayId.toString();
+
+  // The dot's identity travels in its own data attributes rather than in a closure, which is what lets the ticker find every rendered dot by query and repaint it
+  // without holding a reference to the row that built it.
+  applyDotState(dot, zoneScheduleState(device.zoneSchedule, device.scheduleMeta, Math.floor(Date.now() / 1000)));
+
+  const number = document.createElement("span");
+
+  number.className = "hbhh-zone-number";
+  number.textContent = device.relay.toString() + ".";
+
+  const name = document.createElement("span");
+
+  name.className = "hbhh-zone-name";
+  name.textContent = device.displayName ?? device.name;
+
+  if(device.enabled === false) {
+
+    name.classList.add("hbhh-zone-disabled");
+    name.title = "Not published to HomeKit.";
+  }
+
+  row.append(dot, number, name);
+
+  return row;
+};
+
+/* One tick of the schedule ticker, refreshing both schedule-bearing surfaces from ONE read of the accessory cache: the sidebar's zone dots and the details panel on
+ * screen. A poll that landed since the last render therefore shows up in both at once, and a running countdown keeps counting down while the user watches. The read
+ * is homebridge.getCachedAccessories, a LOCAL call, so the webUI's zero-automatic-cloud-call property is untouched by the cadence.
+ *
+ * The two surfaces are reached differently, and deliberately so. The panel belongs to one render, so its repaint is gated on that render still being the one on
+ * screen; the dots are found by query at the top of the tick, so they belong to whatever the sidebar is actually showing and need no such gate.
  */
 const scheduleTick = async () => {
 
   const context = renderContext;
+  const dots = document.querySelectorAll("#devicesContainer .hbhh-zone-dot[data-relay-id]");
+  const wantsPanel = Boolean(context?.device) && scheduleSurface(context.device);
 
-  // Nothing on screen reads a schedule, so there is nothing to refresh. The interval itself keeps running until the mount aborts, which a no-op this cheap makes
-  // entirely acceptable.
-  if(!context?.device || !scheduleSurface(context.device)) {
+  // Neither surface reads a schedule, so there is nothing to refresh and the cache is left alone. The interval itself keeps running until the mount aborts, which a
+  // no-op this cheap makes entirely acceptable.
+  if(!wantsPanel && !dots.length) {
 
     return;
   }
@@ -1034,8 +1177,35 @@ const scheduleTick = async () => {
 
   inFlightTick = null;
 
+  /* The sidebar dots first, and unconditionally: they were queried from the DOM rather than carried on a render, so they are the sidebar the user is looking at
+   * whatever the panel beside them is showing. Dots are grouped by their owning controller so each controller's accessory is located and validated once however
+   * many zones it lists, and the whole pass shares one instant, so no two dots of a pass answer to a different "now".
+   *
+   * A sidebar rebuilt while this read was in flight has already painted its own fresh dots from the listing that rebuilt it, so the nodes gathered above are then
+   * detached and writing to them changes nothing the user can see.
+   */
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  for(const [ serial, group ] of Map.groupBy(dots, (dot) => foldSerial(dot.dataset.ownerSerial))) {
+
+    const owner = matchControllerAccessory(cached, serial);
+    const schedule = isScheduleStatus(owner?.context?.schedule) ? owner.context.schedule : null;
+    const meta = schedule ? { activeWindowSeconds: schedule.activeWindowSeconds, asOf: schedule.asOf } : undefined;
+
+    for(const dot of group) {
+
+      applyDotState(dot, zoneScheduleState(schedule?.zones.find((zone) => zone.relayId === Number(dot.dataset.relayId)), meta, nowSeconds));
+    }
+  }
+
+  // The dots were this tick's whole work when the view on screen reads no schedule of its own.
+  if(!wantsPanel) {
+
+    return;
+  }
+
   // Discard unless the view that dispatched this read is still the one on screen. The context object is minted fresh on every render, so an identity check asks
-  // exactly the right question - is this still the same render - and a read that resolves after the user navigated repaints nothing.
+  // exactly the right question - is this still the same render - and a read that resolves after the user navigated leaves the panel alone.
   if(renderContext !== context) {
 
     return;
@@ -1104,6 +1274,7 @@ const featureOptionsParams = {
   infoPanel: showDeviceDetails,
   sidebar: {
 
+    deviceContent: renderDeviceContent,
     deviceLabel: "Zones"
   },
   ui: {
