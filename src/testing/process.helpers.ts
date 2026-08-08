@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * process.helpers.ts: Process-level test helpers. Exposes assertNoUnhandledRejections and expectAt. Both bridge between the test body and the surrounding Node
  * process surface - one captures unhandled rejections via the process's emitter, the other yields to the microtask queue while waiting for a predicate to
  * become true.

@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * delay.ts: Async delay and timeout utilities. The Clock port (clock.ts) consumes raceWithTimeout and delay from this file as its production implementation;
  * any other code path that needs "promise with timeout" or a cancellable timeout should consume these directly rather than re-rolling the timer/promise/race/
  * cleanup sequence.

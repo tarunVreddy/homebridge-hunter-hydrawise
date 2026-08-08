@@ -1,5 +1,6 @@
-/**
- * loggers.helpers.ts: Logger doubles used to substitute for the production logger via mock.module(). silentLog drops every call (used when production code logs
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * loggers.helpers.ts: Logger doubles handed to code under test in place of the production logger. silentLog drops every call (used when production code logs
  * but the test isn't asserting on output); capturingLog records every call (used when the test does want to assert on log output). Both satisfy the TestLogger
  * interface, which mirrors the public surface of the project's production logger.
  *

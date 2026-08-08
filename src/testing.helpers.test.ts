@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * testing.helpers.test.ts: Tests for the cross-cutting testing-helpers barrel. The barrel is the canonical import path for tests outside `src/testing/`
  * (enforce this with a project-specific ESLint rule - see `test-conventions.md` §8 Barrel-Only Import Discipline). These tests pin the barrel's runtime export
  * surface so a forgotten re-export, a renamed submodule symbol, or an unintended addition surfaces immediately at unit-tier rather than as a confusing import
@@ -77,8 +78,8 @@ describe("testing.helpers barrel", () => {
     for(const name of actual) {
 
       assert.ok(allowed.has(name),
-        "Unexpected runtime export from the testing.helpers barrel: " + name + ". Add it to EXPECTED_FUNCTION_EXPORTS or EXPECTED_VALUE_EXPORTS, " +
-        "or remove it from the barrel.");
+        "Unexpected runtime export from the testing.helpers barrel: " + name +
+          ". Add it to EXPECTED_FUNCTION_EXPORTS or EXPECTED_VALUE_EXPORTS, or remove it from the barrel.");
     }
   });
 

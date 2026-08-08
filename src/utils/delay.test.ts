@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * delay.test.ts: Tests for the time primitives (delay, raceWithTimeout, cancellableTimeout). Coverage pins the contract each one promises plus the cleanup
  * behavior that makes them safe in long-running processes - timers must not be left dangling after the race or after cancel.
  */
@@ -22,6 +23,8 @@ describe("delay", () => {
 
   test("resolves with no value (Promise<void>)", async () => {
 
+    // The resolved value is read through a then-callback rather than bound from the await, because assigning a Promise<void> result to a binding trips this
+    // project's no-confusing-void-expression rule.
     let sawUndefined = false;
 
     await delay(1).then((value) => { sawUndefined = value === undefined; });
@@ -37,14 +40,14 @@ describe("raceWithTimeout", () => {
     const inner = Promise.resolve("the value");
     const result = await raceWithTimeout(inner, 1000);
 
-    assert.equal(result, "the value");
+    assert.equal(result, "the value", "the resolved value should come from the inner promise");
   });
 
   test("propagates the inner promise's rejection when the promise rejects first", async () => {
 
     const inner = Promise.reject(new Error("inner failure"));
 
-    await assert.rejects(() => raceWithTimeout(inner, 1000), /inner failure/);
+    await assert.rejects(() => raceWithTimeout(inner, 1000), /inner failure/, "the inner rejection should propagate unchanged");
   });
 
   test("throws a default Error when the timer wins the race", async () => {
@@ -64,7 +67,7 @@ describe("raceWithTimeout", () => {
     const { promise: never } = Promise.withResolvers<never>();
     const custom = new Error("custom timeout");
 
-    await assert.rejects(() => raceWithTimeout(never, 1, custom), /custom timeout/);
+    await assert.rejects(() => raceWithTimeout(never, 1, custom), /custom timeout/, "the supplied error should be the one thrown");
   });
 
   test("cleans up the timer when the inner promise wins (no leaked handles)", async () => {
@@ -72,13 +75,13 @@ describe("raceWithTimeout", () => {
     // We can't directly observe the cleared timer, but the .finally(clearTimeout) guarantees no event-loop reference outlives the race. Indirect verification:
     // running many races back-to-back must not leak handles - if the timer were leaked, Node's test runner would hang at exit. The fast pass here plus the
     // --test-force-exit safety net in the canonical scripts provide the cleanup signal.
-    const promises = Array.from({ length: 50 }, async (_, i) => raceWithTimeout(Promise.resolve(i), 10_000));
+    const promises = Array.from({ length: 50 }, async (_, i) => raceWithTimeout(Promise.resolve(i), 10000));
 
     const results = await Promise.all(promises);
 
-    assert.equal(results.length, 50);
-    assert.equal(results[0], 0);
-    assert.equal(results[49], 49);
+    assert.equal(results.length, 50, "every race should settle");
+    assert.equal(results[0], 0, "the first race should carry its own value");
+    assert.equal(results[49], 49, "the last race should carry its own value");
   });
 });
 
@@ -106,7 +109,7 @@ describe("cancellableTimeout", () => {
     assert.equal(winner, "microtask", "the cancelled timer must not resolve before the microtask");
   });
 
-  test("cancel() is idempotent (safe to call twice)", () => {
+  test("cancel() is safe to call more than once", () => {
 
     const { cancel } = cancellableTimeout(100);
 
@@ -123,6 +126,6 @@ describe("cancellableTimeout", () => {
     const { promise } = cancellableTimeout(1);
     const result: false = await promise;
 
-    assert.equal(result, false);
+    assert.equal(result, false, "the promise should resolve to exactly false");
   });
 });

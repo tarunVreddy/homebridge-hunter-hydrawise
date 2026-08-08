@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * fs.helpers.ts: Filesystem-scoped test helpers. Exposes withTempDir, the canonical scope for tests that need a temporary directory with guaranteed cleanup on
  * failure or success. Equivalent to a `using` block for filesystem state.
  *

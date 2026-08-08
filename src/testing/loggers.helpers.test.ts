@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * loggers.helpers.test.ts: Tests for silentLog and capturingLog. These are the logger doubles every other test relies on, so a bug here cascades into
  * misleading results across the entire suite. Coverage pins: silent contract (drop-the-call), capture shape (level, message, args), the message-first debug
  * channel, snapshot semantics on lines(), and clear() resetting the buffer.

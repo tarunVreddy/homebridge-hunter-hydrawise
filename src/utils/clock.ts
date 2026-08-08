@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * clock.ts: The Clock port - the project's abstraction for time-dependent operations. Production code that needs to sleep, race a promise against a timeout,
  * or read the high-resolution clock should consume a Clock when those operations live inside an async chain that tests need to control deterministically. The
  * default realClock delegates to delay() and raceWithTimeout() in delay.ts and to performance.now() in the runtime; tests pass a fake-clock literal that

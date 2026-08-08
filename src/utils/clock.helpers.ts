@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * clock.helpers.ts: Test affordance for the Clock port. The realClock default in clock.ts is the production-side adapter; makeFakeClock here is the test-side
  * counterpart - they form a pair, co-located so any test that consumes a Clock has the factory ready without inventing its own. By default the fake clock's
  * sleep() resolves immediately and records the requested duration into a shared array (so tests can assert on the schedule); raceWithTimeout() forwards the

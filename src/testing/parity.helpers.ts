@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * parity.helpers.ts: Factory-parity utilities for catching silent drift between a fixture factory's output and the production type it's meant to mirror.
  *
  * The drift scenario these utilities protect against:

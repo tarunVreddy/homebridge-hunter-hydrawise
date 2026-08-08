@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * narrowing.helpers.ts: Indexed-access narrowing helpers. Under noUncheckedIndexedAccess, every array index produces T | undefined; these helpers collapse the
  * destructure-and-assert.ok dance into a labeled call that throws with a useful error when the array is too short.
  */

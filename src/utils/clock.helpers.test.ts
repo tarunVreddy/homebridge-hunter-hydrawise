@@ -1,4 +1,5 @@
-/**
+/* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
  * clock.helpers.test.ts: Tests for makeFakeClock. Coverage pins the default behavior of each method (sleep records and resolves immediately, raceWithTimeout
  * forwards the inner promise, now returns 0), the override-by-method semantics (overriding one method does not affect the others), and the closure-shared
  * sleeps array (the same array is observable from the handle and from inside the clock).
@@ -13,7 +14,7 @@ describe("makeFakeClock", () => {
 
     const { clock } = makeFakeClock();
 
-    assert.equal(clock.now(), 0);
+    assert.equal(clock.now(), 0, "a fake clock reads zero until the test says otherwise");
   });
 
   test("default sleep() resolves immediately and records the requested duration", async () => {
@@ -33,7 +34,7 @@ describe("makeFakeClock", () => {
 
     const result = await clock.raceWithTimeout(Promise.resolve("inner-value"), 1000);
 
-    assert.equal(result, "inner-value");
+    assert.equal(result, "inner-value", "the default race should hand back the inner promise unchanged");
   });
 
   test("default raceWithTimeout() propagates the inner promise's rejection", async () => {
@@ -121,7 +122,7 @@ describe("makeFakeClock", () => {
     await clock.sleep(7);
 
     assert.equal(sleeps[0], 7, "the handle's sleeps array sees writes from inside the clock");
-    assert.equal(sleeps.length, 1);
+    assert.equal(sleeps.length, 1, "one sleep should record exactly one entry");
   });
 
   test("two independent clocks have independent sleeps arrays", async () => {
@@ -132,7 +133,7 @@ describe("makeFakeClock", () => {
     await a.clock.sleep(11);
     await b.clock.sleep(22);
 
-    assert.deepEqual(a.sleeps, [11]);
-    assert.deepEqual(b.sleeps, [22]);
+    assert.deepEqual(a.sleeps, [11], "the first clock should record only its own sleep");
+    assert.deepEqual(b.sleeps, [22], "the second clock should record only its own sleep");
   });
 });
