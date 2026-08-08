@@ -4,8 +4,11 @@
  */
 "use strict";
 
+import { API_KEY_LENGTH, makeHydrawiseConfig, makeLegacyHydrawiseConfig } from "./hydrawise-config.mjs";
 import { FeatureOptions, expandOption } from "homebridge-plugin-utils/featureOptions.js";
+import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
 import { webUi } from "homebridge-plugin-utils/webUi.mjs";
+import { withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 
 // The feature-option category the controller-scope options this webUI reasons about live in. One constant anchors the category everywhere this file names it - the
 // floor-entry grammar, the catalog read, and the enable-state oracle - while the plugin's runtime names it independently in TypeScript; the two meet at the wire.
@@ -113,6 +116,80 @@ const getCatalog = () => {
 
   return catalogPromise;
 };
+
+/* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
+ * wiring step that hangs against an unresponsive host can never be what makes the settings panel look broken.
+ */
+const WIRING_DEADLINE = 5;
+
+/* The interpreter every configuration read in this file goes through. It is declared already holding the degraded-mode interpreter, so the binding is never
+ * undefined in any window and no consumer needs a guard; the wiring below swaps in the catalog-backed interpreter the moment the catalog is in hand.
+ */
+let hydrawiseConfig = makeLegacyHydrawiseConfig();
+
+// The load-time wiring's own lifecycle. Aborting it is how an envelope that failed or expired tells a continuation still running underneath it that it must not
+// stage anything after the fact.
+const wiringController = new AbortController();
+
+/* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
+ *
+ * The whole envelope is awaited at module top level, which is what makes every consumer below safe without any of them knowing this ran: module evaluation is
+ * suspended until the wiring settles, so the webUI is constructed, the refresh listener is bound, and ui.show() is called only afterwards. Two consequences
+ * follow. The framework opens its own configuration session inside the launch path that ui.show() starts, so every replica it hands to a hook - the first-run
+ * config, the options page's persist path - is read after the migration has settled, and none of them can commit a pre-migration snapshot over it. And no
+ * first-run hook or refresh handler can observe a half-wired interpreter, because nothing that consumes it can run at all until module evaluation completes.
+ * Bounding evaluation is what makes that safe rather than reckless: the library's deadline settles the envelope either way, and every failure path assigns
+ * rather than throws.
+ *
+ * A migration that composes a patch persists it to disk itself, without waiting for the user to press Save. Most people never open this panel to save
+ * anything, so a migration that waited for one would leave a fleet split between two configuration shapes indefinitely, and the plumbing that reconciles them
+ * could never retire. The write is gated on there being a patch, which is what bounds it: only a session that actually found legacy settings writes, so a
+ * migrated install's every later open reads, finds nothing to do, and touches the disk not at all. The host's restart indicator therefore appears at most once
+ * per install, in the single session that converts it.
+ *
+ * The weaker outcomes are deliberate. A save the deadline overtakes, and a save the host rejects, both leave the migration sitting in the modal's pending
+ * configuration, where the user's own Save picks it up.
+ *
+ * Reopening the panel is convergent rather than racing. The settings frame is reused and each open imports a fresh copy of this module whose wiring runs
+ * independently, but a second copy reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely
+ * simultaneous wirings read the same configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state.
+ *
+ * When the envelope fails, the interpreter settles at whatever the wiring reached. A catalog fetch that never succeeded leaves the degraded-mode interpreter in
+ * place, which reads and writes the legacy properties, so the page still loads and first run still works; a migration that stumbled after the catalog arrived
+ * keeps the catalog-backed interpreter, because one failed attempt is no reason to degrade every read for the session. The migration itself simply waits for a
+ * session whose fetches succeed.
+ */
+const wireHydrawiseConfig = async () => {
+
+  hydrawiseConfig = makeHydrawiseConfig({ FeatureOptions, catalog: await getCatalog() });
+
+  // The library's session is the single conduit the framework's own writes use, so the patch merges onto a replica synced just now rather than onto a snapshot
+  // taken before the page opened.
+  const session = await PluginConfigSession.open({ host: homebridge, name: "Hydrawise" });
+  const patch = hydrawiseConfig.migrate(session.platform);
+
+  // The abort is read immediately before the write, so an envelope that expired while the session was still opening cannot stage a patch after the page has
+  // given up waiting for it.
+  if(patch && !wiringController.signal.aborted) {
+
+    await session.commit(patch);
+
+    // The signal is read a second time, because the commit itself was an await and the envelope may have expired across it. A save the deadline overtakes is
+    // skipped rather than forced, which leaves the migration staged for the user's own save - the weaker outcome, and the honest one.
+    if(!wiringController.signal.aborted) {
+
+      await homebridge.savePluginConfig();
+    }
+  }
+};
+
+try {
+
+  await withDeadline({ promise: wireHydrawiseConfig(), seconds: WIRING_DEADLINE, signal: wiringController.signal });
+} catch(error) {
+
+  wiringController.abort(error);
+}
 
 // Build the feature-option engine over the cached catalog and the user's configured options. The engine is rebuilt per call because the configured options change
 // underneath us as the user edits them, so an edit the user just saved is reflected the next time we ask. Every consult in this file resolves through here, which
@@ -253,14 +330,20 @@ const notifyError = (message) => {
 };
 
 // Execute our first run screen if we don't have a valid Hydrawise API key. The framework injects our primary platform-config entry, so this is a pure predicate over
-// the persisted config rather than a reach into the feature-options page's state. A Hydrawise API key is always nineteen characters.
-const firstRunIsRequired = ({ config }) => config?.apiKey?.length !== 19;
+// the persisted config rather than a reach into the feature-options page's state, and the interpreter is what knows where a key can live.
+const firstRunIsRequired = ({ config }) => hydrawiseConfig.apiKey(config).length !== API_KEY_LENGTH;
 
-// Initialize our first run screen with any information from our existing configuration.
+// Initialize our first run screen with any information from our existing configuration. The key's length is a validation fact the interpreter module owns, so the
+// input's own bounds are stamped from it here rather than restated in the markup.
 const firstRunOnStart = ({ config }) => {
 
+  const input = document.getElementById("apiKey");
+
+  input.maxLength = API_KEY_LENGTH;
+  input.minLength = API_KEY_LENGTH;
+
   // Pre-populate with anything we might already have in our configuration.
-  document.getElementById("apiKey").value = config?.apiKey ?? "";
+  input.value = hydrawiseConfig.apiKey(config);
 
   return true;
 };
@@ -312,7 +395,7 @@ const seedSessionControllers = (controllers) => {
 };
 
 // Validate our Hydrawise API key.
-const firstRunOnSubmit = async ({ commit }) => {
+const firstRunOnSubmit = async ({ commit, config }) => {
 
   const apiKey = document.getElementById("apiKey").value;
   const tdLoginError = document.getElementById("loginError");
@@ -335,8 +418,9 @@ const firstRunOnSubmit = async ({ commit }) => {
   // Seed the session roster from the login response so a first-run user sees their controllers immediately, with no extra call, once the feature-options view opens.
   seedSessionControllers(controllers);
 
-  // Persist the validated key through commit, the framework's single write path. HBHH's config shape is flat, so the patch is the one scalar we own.
-  await commit({ apiKey });
+  // Persist the validated key through commit, the framework's single write path. The interpreter composes the patch, so the key is written to the feature option
+  // that owns it and any legacy property carrying an older key leaves on the same save.
+  await commit(hydrawiseConfig.withApiKey(config, apiKey));
 
   return true;
 };
@@ -349,9 +433,9 @@ const isController = (device) => device.kind === "controller";
  * the zone's relay id.
  *
  * This is the LAST-FLUSHED name, not a live mirror: Homebridge rewrites the accessory cache when an accessory is registered, updated, or unregistered, never on a
- * bare characteristic write. With name synchronization at its default the plugin keeps each valve at its effective name, so this tracks that name closely; where a
- * user has opted out of synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name
- * HomeKit shows the user and so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
+ * bare characteristic write. Where name synchronization is enabled the plugin keeps each valve at its effective name, so this tracks that name closely; without
+ * synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name HomeKit shows the user and
+ * so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
  */
 const cachedValveName = (accessory, relayId) => {
 
@@ -1067,8 +1151,7 @@ const onRefreshControllers = async () => {
 
   try {
 
-    const pluginConfig = await homebridge.getPluginConfig();
-    const apiKey = pluginConfig?.[0]?.apiKey ?? "";
+    const apiKey = hydrawiseConfig.apiKey((await homebridge.getPluginConfig())?.[0]);
     const { controllers, error } = await homebridge.request("/refreshControllers", { apiKey });
 
     // A failed refresh surfaces its reason and changes nothing: the context view stands rather than being masked by a failure.

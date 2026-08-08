@@ -3,19 +3,20 @@
  * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, MqttClient, RateBudget, composeSignals, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
+import { APIEvent, FeatureOptions, RateBudget, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop }
+  from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint,
   HydrawiseZoneIdentity } from "./hydrawise-types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS,
-  PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
+  PLUGIN_NAME } from "./settings.ts";
+import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./hydrawise-options.ts";
+import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./hydrawise-types.ts";
 import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./hydrawise-controller.ts";
-import type { HydrawiseOptions } from "./hydrawise-options.ts";
-import type { Nullable } from "homebridge-plugin-utils";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
 
@@ -81,18 +82,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
     this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
 
+    // Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
+    // resolves through the same precedence here, so no reader downstream has to know that a setting has two possible homes.
     this.config = {
 
-      apiKey: (config?.["apiKey"] as string | undefined) ?? "",
-      debug: config?.["debug"] === true,
-      mqttTopic: (config?.["mqttTopic"] as string | undefined) ?? HYDRAWISE_MQTT_TOPIC,
-      mqttUrl: config?.["mqttUrl"] as string | undefined,
+      apiKey: this.consolidatedValue("Account.ApiKey", config?.["apiKey"] as string | undefined) ?? "",
+      debug: this.consolidatedFlag("Log.Debug", typeof config?.["debug"] === "boolean" ? config["debug"] : undefined),
+      mqttTopic: this.consolidatedValue("Mqtt.Topic", config?.["mqttTopic"] as string | undefined),
+      mqttUrl: this.consolidatedValue("Mqtt.Url", config?.["mqttUrl"] as string | undefined),
       options
     };
 
     // No Hydrawise API key, we're done.
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    if(!this.config.apiKey?.length) {
+    if(!this.config.apiKey.length) {
 
       this.log.error("Unable to startup: no Hunter Hydrawise API key has been configured. Please configure one and restart the plugin.");
 
@@ -102,18 +104,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Initialize our network connectivity.
     this.initNetworking();
 
-    // Initialize MQTT, if needed. The HBPU MqttClient throws synchronously on an invalid broker URL, so we wrap construction in a try/catch and degrade gracefully -
-    // a single bad MQTT entry should not block the rest of the plugin from loading. The composed shutdown signal ties the client's lifetime to ours.
-    if(this.config.mqttUrl) {
-
-      try {
-
-        this.mqtt = new MqttClient({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { signal: this.signal });
-      } catch(error) {
-
-        this.log.error("Unable to initialize MQTT client: %s", util.inspect(error, { depth: null }));
-      }
-    }
+    /* Initialize MQTT, if needed. The guarded factory answers null for both of the ways MQTT can fail to start - a broker URL or topic prefix that resolves to
+     * nothing, and a URL the client cannot parse - so a mistyped MQTT setting degrades to MQTT being off rather than keeping the rest of the plugin from
+     * loading. An unusable URL is reported once at error level, with the URL itself redacted so a broker password embedded in it never reaches the log. The
+     * platform's shutdown signal ties the client's lifetime to ours.
+     */
+    this.mqtt = createMqttClient({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { signal: this.signal });
 
     this.log.debug("Debug logging on. Expect a lot of data.");
 
@@ -238,6 +234,29 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private isControllerEnabled(serialNumber: string): boolean {
 
     return this.featureOptions.test("Device", undefined, serialNumber);
+  }
+
+  /* Resolve one consolidated setting to its effective value. An explicitly configured feature option always rules - its enabled, disabled, and valueless states
+   * alike - because configuring an option is the user saying what they want. A legacy configuration property, where one is present, otherwise outranks the
+   * catalog default, so a configuration that names only the properties runs correctly without the webUI ever being opened. The legacy arm is transitional and
+   * sunsets at the plugin's next major version, at which point the option is the only home a setting has.
+   *
+   * The legacy argument keeps this file's bracket-access cast posture. A non-string smuggled past that cast by a hand-edited configuration degrades safely at
+   * every consumer: the API key gate reads it as no key, and the MQTT factory reads it as nothing configured.
+   */
+  private consolidatedValue(option: HydrawiseGlobalValueOption, legacy: string | undefined): Nullable<string | undefined> {
+
+    return this.featureOptions.exists(option) ? this.featureOptions.value(option) : legacy ?? this.featureOptions.value(option);
+  }
+
+  /* Resolve one consolidated boolean setting to its effective state, the flag twin of the resolver above and the same rule in boolean terms. An explicitly
+   * configured feature option rules, enabled or disabled alike, because configuring an option is the user saying what they want. A legacy configuration property,
+   * where one carries an actual boolean, otherwise decides. The catalog's own declared default closes the chain, which is what lets a flag whose default is on
+   * resolve honestly without a line changing here. The legacy arm sunsets alongside the others.
+   */
+  private consolidatedFlag(option: HydrawiseGlobalFlagOption, legacy: boolean | undefined): boolean {
+
+    return this.featureOptions.exists(option) ? this.featureOptions.test(option) : legacy ?? this.featureOptions.defaultValue(option);
   }
 
   // Configure a discovered irrigation controller. The account roster is threaded through to the controller so it can seed its accessory context with every sibling's

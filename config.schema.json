@@ -9,40 +9,6 @@
     "type": "object",
     "properties": {
 
-      "apiKey": {
-        "title": "Hunter Hydrawise Account API Key",
-        "type": "string",
-        "placeholder": "e.g. ABCD-EFGH-0123-4567",
-        "maxLength": 19,
-        "minLength": 19,
-        "required": true,
-        "description": "The API key for your Hunter Hydrawise account. You can generate one by going to the Account Settings section of the Account Details page on your Hydrawise online account. Default: None."
-      },
-
-      "debug": {
-        "title": "Debug Logging",
-        "type": "boolean",
-        "required": false,
-        "description": "Logging verbosity for debugging. Default: false."
-      },
-
-      "mqttTopic": {
-        "type": "string",
-        "title": "MQTT Base Topic",
-        "required": false,
-        "placeholder": "e.g. hydrawise",
-        "description": "The base MQTT topic to publish to. Default: hydrawise."
-      },
-
-      "mqttUrl": {
-        "type": "string",
-        "title": "MQTT Broker URL",
-        "required": false,
-        "format": "uri",
-        "placeholder": "e.g. mqtt://1.2.3.4",
-        "description": "URL for the MQTT broker you'd like to publish event messages to. Default: None."
-      },
-
       "name": {
         "title": "Plugin Name",
         "type": "string",
@@ -59,7 +25,7 @@
           "type": "string",
           "title": "Feature Option",
           "required": false,
-          "description": "Enter only one option per entry. Use the feature options webUI tab above unless you know what you're doing.",
+          "description": "Enter only one option per entry. Use the Settings tab above unless you know what you're doing.",
           "placeholder": "e.g. Disable.Device.0610C29283"
         }
       }
@@ -67,18 +33,6 @@
   },
 
   "layout": [
-    {
-      "type": "section",
-      "title": "Required Settings",
-      "items": [
-        {
-          "description": "These options are required in order to use this plugin.",
-          "items": [
-            "apiKey"
-          ]
-        }
-      ]
-    },
     {
       "type": "section",
       "title": "Plugin Feature Options (Optional)",
@@ -90,26 +44,10 @@
           "type": "array",
           "orderable": true,
           "title": " ",
-          "description": "Use the feature options webUI tab above instead of manually configuring feature options here.",
+          "description": "Use the Settings tab above instead of manually configuring feature options here.",
           "buttonText": "Add Feature Option",
           "items": [
             "options[]"
-          ]
-        }
-      ]
-    },
-
-    {
-      "type": "section",
-      "title": "MQTT Settings (Optional)",
-      "expandable": true,
-      "expanded": false,
-      "items": [
-        {
-          "description": "MQTT support will only be enabled if an MQTT broker URL is specified below.",
-          "items": [
-            "mqttUrl",
-            "mqttTopic"
           ]
         }
       ]
@@ -124,8 +62,7 @@
         {
           "description": "These settings should be rarely used or needed by most people. Use these with caution.",
           "items": [
-            "name",
-            "debug"
+            "name"
           ]
         }
       ]

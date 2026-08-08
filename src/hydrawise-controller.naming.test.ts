@@ -322,14 +322,14 @@ describe("the zone name option's declared scope", () => {
     const engine = new FeatureOptions(featureOptionCategories, featureOptions, ["Enable.Device.Name=Every Zone"]);
 
     assert.notEqual(engine.value("Device.Name", ZONE_SUBTYPE, CONTROLLER_SERIAL), "Every Zone", "a global entry does not reach a zone");
-    assert.equal(engine.value("Device.Name", ZONE_SUBTYPE, CONTROLLER_SERIAL), "", "the zone resolves the catalog's empty default instead");
+    assert.equal(engine.value("Device.Name", ZONE_SUBTYPE, CONTROLLER_SERIAL), null, "the zone resolves no value at all, since the option defaults to disabled");
   });
 
   test("does not resolve a name written at the controller scope", () => {
 
     const engine = new FeatureOptions(featureOptionCategories, featureOptions, ["Enable.Device.Name." + CONTROLLER_SERIAL + "=Every Zone"]);
 
-    assert.equal(engine.value("Device.Name", ZONE_SUBTYPE, CONTROLLER_SERIAL), "", "a controller entry does not reach a zone either");
+    assert.equal(engine.value("Device.Name", ZONE_SUBTYPE, CONTROLLER_SERIAL), null, "a controller entry does not reach a zone either");
   });
 
   test("leaves a valve at its wire name when a name is written outside the zone scope", async (t) => {

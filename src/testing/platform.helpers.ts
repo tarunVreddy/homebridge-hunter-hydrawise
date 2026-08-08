@@ -563,11 +563,15 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
 
   const { lines, logger } = capturingLog();
   const apiResult = makeTestApi();
+
+  // The topic and the debug flag pass through exactly as the caller supplied them, with no default of their own, because a synthesized legacy value would
+  // satisfy the platform's resolver on every build and put the catalog-default arm out of reach of any test. A setting left unnamed still resolves to the same
+  // effective value, by way of the catalog registration.
   const config = {
 
     apiKey: options.apiKey ?? "test-api-key",
-    debug: options.debug ?? false,
-    mqttTopic: options.mqttTopic ?? "hydrawise",
+    debug: options.debug,
+    mqttTopic: options.mqttTopic,
     mqttUrl: options.mqttUrl,
     options: options.options ?? []
   };

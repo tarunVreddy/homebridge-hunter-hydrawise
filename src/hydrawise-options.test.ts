@@ -3,21 +3,20 @@
  * hydrawise-options.test.ts: The feature-option catalog and its documentation hook. Pins the catalog defaults, the scope-set drift between the catalog's declared
  * scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
  */
+import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
 import { describe, test } from "node:test";
 import { describeOptionScope, featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
-import type { FeatureOptionScope } from "homebridge-plugin-utils";
-import type { HydrawiseFeatureOption } from "./hydrawise-options.ts";
 import assert from "node:assert/strict";
 
 // Compute the full option name for a catalog entry, joining the category with the entry name (an empty entry name is the category-level option).
-function fullName(category: string, entry: HydrawiseFeatureOption): string {
+function fullName(category: string, entry: FeatureOptionEntry): string {
 
   return entry.name ? category + "." + entry.name : category;
 }
 
 // Look up a catalog entry by category and entry name, so an assertion names the option it pins rather than depending on where the entry sits in its array. A
 // catalog that gains an option therefore shifts no expectation but its own.
-function optionEntry(category: string, name: string): HydrawiseFeatureOption | undefined {
+function optionEntry(category: string, name: string): FeatureOptionEntry | undefined {
 
   return featureOptions[category]?.find(entry => entry.name === name);
 }
@@ -31,7 +30,7 @@ function scopedOptions(scope: FeatureOptionScope): string[] {
 
     for(const entry of entries) {
 
-      if(entry.scopes.includes(scope)) {
+      if(entry.scopes?.includes(scope)) {
 
         names.push(fullName(category, entry));
       }
@@ -45,7 +44,8 @@ describe("hydrawise feature options", () => {
 
   test("declares the expected categories", () => {
 
-    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Device", "Log" ], "the catalog should declare the Device and Log categories");
+    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Account", "Device", "Log", "Mqtt" ],
+      "the catalog should declare the account, device, logging, and MQTT categories");
   });
 
   test("carries the catalog defaults for each option", () => {
@@ -58,7 +58,7 @@ describe("hydrawise feature options", () => {
 
     assert.ok(device && name && suspend && syncName && logZone, "every catalog entry the runtime names should exist");
     assert.equal(device.default, true, "the base Device option defaults to enabled");
-    assert.equal(name.default, true, "the zone name option defaults to enabled, so an unset name resolves to its empty default rather than to nothing");
+    assert.equal(name.default, false, "the zone name option defaults to disabled, so an unconfigured zone resolves no override at all");
     assert.equal(name.defaultValue, "", "the zone name option is value-centric and defaults to empty, which the runtime reads as no override");
     assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
     assert.equal(syncName.default, true, "name synchronization defaults to enabled");
@@ -85,8 +85,8 @@ describe("hydrawise feature options", () => {
 
     // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
     // zone, so it resolves at the zone alone.
-    assert.deepEqual(scopedOptions("global"), [ "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
-      "the zone name override is the only option that does not resolve globally");
+    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Debug", "Log.Zone",
+      "Mqtt.Topic", "Mqtt.Url" ], "the zone name override is the only option that does not resolve globally");
   });
 
   test("describeOptionScope renders the multi-scope prose", () => {

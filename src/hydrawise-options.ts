@@ -2,15 +2,22 @@
  *
  * hydrawise-options.ts: Feature option and type definitions for Hydrawise.
  */
-import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
+import type { FeatureOptionEntry, FeatureOptionScope, Nullable } from "homebridge-plugin-utils";
+import { HYDRAWISE_MQTT_TOPIC } from "./settings.ts";
+import { mqttFeatureOptions } from "homebridge-plugin-utils";
 
-// Plugin configuration options.
+/* The plugin's effective configuration, assembled once by the platform constructor. Each consolidated setting resolves there - the configured feature option
+ * first, the legacy configuration property as its fallback - so this describes what the plugin actually runs on rather than mirroring the shape of config.json.
+ *
+ * The two MQTT fields carry the feature-option engine's own tri-state answer: a string when a value resolves, null when the option is explicitly disabled, and
+ * undefined when an entry exists carrying no value. Both absences mean the same thing to the MQTT client factory, which is that MQTT is off.
+ */
 export interface HydrawiseOptions {
 
   apiKey: string;
   debug?: boolean;
-  mqttTopic: string;
-  mqttUrl?: string;
+  mqttTopic?: Nullable<string>;
+  mqttUrl?: Nullable<string>;
   options?: string[];
 }
 
@@ -41,37 +48,75 @@ export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.SyncN
 // so asking for a boolean option's value, or for a value option the zone level does not admit, is a type error.
 export type HydrawiseZoneValueOption = "Device.Name";
 
+// The globally-scoped value-centric option names - the account credential and the two MQTT settings the plugin resolves once at startup. The platform's
+// consolidated resolver narrows against this, so asking it for an option that carries no global value is a type error. The two Mqtt members name the library
+// factory's published entries and are bound to them by convention exactly as the unions above are bound to the catalog entries below; renaming either of those
+// entries is a breaking change on the library's side.
+export type HydrawiseGlobalValueOption = "Account.ApiKey" | "Mqtt.Topic" | "Mqtt.Url";
+
+// The globally-scoped boolean option names - the settings the plugin resolves once at startup as a simple on or off. The platform's flag resolver narrows against
+// this, so asking it for a value-bearing option, or for one no global lookup admits, is a type error. This is the boolean counterpart of the union above, and it is
+// bound by convention to the catalog entries below in exactly the same way.
+export type HydrawiseGlobalFlagOption = "Log.Debug";
+
+/* The library's canonical MQTT option group, composed once at module scope and read by both the category list and the catalog below, so the two always describe
+ * the same group. The factory's default scope is global, which is the only level that fits a plugin holding a single Hydrawise account, and this registration is
+ * the runtime's only consumer of the default topic constant, so the prefix a user never overrides is answered by the catalog itself.
+ */
+const mqtt = mqttFeatureOptions({ defaultTopic: HYDRAWISE_MQTT_TOPIC });
+
 // Feature option categories.
 export const featureOptionCategories = [
 
+  { description: "Account feature options.", name: "Account" },
   { description: "Device feature options.", name: "Device" },
-  { description: "Logging feature options.", name: "Log" }
+  { description: "Logging feature options.", name: "Log" },
+  mqtt.category
 ];
 
 /* eslint-disable @stylistic/max-len */
 
-// Individual feature options, broken out by category. Each entry declares the scope levels it may be configured at; the framework gates row visibility and scope
-// resolution on those, and the runtime narrows its lookups through the option-name unions above.
-export const featureOptions: Record<string, HydrawiseFeatureOption[]> = {
+// Account options. The API key is a value option rather than a schema property so that every setting this plugin has lives in one substrate, and it is global
+// because one key addresses the whole Hydrawise account.
+const accountOptions: HydrawiseFeatureOption[] = [
 
-  // Device options.
-  "Device": [
+  { default: false, defaultValue: "", description: "The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website.", inputSize: 19, name: "ApiKey", scopes: ["global"] }
+];
 
-    { default: true, description: "Make this device available in HomeKit.", name: "", scopes: [ "controller", "device", "global" ] },
-    { default: true, defaultValue: "", description: "Set a custom HomeKit name for this zone's valve. When empty, the zone name reported by Hydrawise is used.", name: "Name", scopes: ["device"] },
-    { default: false, description: "Expose a zone as its own standalone HomeKit accessory that can be assigned to any room. Enabling or disabling this option gives the zone a new HomeKit identity, so automations, scenes, and room assignments referencing its previous accessory must be set up again in the Home app.", name: "Standalone", scopes: [ "controller", "device", "global" ] },
-    { default: false, description: "Enable a switch accessory to control suspending all zones.", name: "Suspend", scopes: [ "controller", "global" ] },
-    { default: true, description: "Synchronize zone names with HomeKit. Synchronization is one-way only, syncing the effective zone name - the Name option when set, otherwise the name reported by Hydrawise - to HomeKit.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
-  ],
+// Device options.
+const deviceOptions: HydrawiseFeatureOption[] = [
 
-  // Logging options.
-  "Log": [
+  { default: true, description: "Make this device available in HomeKit.", name: "", scopes: [ "controller", "device", "global" ] },
+  { default: false, defaultValue: "", description: "Custom HomeKit name for this zone. When unset, the name reported by Hydrawise is used.", inputSize: 30, name: "Name", scopes: ["device"] },
+  { default: false, description: "Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated.", name: "Standalone", scopes: [ "controller", "device", "global" ] },
+  { default: false, description: "Enable a switch accessory to control suspending all zones.", name: "Suspend", scopes: [ "controller", "global" ] },
+  { default: true, description: "Synchronize zone names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
+];
 
-    { default: true, description: "Log zone start and stop events in Homebridge.", name: "Zone", scopes: [ "controller", "device", "global" ] }
-  ]
-};
+// Logging options.
+const logOptions: HydrawiseFeatureOption[] = [
+
+  { default: false, description: "Enable debug logging.", name: "Debug", scopes: ["global"] },
+  { default: true, description: "Log zone start and stop events in Homebridge.", name: "Zone", scopes: [ "controller", "device", "global" ] }
+];
 
 /* eslint-enable @stylistic/max-len */
+
+/* The full option catalog, assembled from the categories this plugin authors and the group the library contributes. Each authored entry declares the scope
+ * levels it may be configured at; the framework gates row visibility and scope resolution on those, and the runtime narrows its lookups through the
+ * option-name unions above.
+ *
+ * Two types are at work here on purpose, and neither needs a cast. The authored arrays are typed as our own entry, which is what enforces the scopes
+ * declaration at the site where an entry is written and a forgotten declaration is a compile error. The exported record speaks the framework's own entry
+ * vocabulary, which is the wider type, so a library-composed group drops straight in beside the authored ones.
+ */
+export const featureOptions: Record<string, FeatureOptionEntry[]> = {
+
+  "Account": accountOptions,
+  "Device": deviceOptions,
+  "Log": logOptions,
+  [mqtt.category.name]: mqtt.options
+};
 
 // Human-readable expansion of each scope level, consulted by the documentation hook when rendering an option's scope prose. The framework's level names are generic
 // across plugins, so this is where they become the Hydrawise hierarchy the user actually sees.
