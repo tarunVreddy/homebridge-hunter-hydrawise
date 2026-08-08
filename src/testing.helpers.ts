@@ -4,7 +4,7 @@
  * import paths stable as the implementation modules evolve. The thematic submodules under src/testing/ each own one concern:
  *
  *   - loggers.helpers.ts      TestLogger, CapturedLogLine, silentLog, capturingLog
- *   - fs.helpers.ts           withTempDir
+ *   - fs.helpers.ts           TMPDIR_PREFIX, withTempDir
  *   - process.helpers.ts      assertNoUnhandledRejections, expectAt
  *   - narrowing.helpers.ts    firstOf, nthOf
  *   - parity.helpers.ts       assertSameShape, declareKeysOf
