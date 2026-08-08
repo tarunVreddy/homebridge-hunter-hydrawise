@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-options.ts: Feature option and type definitions for Hydrawise.
+ * options.ts: Feature option and type definitions for Hydrawise.
  */
 import type { FeatureOptionEntry, FeatureOptionScope, Nullable } from "homebridge-plugin-utils";
 import { HYDRAWISE_MQTT_TOPIC } from "./settings.ts";

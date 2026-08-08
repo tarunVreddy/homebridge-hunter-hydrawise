@@ -1,7 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-api.fixtures.ts: Synthetic Hydrawise API response data for the unit suite. Data only - the factories that compose these constants into whole
- * responses live in hydrawise-api.helpers.ts.
+ * api.fixtures.ts: Synthetic Hydrawise API response data for the unit suite. Data only - the factories that compose these constants into whole
+ * responses live in api.helpers.ts.
  *
  * Provenance: the wire shapes mirror captured Hydrawise cloud API v1 responses (customerdetails.php and statusschedule.php) recorded in May 2024 and retained
  * as the repo-root development references. Every identifier here is synthesized - the controller and customer ids, the serial number, the relay ids, and every
@@ -11,7 +11,7 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { CustomerDetailsResponse, HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { CustomerDetailsResponse, HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 
 // The far-future timestamp Hydrawise stamps on a zone's `time` field when it reports no upcoming run. Fixed by the upstream API, so it is a named constant rather
 // than a magic literal scattered through the sentinel matrix below.

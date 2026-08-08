@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.standalone.test.ts: The controller's projection of standalone zones onto accessories of their own. Pins where a zone's valve is hosted and
+ * controller.standalone.test.ts: The controller's projection of standalone zones onto accessories of their own. Pins where a zone's valve is hosted and
  * where it is not, the enumeration difference a standalone host implies, the controller aggregates that deliberately still span standalone zones, the reconcile
  * request the projection builds, the zone accessory's information and name synchronization, the warm-restart handler attach, the fall back to controller hosting,
  * and the default-off parity floor.
@@ -9,15 +9,15 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 import { getServiceName } from "homebridge-plugin-utils";
-import { syntheticController } from "./hydrawise-api.fixtures.ts";
+import { syntheticController } from "./api.fixtures.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;

@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.budgets.test.ts: The rate ceilings retrieve() enforces, exercised against a REAL platform whose undici traffic runs through a MockAgent
+ * platform.budgets.test.ts: The rate ceilings retrieve() enforces, exercised against a REAL platform whose undici traffic runs through a MockAgent
  * installed as the global dispatcher after construction. Pins the capacities the platform constructs its budgets at, which budget each endpoint draws against,
  * and - the pin the whole mechanism rests on - that both draws are AWAITED, by saturating a ceiling and proving the blocked call put nothing on the wire before
  * shutdown resolved it to the quiet null every caller of retrieve() expects.

@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-config.test.ts: The webUI's pure platform-configuration interpreters, exercised against the REAL feature-option engine and the REAL option catalog
+ * config.test.ts: The webUI's pure platform-configuration interpreters, exercised against the REAL feature-option engine and the REAL option catalog
  * so the pins bind to the same grammar the plugin's runtime resolves against. Covers the effective-key precedence, every arm of the legacy-settings migration -
  * what migrates, what deletes without migrating, and what declines entirely - the first-run write, the degraded-mode interpreter, and a round trip proving a
  * migrated configuration runs the platform on the same effective values the legacy one did.
@@ -11,7 +11,7 @@
  */
 import { API_KEY_LENGTH, makeHydrawiseConfig, makeLegacyHydrawiseConfig } from "../homebridge-ui/public/hydrawise-config.mjs";
 import { describe, test } from "node:test";
-import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
+import { featureOptionCategories, featureOptions } from "./options.ts";
 import { FeatureOptions } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { buildPlatform } from "./testing/platform.helpers.ts";

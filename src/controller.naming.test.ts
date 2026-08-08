@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.naming.test.ts: Zone naming and name synchronization. Pins the effective name a valve is created with (the user's Name option when set,
+ * controller.naming.test.ts: Zone naming and name synchronization. Pins the effective name a valve is created with (the user's Name option when set,
  * otherwise the name Hydrawise reports), the synchronization that keeps it current while SyncName holds, the exact-compare that keeps a matching name from being
  * rewritten on every poll, the creation-only behavior a SyncName opt-out restores, and the zone-only scope the framework enforces for the Name option.
  */
@@ -9,17 +9,17 @@
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { FeatureOptions, getServiceName } from "homebridge-plugin-utils";
-import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./hydrawise-options.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
 import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
-import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import type { Service as HapService } from "homebridge";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 
 // The single zone every scenario here works against, and the names standing in for each source a valve's name can come from: what the wire reports, what a user
 // renamed it to in the Home app, and what the Name option configures.

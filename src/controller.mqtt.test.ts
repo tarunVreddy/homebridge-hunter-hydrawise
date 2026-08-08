@@ -1,20 +1,20 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.mqtt.test.ts: The controller's MQTT surface, driven through the recording MQTT double's invokeGet / invokeSet knobs. Covers the status
+ * controller.mqtt.test.ts: The controller's MQTT surface, driven through the recording MQTT double's invokeGet / invokeSet knobs. Covers the status
  * JSON the get handler answers, the set-command grammar (start / stop and the invalid-zone and invalid-command throws), and the per-poll publish including the
  * guarded-dispatch path that lands a publish rejection in the log rather than as an unhandled rejection.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 

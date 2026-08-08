@@ -4,7 +4,7 @@
  */
 "use strict";
 
-import { featureOptionCategories, featureOptions } from "../dist/hydrawise-options.js";
+import { featureOptionCategories, featureOptions } from "../dist/options.js";
 import { HYDRAWISE_API_TIMEOUT } from "../dist/settings.js";
 import { HomebridgePluginUiServer } from "@homebridge/plugin-ui-utils";
 

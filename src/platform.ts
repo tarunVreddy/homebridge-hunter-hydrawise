@@ -1,22 +1,22 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
+ * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, RateBudget, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop }
   from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint,
-  HydrawiseZoneIdentity } from "./hydrawise-types.ts";
+  HydrawiseZoneIdentity } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
   HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
   PLUGIN_NAME } from "./settings.ts";
-import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./hydrawise-options.ts";
+import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
-import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./hydrawise-types.ts";
-import { featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
+import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
+import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { Dispatcher } from "undici";
-import { HydrawiseController } from "./hydrawise-controller.ts";
+import { HydrawiseController } from "./controller.ts";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
 

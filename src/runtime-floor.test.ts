@@ -245,10 +245,10 @@ describe("HBHH runtime floor - gesture detectors", () => {
 
     // Driving the detector against fabricated entry modules is what keeps its rejecting branch out of vacuity: the live entry point is expected to pass, so only
     // synthetic negatives can prove the check would notice if it stopped passing.
-    const first = "import \"" + POLYFILL_SPECIFIER + "\";\nimport { HydrawisePlatform } from \"./hydrawise-platform.ts\";\n";
-    const second = "import { HydrawisePlatform } from \"./hydrawise-platform.ts\";\nimport \"" + POLYFILL_SPECIFIER + "\";\n";
-    const absent = "import { HydrawisePlatform } from \"./hydrawise-platform.ts\";\n";
-    const mentionedOnly = "// We import \"" + POLYFILL_SPECIFIER + "\" somewhere else.\nimport { HydrawisePlatform } from \"./hydrawise-platform.ts\";\n";
+    const first = "import \"" + POLYFILL_SPECIFIER + "\";\nimport { HydrawisePlatform } from \"./platform.ts\";\n";
+    const second = "import { HydrawisePlatform } from \"./platform.ts\";\nimport \"" + POLYFILL_SPECIFIER + "\";\n";
+    const absent = "import { HydrawisePlatform } from \"./platform.ts\";\n";
+    const mentionedOnly = "// We import \"" + POLYFILL_SPECIFIER + "\" somewhere else.\nimport { HydrawisePlatform } from \"./platform.ts\";\n";
 
     assert.equal(gestureIsFirstImport(first), true, "the gesture in first position is accepted");
     assert.equal(gestureIsFirstImport(second), false, "the gesture in second position is rejected");
@@ -304,7 +304,7 @@ describe("HBHH runtime floor - live conformance", () => {
     // The known occurrence in the platform proves the synchronous detector detects. There is deliberately no matching minimum for the asynchronous arm: zero
     // construction sites is the correct state today, and the synthetic drive above covers that branch instead.
     assert.ok(constructionSites.length >= 1, "at least one shipped file constructs a DisposableStack");
-    assert.ok(constructionSites.some(file => file.path.endsWith("hydrawise-platform.ts")), "src/hydrawise-platform.ts is among the DisposableStack construction " +
+    assert.ok(constructionSites.some(file => file.path.endsWith("platform.ts")), "src/platform.ts is among the DisposableStack construction " +
       "sites");
 
     assert.ok(gestureIsFirstImport(entrySource), "src/index.ts must make the polyfill gesture as its first import statement");

@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.schedule.test.ts: The zone schedule projection the runtime persists into accessory context - the classifier that turns one wire zone into a
+ * controller.schedule.test.ts: The zone schedule projection the runtime persists into accessory context - the classifier that turns one wire zone into a
  * schedule state, the whole-body projection and its self-describing header, the guards that classify a cache read, and the single flush chokepoint that carries
  * both persisted projections. These pins fix the zero-cloud-call source the webUI's schedule display reads back, and above all its change-shaped cost: a poll whose
  * facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
@@ -9,18 +9,18 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
-  scheduleStatus } from "./hydrawise-types.ts";
+  scheduleStatus } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
-  StatusScheduleResponse } from "./hydrawise-types.ts";
-import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./hydrawise-api.fixtures.ts";
+  StatusScheduleResponse } from "./types.ts";
+import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
 import { buildController, buildPlatform, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
 import { firstOf } from "./testing.helpers.ts";
-import { zoneIdentity } from "./hydrawise-types.ts";
+import { zoneIdentity } from "./types.ts";
 
 // The wire root time the bespoke scenarios stamp, and the one-poll-interval step the drift scenarios advance it by. A nominal Hydrawise poll is sixty seconds, so
 // stepping the root clock by sixty while the zones' countdowns fall by the same sixty is exactly the steady state a live controller reports.

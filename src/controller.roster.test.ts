@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.roster.test.ts: The accessory-context identity rosters HydrawiseController persists - the self identity and denormalized account roster seeded
+ * controller.roster.test.ts: The accessory-context identity rosters HydrawiseController persists - the self identity and denormalized account roster seeded
  * at construction (with a prior zone roster preserved or shape-degraded across the wipe), and the zone roster written and flushed on change from each poll. These pins
  * fix the zero-cloud-call source the webUI reads back: the full reported zone set (feature-disabled zones included), identity fields only, flushed exactly once per
  * change and never on an unchanged poll.
@@ -8,12 +8,12 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
 import { assertSameShape, firstOf } from "./testing.helpers.ts";
-import { bareSensors, normalZoneMatrix } from "./hydrawise-api.fixtures.ts";
+import { bareSensors, normalZoneMatrix } from "./api.fixtures.ts";
 import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import assert from "node:assert/strict";
 
 // The synthetic controller identity the default fixture carries, and a disabled sibling, so the denormalized account roster the platform passes in carries more than

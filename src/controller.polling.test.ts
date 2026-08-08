@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.polling.test.ts: The structure of the polling loop, as distinct from what any single poll projects. Pins the terminal fault - a poll body
+ * controller.polling.test.ts: The structure of the polling loop, as distinct from what any single poll projects. Pins the terminal fault - a poll body
  * that survives the shape guard but breaks the pass kills the loop once, reports once, and polls no more - the first-run handler attachment for a valve that came
  * back from the accessory cache rather than being created by this pass, and the ordering between the loop's wire half and its projection half.
  */
@@ -8,14 +8,14 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
 import { buildController, countLogged, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { TestAccessory } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 import { setTimeout as delay } from "node:timers/promises";
 
 // The single zone every scenario here works against.

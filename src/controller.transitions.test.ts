@@ -1,17 +1,17 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.transitions.test.ts: Multi-poll transition behavior of the HydrawiseController polling loop. Each test programs a queue of poll responses
+ * controller.transitions.test.ts: Multi-poll transition behavior of the HydrawiseController polling loop. Each test programs a queue of poll responses
  * and drives the live loop across them at the fast cadence, waiting on the observable each transition produces. Covers zone start / stop logging (globally and
  * per-zone by the Log.Zone feature), rain-sensor transitions, zone appearance and disappearance with valve pruning, and zone-scoped Device disable.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
-import { bareSensors, rainSensors } from "./hydrawise-api.fixtures.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { bareSensors, rainSensors } from "./api.fixtures.ts";
 import { buildController, countLogged, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 

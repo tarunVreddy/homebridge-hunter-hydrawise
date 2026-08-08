@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.options.test.ts: The platform's consolidated setting resolution and its guarded MQTT construction, exercised against a REAL platform built
+ * platform.options.test.ts: The platform's consolidated setting resolution and its guarded MQTT construction, exercised against a REAL platform built
  * through the harness. Covers every arm of the precedence rule - option over legacy property, legacy property over catalog default, and the explicit disabled and
  * valueless option states - for the API key, the MQTT broker URL, and the MQTT topic prefix, plus the client the resolved values do or do not construct.
  *

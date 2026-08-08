@@ -1,14 +1,14 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-api.helpers.ts: Factories that compose the synthetic fixture data in hydrawise-api.fixtures.ts into whole Hydrawise API response objects. Every
+ * api.helpers.ts: Factories that compose the synthetic fixture data in api.fixtures.ts into whole Hydrawise API response objects. Every
  * factory returns a fresh deep clone so a test that mutates a result - or production code that reassigns and trims a response's relays - never leaks state into
  * another test or back into the shared fixture constants.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { CustomerDetailsResponse, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
-import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./hydrawise-api.fixtures.ts";
+import type { CustomerDetailsResponse, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 
 // The steady-state polling cadence, in seconds, the fastPolling helper stamps so a live-loop test cycles in roughly 250ms - (nextpoll + jitter) * 1000 with the
 // jitter constant of 0.2 - rather than the wire-realistic 60-second interval.

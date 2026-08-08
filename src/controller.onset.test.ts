@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
+ * controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
  * handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone stops, the
  * command-failure revert, and the suspend / resume commands including the floored suspend timestamp pin (the bug 14 fix).
  */
@@ -8,13 +8,13 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./hydrawise-api.helpers.ts";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 import { firstOf } from "./testing.helpers.ts";
 
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {

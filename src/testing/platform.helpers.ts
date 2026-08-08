@@ -16,19 +16,19 @@ import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
 import { FeatureOptions, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../hydrawise-types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { featureOptionCategories, featureOptions } from "../hydrawise-options.ts";
+import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
-import { HydrawiseController } from "../hydrawise-controller.ts";
-import type { HydrawiseOptions } from "../hydrawise-options.ts";
-import { HydrawisePlatform } from "../hydrawise-platform.ts";
+import { HydrawiseController } from "../controller.ts";
+import type { HydrawiseOptions } from "../options.ts";
+import { HydrawisePlatform } from "../platform.ts";
 import { capturingLog } from "../testing.helpers.ts";
 import { setTimeout as delay } from "node:timers/promises";
-import { syntheticController } from "../hydrawise-api.fixtures.ts";
+import { syntheticController } from "../api.fixtures.ts";
 import util from "node:util";
-import { zoneAccessoryId } from "../hydrawise-types.ts";
+import { zoneAccessoryId } from "../types.ts";
 
 /**
  * Scan captured log lines for one at the given level whose fully-formatted text contains the substring. The plugin logs printf-style (a format string plus

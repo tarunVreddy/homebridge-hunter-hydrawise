@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.zones.test.ts: The standalone zone accessory contract the platform owns - reconcileZoneAccessories and the discovery-time orphan sweep's
+ * platform.zones.test.ts: The standalone zone accessory contract the platform owns - reconcileZoneAccessories and the discovery-time orphan sweep's
  * kind dispatch. Drives the reconcile directly against a real HydrawisePlatform (it is public API; the controller is its one production caller, but the contract
  * belongs to the platform) and drives the sweep through the captured DID_FINISH_LAUNCHING handler exactly as the discovery suite does.
  *
@@ -12,14 +12,14 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let the fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS } from "./settings.ts";
-import type { HydrawiseControllerConfig, HydrawiseZoneConfig, HydrawiseZoneIdentity } from "./hydrawise-types.ts";
+import type { HydrawiseControllerConfig, HydrawiseZoneConfig, HydrawiseZoneIdentity } from "./types.ts";
 import { buildPlatform, installMockDispatcher, loggedAt, programJsonReply, seedAccessory, waitFor } from "./testing/platform.helpers.ts";
-import { controllerIdentity, zoneAccessoryId, zoneIdentity } from "./hydrawise-types.ts";
+import { controllerIdentity, zoneAccessoryId, zoneIdentity } from "./types.ts";
 import { describe, test } from "node:test";
-import { makeCustomerDetails, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { makeCustomerDetails, makeZone, normalSchedule } from "./api.helpers.ts";
 import assert from "node:assert/strict";
 import { sanitizeName } from "homebridge-plugin-utils";
-import { syntheticController } from "./hydrawise-api.fixtures.ts";
+import { syntheticController } from "./api.fixtures.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";

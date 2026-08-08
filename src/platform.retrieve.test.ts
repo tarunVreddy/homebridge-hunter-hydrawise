@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.retrieve.test.ts: The HydrawisePlatform.retrieve() HTTP path, exercised against a REAL platform whose undici traffic is driven through a
+ * platform.retrieve.test.ts: The HydrawisePlatform.retrieve() HTTP path, exercised against a REAL platform whose undici traffic is driven through a
  * MockAgent installed as the global dispatcher after construction. Covers the happy 200, the invalid-key and rate-limit status branches, the bug-1 status gate,
  * the shutdown-abort short circuit, the connection-error taxonomy, and the bounded timeout branch.
  *

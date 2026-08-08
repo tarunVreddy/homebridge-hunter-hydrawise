@@ -3,7 +3,7 @@
  * settings.ts: Settings and constants for homebridge-hunter-hydrawise.
  */
 import type { Categories } from "homebridge";
-import type { HydrawiseEndpoint } from "./hydrawise-types.ts";
+import type { HydrawiseEndpoint } from "./types.ts";
 
 // Hydrawise API response timeout, in seconds.
 export const HYDRAWISE_API_TIMEOUT = 7;

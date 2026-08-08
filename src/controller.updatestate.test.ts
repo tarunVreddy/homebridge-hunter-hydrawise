@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.updatestate.test.ts: Single-poll behavior of the HydrawiseController polling loop, driven live at the fast (~250ms) cadence against the
+ * controller.updatestate.test.ts: Single-poll behavior of the HydrawiseController polling loop, driven live at the fast (~250ms) cadence against the
  * synthetic zone matrices. Covers valve creation and enumeration, the Active / InUse mapping across running, active-soon, and inactive zones, and the
  * irrigation-system aggregate characteristics - program mode included - after one completed poll.
  */
@@ -10,10 +10,10 @@
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./hydrawise-api.helpers.ts";
-import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./hydrawise-types.ts";
+import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import assert from "node:assert/strict";
-import { rainSensors } from "./hydrawise-api.fixtures.ts";
+import { rainSensors } from "./api.fixtures.ts";
 
 describe("HydrawiseController updateState (single poll)", () => {
 

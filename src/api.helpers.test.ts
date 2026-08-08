@@ -1,13 +1,13 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-api.helpers.test.ts: Self-test for the API response factories. Pins the factory defaults, the override merge, the scenario composers' distinguishing
+ * api.helpers.test.ts: Self-test for the API response factories. Pins the factory defaults, the override merge, the scenario composers' distinguishing
  * shapes, the fast-cadence stamp, and the fresh-clone-per-call isolation that keeps production's reassign-and-trim from leaking across tests.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { UNSCHEDULED_SENTINEL, allRelayIds } from "./hydrawise-api.fixtures.ts";
-import { allSuspended, fastPolling, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./hydrawise-api.helpers.ts";
+import { UNSCHEDULED_SENTINEL, allRelayIds } from "./api.fixtures.ts";
+import { allSuspended, fastPolling, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { firstOf } from "./testing.helpers.ts";

@@ -1,11 +1,11 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-options.test.ts: The feature-option catalog and its documentation hook. Pins the catalog defaults, the scope-set drift between the catalog's declared
+ * options.test.ts: The feature-option catalog and its documentation hook. Pins the catalog defaults, the scope-set drift between the catalog's declared
  * scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
  */
 import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
 import { describe, test } from "node:test";
-import { describeOptionScope, featureOptionCategories, featureOptions } from "./hydrawise-options.ts";
+import { describeOptionScope, featureOptionCategories, featureOptions } from "./options.ts";
 import assert from "node:assert/strict";
 
 // Compute the full option name for a catalog entry, joining the category with the entry name (an empty entry name is the category-level option).

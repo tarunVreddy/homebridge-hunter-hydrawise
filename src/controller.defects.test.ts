@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.defects.test.ts: Characterization pins for the HydrawiseController polling loop that fix current behavior with a distinguishing input,
+ * controller.defects.test.ts: Characterization pins for the HydrawiseController polling loop that fix current behavior with a distinguishing input,
  * including the preserved defects labeled with their bug-ledger numbers. Also covers the all-suspended versus rain-stopped program-mode distinction and the two
  * getStatus-failure backoff arms.
  */
@@ -8,13 +8,13 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.ts";
-import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./hydrawise-api.helpers.ts";
+import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
 import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { bareSensors } from "./hydrawise-api.fixtures.ts";
+import { bareSensors } from "./api.fixtures.ts";
 
 // Compose a fast-cadence single-zone schedule.
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {

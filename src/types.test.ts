@@ -1,11 +1,11 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-types.test.ts: The reserved-name constants and the fixture-versus-interface conformance check. The interfaces are compile-time contracts; this file
+ * types.test.ts: The reserved-name constants and the fixture-versus-interface conformance check. The interfaces are compile-time contracts; this file
  * pins the one runtime value the types module exports and verifies the synthetic fixtures carry the required wire fields with wire-accurate types.
  */
-import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./hydrawise-api.fixtures.ts";
+import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
-import { HydrawiseReservedNames } from "./hydrawise-types.ts";
+import { HydrawiseReservedNames } from "./types.ts";
 import assert from "node:assert/strict";
 import { firstOf } from "./testing.helpers.ts";
 

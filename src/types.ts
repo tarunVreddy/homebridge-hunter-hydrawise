@@ -1,6 +1,6 @@
 /* Copyright(C) 2020-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-types.ts: Interface and type definitions for Hydrawise.
+ * types.ts: Interface and type definitions for Hydrawise.
  */
 import type { PlatformAccessory } from "homebridge";
 

@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
+ * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
  * retry failure paths, and the shutdown teardown.
@@ -8,11 +8,11 @@
 import { buildPlatform, countLogged, dispatcherOf, installMockDispatcher, loggedAt, programJsonReply, programStatusReply, seedAccessory, waitFor }
   from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { makeCustomerDetails, normalSchedule } from "./hydrawise-api.helpers.ts";
+import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 import { onAbort } from "homebridge-plugin-utils";
-import { syntheticController } from "./hydrawise-api.fixtures.ts";
+import { syntheticController } from "./api.fixtures.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";

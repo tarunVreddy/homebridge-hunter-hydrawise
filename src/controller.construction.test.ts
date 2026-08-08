@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-controller.construction.test.ts: Construction-time behavior of HydrawiseController, exercised against a pre-aborted platform signal so the controller
+ * controller.construction.test.ts: Construction-time behavior of HydrawiseController, exercised against a pre-aborted platform signal so the controller
  * wires its services and subscriptions fully while its polling loop exits silently. Covers the irrigation-system and service-label services, the AccessoryInformation
  * fields, the optional suspend switch and its feature-log line, and the MQTT subscriptions.
  */
