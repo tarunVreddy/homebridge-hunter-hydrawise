@@ -14,7 +14,7 @@
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
-import { FeatureOptions, sanitizeName } from "homebridge-plugin-utils";
+import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
@@ -240,6 +240,7 @@ export interface TestPlatform {
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
   signal: AbortSignal;
+  timers: TimerRegistry;
 }
 
 // Options for makeTestPlatform: the platform config overrides, whether to attach a recording MQTT double, whether the platform signal starts pre-aborted (the
@@ -288,6 +289,12 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   }
 
   const mqtt = options.mqtt ? new TestMqttClient() : null;
+
+  /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
+   * wire - while a pure in-memory, signal-scoped mechanism runs its production self here, exactly as the FeatureOptions engine and the platform's rate budgets do.
+   * It takes the double's own signal, so a pre-aborted platform double carries a registry born disposed, which is the state production reaches at shutdown.
+   */
+  const timers = new TimerRegistry({ signal: signalController.signal });
   const retrieve = new RetrieveRecorder();
   const flushes: TestAccessory[][] = [];
   const reconciles: RecordedReconcileCall[] = [];
@@ -352,7 +359,8 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt,
     reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
-    signal: signalController.signal
+    signal: signalController.signal,
+    timers
   };
 
   return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, reconciles, retrieve,
@@ -427,6 +435,10 @@ export interface TestApiResult {
   // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
   // succeeding exactly as before.
   failRegistrationUuids: Set<string>;
+
+  // The UUIDs whose cache flush should throw, so a test can drive the arm where an accessory registers and then fails to persist - the one path that reaches
+  // production's promotion undo. Empty by default, which leaves every flush recording exactly as before.
+  failUpdateUuids: Set<string>;
   makeAccessory: (displayName: string, uuid: string, category?: number) => TestAccessory;
   registered: TestAccessory[];
   unregistered: TestAccessory[];
@@ -441,9 +453,25 @@ export function makeTestApi(): TestApiResult {
 
   const handlers = new Map<string, ApiEventHandler[]>();
   const failRegistrationUuids = new Set<string>();
+  const failUpdateUuids = new Set<string>();
   const registered: TestAccessory[] = [];
   const unregistered: TestAccessory[] = [];
   const updated: TestAccessory[][] = [];
+
+  /* The one check-before-record gate the recording closures answer to: any accessory the fail set names throws before a single entry lands in a buffer, so a
+   * rejected call leaves the recorded state exactly as a real failure would. The knobs share this check rather than each closure carrying its own mirrored
+   * loop, so they can never drift apart in what "rejected" means.
+   */
+  const rejectNamed = (failUuids: Set<string>, accessories: TestAccessory[], action: string): void => {
+
+    for(const accessory of accessories) {
+
+      if(failUuids.has(accessory.UUID)) {
+
+        throw new Error(action + " rejected for " + accessory.UUID + ".");
+      }
+    }
+  };
 
   const api = {
 
@@ -460,19 +488,17 @@ export function makeTestApi(): TestApiResult {
     platformAccessory: TestPlatformAccessory,
     registerPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => {
 
-      // The failure knob, checked before anything is recorded so a rejected registration leaves the buffer exactly as a real failure would.
-      for(const accessory of accessories) {
-
-        if(failRegistrationUuids.has(accessory.UUID)) {
-
-          throw new Error("Registration rejected for " + accessory.UUID + ".");
-        }
-      }
+      rejectNamed(failRegistrationUuids, accessories, "Registration");
 
       registered.push(...accessories);
     },
     unregisterPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => { unregistered.push(...accessories); },
-    updatePlatformAccessories: (accessories: TestAccessory[]): void => { updated.push(accessories); }
+    updatePlatformAccessories: (accessories: TestAccessory[]): void => {
+
+      rejectNamed(failUpdateUuids, accessories, "Cache flush");
+
+      updated.push(accessories);
+    }
   };
 
   const emit = (event: string): void => {
@@ -483,7 +509,7 @@ export function makeTestApi(): TestApiResult {
     }
   };
 
-  return { api, emit, failRegistrationUuids,
+  return { api, emit, failRegistrationUuids, failUpdateUuids,
     makeAccessory: (displayName: string, uuid: string, category?: number): TestAccessory => new TestPlatformAccessory(displayName, uuid, category), registered,
     unregistered, updated };
 }

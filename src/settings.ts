@@ -35,6 +35,12 @@ export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 
+/* The beat, in MILLISECONDS - every other duration in this file is stated in seconds - between a command the Hydrawise API refused and the HomeKit characteristic
+ * write that puts the optimistic state back. Every revert site schedules against this one constant, so the pause a user sees when a command fails is the same
+ * wherever it failed.
+ */
+export const HYDRAWISE_REVERT_DELAY = 50;
+
 // The suspend-all duration, in seconds. Hydrawise's suspend-all convention pushes the resume boundary one year into the future; a resume sends the current time.
 export const HYDRAWISE_SUSPEND_DURATION = 31556926;
 

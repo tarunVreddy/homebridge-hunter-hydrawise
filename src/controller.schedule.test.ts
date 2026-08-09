@@ -516,9 +516,14 @@ describe("HydrawiseController schedule exclusivity", () => {
     const zone: HydrawiseZoneIdentity = { name: "Alpha", relay: 1, relayId: ALPHA_RELAY_ID };
     const projection = scheduleStatus(schedule(scheduledDrift(0)), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
+    /* The ambiguous shape inhabits neither arm of the context union - closing it off statically is what the arms are for - so it reaches the predicate through
+     * the same cast the cache reader above uses. That is the honest model of where such an object comes from: Homebridge round-trips this context through its
+     * on-disk cache, where a hand-edited or half-written entry answers to no static type, and the predicate is the guard that reads it.
+     */
+    const ambiguous = { ownerController, schedule: projection, zone } as unknown as HydrawiseAccessoryContext;
+
     assert.ok(isZoneAccessoryContext({ ownerController, zone }), "the schedule-free zone pair is a zone accessory context");
-    assert.ok(!isZoneAccessoryContext({ ownerController, schedule: projection, zone }),
-      "a schedule leaking onto a zone accessory makes it classify as not-a-zone, the self-healing direction");
+    assert.ok(!isZoneAccessoryContext(ambiguous), "a schedule leaking onto a zone accessory makes it classify as not-a-zone, the self-healing direction");
   });
 
   test("a reconciled standalone accessory's context carries the zone pair alone", () => {

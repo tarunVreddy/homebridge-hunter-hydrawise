@@ -5,8 +5,8 @@
  * belongs to the platform) and drives the sweep through the captured DID_FINISH_LAUNCHING handler exactly as the discovery suite does.
  *
  * Covers the persistence-critical UUID seed, the accessory category and sanitized name, the exclusive context key set, the field-wise refresh comparison, the
- * demotion split between configuration intent and wire absence with its poll-count grace, per-controller isolation, and the per-zone promotion-failure
- * containment.
+ * demotion split between configuration intent and wire absence with its poll-count grace, per-controller isolation, the per-zone promotion-failure
+ * containment, and the undo that runs when a registered accessory fails to persist.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let the fixtures mirror the wire verbatim.
@@ -292,6 +292,48 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
     platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present, zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
 
     assert.equal(registered.length, 2, "the faulted zone leaves no residue behind, so the next reconcile retries its registration");
+  });
+
+  test("undoes a promotion whose seed flush fails and retries the zone once the flush recovers", () => {
+
+    const failing = zoneFixture();
+    const healthy = zoneFixture({ name: "Side Yard", relay: 2, relay_id: SECOND_RELAY_ID });
+    const { failUpdateUuids, lines, platform, registered, unregistered, updated } = buildPlatform();
+    const present = new Set([ ZONE_RELAY_ID, SECOND_RELAY_ID ]);
+    const failingUuid = zoneAccessoryId(syntheticController.controller_id, ZONE_RELAY_ID);
+
+    /* Failing the CACHE FLUSH rather than the registration is what reaches the undo arm: the registration succeeds, so this pass has an accessory of its own to
+     * take back. The knob cannot deadlock that undo either - removeAccessory splices the accessory out of the tracked array before its own tail flush, so the
+     * accessory the knob names is already gone from the array that flush carries, and the scenario terminates.
+     */
+    failUpdateUuids.add(failingUuid);
+
+    const hosts = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present,
+      zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
+
+    assert.equal(registered.length, 2, "both zones register - it is the flush that fails here, not the registration");
+    assert.equal(unregistered.length, 1, "the failed pass takes back exactly the accessory it created");
+    assert.equal(unregistered[0]?.UUID, failingUuid, "the undo unregisters the zone whose flush threw");
+    assert.equal(hosts.has(ZONE_RELAY_ID), false, "the faulted zone is omitted from the hosting map, so the controller keeps hosting its valve");
+    assert.equal(hosts.get(SECOND_RELAY_ID)?.UUID, "500001.Zone.700002", "the other zone's accessory still lands");
+    assert.ok(loggedAt(lines(), "error", "Unable to establish a standalone accessory"), "the fault is reported against the zone it belongs to");
+
+    const updatesAfterFailure = updated.length;
+
+    failUpdateUuids.clear();
+
+    const retried = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present,
+      zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
+
+    /* The signals below are what tell a cleared knob from one still stuck open. A knob still throwing would omit the zone from the hosting map again, log
+     * again, and grow the unregistered buffer again; registration-buffer growth on its own could not tell the two apart, because addAccessory registers before
+     * the gated flush ever runs. That fresh registration is the residue proof: a ghost left in the tracked array would satisfy the find-by-UUID lookup and
+     * short-circuit it, the same idiom the containment pin above rests on.
+     */
+    assert.equal(retried.get(ZONE_RELAY_ID)?.UUID, failingUuid, "a recovered flush lets the zone take an accessory of its own");
+    assert.equal(unregistered.length, 1, "the retry undoes nothing, so the unregistered buffer stands where the failed pass left it");
+    assert.equal(updated.length, updatesAfterFailure + 1, "the retry records the seed flush the failed pass never completed");
+    assert.equal(registered.length, 3, "the faulted zone leaves no residue behind, so the retry registers it afresh");
   });
 });
 

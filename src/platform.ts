@@ -3,10 +3,10 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, RateBudget, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop }
+import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop }
   from "homebridge-plugin-utils";
-import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint,
-  HydrawiseZoneIdentity } from "./types.ts";
+import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
+  HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
   HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
   PLUGIN_NAME } from "./settings.ts";
@@ -36,6 +36,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly mqtt: Nullable<MqttClient>;
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
+  public readonly timers: TimerRegistry;
 
   /* Everything shutdown has to undo, declared in one place and disposed in one call. A DisposableStack runs its registered work in reverse registration order, so
    * the ordering teardown depends on is expressed by the order things are registered rather than by a handler body that has to be read to be trusted, and the
@@ -81,6 +82,11 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // both are built here alongside the signal, ahead of the missing-API-key return below that leaves the rest of the platform unbuilt.
     this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
     this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
+
+    // The one home for every deferred HomeKit write this plugin arms, shared by every controller the platform builds. Construction schedules nothing, so it is
+    // built here beside the budgets, ahead of the missing-API-key return below. Its lifetime IS the shutdown signal - the abort drains whatever is pending and
+    // leaves every later registration inert - so it takes no teardown-stack registration of its own, on the same terms as the MQTT client below.
+    this.timers = new TimerRegistry({ signal: this.signal });
 
     // Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
     // resolves through the same precedence here, so no reader downstream has to know that a setting has two possible homes.
@@ -294,8 +300,14 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // Inform the user.
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-    // Add it to our list of configured devices. The controller seeds its accessory context during construction; the flush just below persists that seed.
-    this.configuredDevices[uuid] = new HydrawiseController(this, accessory, controller, roster);
+    /* Add it to our list of configured devices. The controller seeds its accessory context during construction; the flush just below persists that seed.
+     *
+     * The cast to the controller arm is sound by construction, and it is the one place the narrowing cannot be derived from a predicate. A controller
+     * accessory's UUID is seeded from the bare controller_id above, while every zone accessory's is seeded from the `.Zone.`-infixed compound, so the
+     * controller UUID space and the zone UUID space cannot collide and an accessory found or created under a controller UUID can only be a controller
+     * accessory. The controller writes its own context fields one at a time, which the arm's mutable interface is what allows.
+     */
+    this.configuredDevices[uuid] = new HydrawiseController(this, accessory as HydrawiseControllerAccessory, controller, roster);
 
     // Refresh the accessory cache.
     this.api.updatePlatformAccessories([accessory]);

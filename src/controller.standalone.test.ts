@@ -10,12 +10,12 @@
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { buildController, waitFor } from "./testing/platform.helpers.ts";
+import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors } from "./api.fixtures.ts";
+import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./api.fixtures.ts";
 import { getServiceName } from "homebridge-plugin-utils";
 import { syntheticController } from "./api.fixtures.ts";
 
@@ -48,6 +48,10 @@ function standaloneZone(overrides: Partial<HydrawiseZoneConfig> = {}): Hydrawise
 // running, and the run command the handler sends is a no-op without one.
 const SCHEDULED: Partial<HydrawiseZoneConfig> = { run: 480, time: 68000, timestr: "16:00" };
 
+// The overrides that give the zone the unscheduled sentinel shape. Served with a rain sensor whose relay list covers the zone, this is the wire state that
+// classifies as a sensor stop.
+const SENSOR_STOPPED: Partial<HydrawiseZoneConfig> = { run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" };
+
 // The controller-hosted zone: scheduled well beyond the active-zone window, so it neither runs nor drives a transition.
 function hostedZone(): HydrawiseZoneConfig {
 
@@ -58,6 +62,18 @@ function hostedZone(): HydrawiseZoneConfig {
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
   return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+}
+
+/* A cadence deliberately slower than the fast one, in seconds. It leaves a gap after each poll's projection wide enough for a test to change what the NEXT poll
+ * will see - a feature option, the programmed body - before that poll fetches. The fast cadence leaves no usable gap: its next fetch is already away by the
+ * time an effect of the previous poll is observable.
+ */
+const PACED_POLL_SECONDS = 0.3;
+
+// A paced-cadence schedule around the given zones and sensor block.
+function pacedSchedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"]): StatusScheduleResponse {
+
+  return makeStatusSchedule({ nextpoll: PACED_POLL_SECONDS, relays: zones, sensors });
 }
 
 // Wait until the controller has completed the given number of polls. Bounding on the NEXT call guarantees the poll before it fully ran its projection, which is
@@ -332,5 +348,40 @@ describe("HydrawiseController standalone zones", () => {
     assert.ok(h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE), "both zones keep their valves on the controller accessory");
     assert.equal(h.flushes.length, 1, "only the first poll's roster seed flushes, exactly as it does without this feature");
     assert.equal(h.controllerConfig.serial_number, syntheticController.serial_number, "the scenario ran against the synthetic controller");
+  });
+
+  test("a zone promoted on the poll that first reports it sensor-stopped logs no rain transition", async (t) => {
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: pacedSchedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // Poll 1 hosts the zone on the controller accessory against a normal schedule, which seeds its stored rain state false.
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE) ? true : undefined);
+
+    /* Opt the zone in through the platform double's REAL feature-options engine - the same instance the controller consults on every poll - so the promotion
+     * arrives at a controller that ALREADY holds a hint entry for this zone. Building a second controller would seed a fresh ledger and quietly defeat the
+     * existing-entry premise this pin exists to exercise. The paced cadence is what lets the option and the body change together: the gap after one poll's
+     * projection is wide enough to make both changes before the next poll fetches.
+     */
+    h.platform.featureOptions.configuredOptions = [ ...h.platform.featureOptions.configuredOptions, STANDALONE_ON ];
+    h.retrieve.programDefault("statusschedule.php", { body: pacedSchedule([standaloneZone(SENSOR_STOPPED)], rainSensors), kind: "response" });
+
+    // Poll 2 promotes the zone and reports it sensor-stopped in the same pass, so the valve is re-acquired on a new host while the live sensor state differs
+    // from the value stored for the zone. Observing the valve is what proves the promotion happened rather than the scenario passing vacuously.
+    await waitFor(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) ? true : undefined);
+
+    assert.ok(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the valve genuinely landed on the standalone host");
+    assert.ok(!loggedAt(h.lines(), "info", "Rain sensor is stopping irrigation"),
+      "a valve rediscovery refreshes the stored sensor state before the comparison, so a promotion narrates no transition the zone never made");
+
+    // Clearing the stop is the positive control: the line firing here proves Log.Zone is live for this zone and that the promotion poll stored the live
+    // stopped state rather than leaving the seeded false standing.
+    h.retrieve.programDefault("statusschedule.php", { body: pacedSchedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" });
+
+    await waitFor(() => loggedAt(h.lines(), "info", "Rain sensor is allowing irrigation") ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "info", "Rain sensor is allowing irrigation"), "the sensor clearing after the promotion does narrate its transition");
   });
 });

@@ -401,45 +401,69 @@ export function sameScheduleStatus(a: ComparedScheduleFields, b: ComparedSchedul
  * hold still between polls, so it is written on the same compare-then-write terms identity is. Both are read straight off the accessory cache, which is what keeps
  * the webUI's listing and its schedule display free of any cloud call.
  *
- * The accessory KINDS remain mutually exclusive. A controller accessory carries its own identity (the self-identity the webUI's zone lookup keys on), the
- * denormalized account roster (every account controller, enabled or not, so any one accessory knows all its siblings), its own zone roster, and its schedule
- * projection; it never carries the zone-accessory pair. A standalone zone accessory carries exactly that pair - the owning controller's identity and the zone's own
- * - and never any controller-accessory field. That split is what the webUI's controller match rests on: it finds a controller by reading `controller`, so a zone
- * accessory carrying that field would shadow the real controller accessory and blank the zone listing. isZoneAccessoryContext below is the one place the split is
- * asserted.
+ * The accessory KINDS are mutually exclusive, and the arms below state that in the types rather than leaving it to convention. A controller accessory carries
+ * its own identity (the self-identity the webUI's zone lookup keys on), the denormalized account roster (every account controller, enabled or not, so any one
+ * accessory knows all its siblings), its own zone roster, and its schedule projection; it never carries the zone-accessory pair. A standalone zone accessory carries
+ * exactly that pair - the owning controller's identity and the zone's own - and never any controller-accessory field. Each arm types the other kind's fields as
+ * `never`, so an object carrying both shapes at once inhabits neither. That split is what the webUI's controller match rests on: it finds a controller by reading
+ * `controller`, so a zone accessory carrying that field would shadow the real controller accessory and blank the zone listing.
  *
- * Every field is optional, and the interface is deliberately flat rather than a union of the kinds. This shape round-trips the on-disk cache and is field-written by
- * paths whose flush cadence is pinned (the roster and the schedule are each written alone), which a union would force into whole-object writes. Exclusivity is
- * therefore enforced by the predicate below and re-asserted by every zone-context write, which assigns a complete fresh object rather than a field.
+ * The arms are deliberately asymmetric in what they require. Every controller-arm field is optional, so a freshly constructed `{}` and a cache entry carrying only
+ * some of the fields both inhabit that arm, and an ambiguous or empty context classifies as controller-side - the self-healing direction, and the same answer the
+ * runtime predicate gives. The zone arm requires its pair, because that pair is only ever written as one whole object.
+ *
+ * The write discipline follows from the aliases rather than from a rule each writer has to remember. HydrawiseAccessoryContext composes READONLY views of the arms,
+ * so a reference typed as the union admits a whole-object assignment and rejects a field write outright, while every field write lives on an arm-typed reference,
+ * which carries the mutable interface. isZoneAccessoryContext below is the runtime half of the same rule and the vocabulary every consumer branches on: it asserts
+ * the split against cache JSON that no static type governs, and it narrows both of its branches.
  */
-export interface HydrawiseAccessoryContext {
+export interface HydrawiseControllerAccessoryContext {
 
   controller?: HydrawiseControllerIdentity;
   controllers?: HydrawiseControllerIdentity[];
-  ownerController?: HydrawiseControllerIdentity;
+  ownerController?: never;
   schedule?: HydrawiseScheduleStatus;
-  zone?: HydrawiseZoneIdentity;
+  zone?: never;
   zones?: HydrawiseZoneIdentity[];
 }
+
+// The persisted context of a standalone zone accessory: the owning controller's identity and the zone's own. The pair is required because it is only ever written
+// whole - the reconcile assigns a complete fresh object - and the controller-accessory fields are closed off as `never`.
+export interface HydrawiseZoneAccessoryContext {
+
+  controller?: never;
+  controllers?: never;
+  ownerController: HydrawiseControllerIdentity;
+  schedule?: never;
+  zone: HydrawiseZoneIdentity;
+  zones?: never;
+}
+
+// A persisted accessory context of either kind - the union every surface that genuinely sees both kinds speaks. The arms compose as readonly views, which is what
+// makes a field write through a union-typed reference a compile error and keeps field writes on the arm-typed references that carry the mutable interfaces.
+export type HydrawiseAccessoryContext = Readonly<HydrawiseControllerAccessoryContext> | Readonly<HydrawiseZoneAccessoryContext>;
 
 /* Whether a persisted accessory context belongs to a standalone zone accessory. Exclusivity is checked in BOTH directions - the zone-accessory pair present and
  * well-formed, and every controller-accessory field absent - so an ambiguous context carrying both shapes at once classifies as NOT a zone accessory and takes the
  * non-zone arm wherever it is read, which is the self-healing direction. This predicate is the single vocabulary every consumer branches on, so the exclusivity rule
  * is asserted in exactly one place instead of being re-derived at each read site.
  *
- * The narrowed type states the absences as well as the presences, so the compiler carries the rule the runtime just checked. A bare read of a controller-side field
- * off a narrowed context stays legal and types as undefined; what the compiler rejects is CONSUMING such a read as a value, since the field's type has intersected
- * away to undefined. That is protection the write-site convention alone could never give, because a convention is only as good as the next writer.
+ * The check runs in full against the values themselves, whatever the static types promise, because what it reads is cache JSON Homebridge round-trips from disk,
+ * where a hand-edited or half-written entry can carry any shape at all. What the narrowing adds is the compiler carrying the same rule forward: this is also the
+ * union's narrowing vocabulary, so the true branch types as the zone arm and the else branch as the controller arm. That is protection the write-site convention
+ * alone could never give, because a convention is only as good as the next writer.
  */
-export function isZoneAccessoryContext(context: HydrawiseAccessoryContext):
-  context is HydrawiseAccessoryContext & { controller?: undefined; controllers?: undefined; ownerController: HydrawiseControllerIdentity; schedule?: undefined;
-    zone: HydrawiseZoneIdentity; zones?: undefined; } {
+export function isZoneAccessoryContext(context: HydrawiseAccessoryContext): context is Readonly<HydrawiseZoneAccessoryContext> {
 
   return isControllerIdentity(context.ownerController) && isZoneIdentity(context.zone) && (context.controller === undefined) &&
     (context.controllers === undefined) && (context.schedule === undefined) && (context.zones === undefined);
 }
 
-// A Hydrawise accessory of either kind: a Homebridge PlatformAccessory whose context is our typed HydrawiseAccessoryContext. This alias is the single name threaded
-// through every accessory field, parameter, and creation site, so the context contract lives in exactly one place. Because every context field is optional the alias
-// stays assignable both ways with the platform's bare PlatformAccessory (the wide UnknownContext) without a cast at the construction and configure boundaries.
+// A Hydrawise accessory of either kind: a Homebridge PlatformAccessory whose context is our typed union. This is the alias for every surface that genuinely sees
+// both kinds - the tracked accessory array, the creation and removal paths, the orphan sweep, the hosting map - so the context contract lives in exactly one place.
+// A reference typed this way admits a whole-object context assignment and no field write at all, because the union's arms are readonly views.
 export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;
+
+// A controller accessory specifically: the same PlatformAccessory over the controller arm alone. The controller's own accessory takes this alias because that is
+// where the field writes live - seeding one roster field at a time is legal on the arm's mutable interface and nowhere else.
+export type HydrawiseControllerAccessory = PlatformAccessory<HydrawiseControllerAccessoryContext>;

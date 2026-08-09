@@ -2,19 +2,20 @@
  *
  * controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
  * handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone stops, the
- * command-failure revert, and the suspend / resume commands including the floored suspend timestamp pin (the bug 14 fix).
+ * command-failure revert and the shutdown lifetime it answers to, and the suspend / resume commands including the floored suspend timestamp pin (the bug 14 fix).
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
+import { setTimeout as delay } from "node:timers/promises";
 import { firstOf } from "./testing.helpers.ts";
 
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
@@ -30,6 +31,19 @@ function scheduledZone(): HydrawiseZoneConfig {
 function runningZone(): HydrawiseZoneConfig {
 
   return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 600, time: 1, timestr: "" });
+}
+
+// A zone queued to run inside the active window, so every poll of it writes the same ACTIVE the optimistic set writes. The shutdown pin below works from this
+// shape deliberately: with the polling cadence unable to move the characteristic, a value that changes across the settle wait can only be a revert landing.
+function activeSoonZone(): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 1800, timestr: "16:30" });
+}
+
+// A second zone that every poll keeps reporting. The stale-tap scenarios below drop the first zone alone, so this one holds the enabled projection non-empty.
+function siblingZone(): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Bravo", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
 }
 
 describe("HydrawiseController valve and suspend onSet", () => {
@@ -98,6 +112,117 @@ describe("HydrawiseController valve and suspend onSet", () => {
       "stopping the last running zone leaves the system not in use");
   });
 
+  test("a manual run holds program mode across polls that still report the zone running", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"));
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+    await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
+
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE,
+      "a manual start puts the controller in manual program mode");
+
+    /* Let the wire confirm the run. Bounding each wait on the poll AFTER the one under test is what makes these assertions mean something: a poll's projection
+     * has certainly completed once the next poll has begun, and every call counted from here started after the change that precedes it.
+     */
+    const afterStart = h.retrieve.callsTo("statusschedule.php").length;
+
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > (afterStart + 1)) ? true : undefined);
+
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE,
+      "a poll that still reports the zone running leaves the manual activation standing");
+
+    // Now let the run complete on the wire. The zone reporting as not running is the whole trigger for clearing the manual activation - nothing in HomeKit was
+    // touched - so program mode returns to the schedule on its own.
+    h.retrieve.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+
+    const afterCompletion = h.retrieve.callsTo("statusschedule.php").length;
+
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > (afterCompletion + 1)) ? true : undefined);
+
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "the wire reporting the zone stopped clears the manual activation and returns program mode to the schedule");
+  });
+
+  /* A HomeKit tap that lands after the poll walk has already dropped the zone. HomeKit holds its own view of an accessory, so a tap can arrive against a valve
+   * the plugin has already removed, and the handler then addresses the ledger entry that went with it. Marking a missing entry is the silent no-op the ledger
+   * states, and the no-throw is this pin's contract half: an unguarded write would fault right here, inside a set handler HomeKit is awaiting. The program-mode
+   * read that follows is corroboration - it shows no phantom manual state outlived the prune, which is what the aggregate would report if one had.
+   *
+   * Both zones bind on the first poll and the target alone vanishes on the next, so the sibling holds the enabled projection non-empty. A single-zone scenario
+   * would land the empty domain's own arm instead - the no-program-scheduled divergence the defects suite pins - and would be asserting something else.
+   */
+  test("a manual start on a zone the last poll dropped completes as a no-op on the missing ledger entry", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([ scheduledZone(), siblingZone() ]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([siblingZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"));
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+
+    // The vanish poll prunes the target's ledger entry and removes its valve, while the sibling keeps both of its own.
+    await waitFor(() => (h.accessory.getServiceById(Service.Valve, "700001") === undefined) ? true : undefined);
+
+    assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the sibling zone should still be published");
+    await assert.doesNotReject(() => valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE),
+      "a manual start against a dropped zone completes rather than faulting");
+
+    // Bounded on the poll after the one already in flight, so the aggregate read below is certainly a recomputation that ran after the mark.
+    const afterStart = h.retrieve.callsTo("statusschedule.php").length;
+
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > (afterStart + 1)) ? true : undefined);
+
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "the aggregate recomputes over the sibling's domain alone, so the dropped zone recorded no manual activation");
+  });
+
+  /* The same stale tap in the stop direction, where clearing a missing entry takes the no-op path marking one does. The no-throw is again the whole contract
+   * half. The program-mode read here is corroboration only, and says so plainly: the stop handler recomputes the aggregate itself, and with the dropped zone
+   * outside the enabled projection that recomputation lands on the schedule whether or not the clear found anything to do.
+   */
+  test("a manual stop on a zone the last poll dropped completes as a no-op on the missing ledger entry", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([ runningZone(), siblingZone() ]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([siblingZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"));
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+    await waitFor(() => (h.accessory.getServiceById(Service.Valve, "700001") === undefined) ? true : undefined);
+
+    assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the sibling zone should still be published");
+    await assert.doesNotReject(() => valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.INACTIVE),
+      "a manual stop against a dropped zone completes rather than faulting");
+
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "the handler's own recomputation over the sibling's domain leaves the controller on its schedule");
+  });
+
   test("a failed command reverts the valve state after the revert delay", async (t) => {
 
     const h = buildController({ program: (recorder) => {
@@ -116,6 +241,41 @@ describe("HydrawiseController valve and suspend onSet", () => {
     await waitFor(() => (valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE) ? true : undefined);
 
     assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a failed run should revert the valve to inactive");
+  });
+
+  test("a revert pending at shutdown drains, and one scheduled afterward stays inert", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([activeSoonZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { kind: "null" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"));
+    const active = valve.getCharacteristic(Characteristic.Active);
+
+    /* Phase one: a failed command schedules a revert, and the platform shuts down while that revert is still pending. Every wait here is computed from the
+     * production delay rather than restating it - half of it lands the abort squarely inside the window, and a few multiples of it settle well past the beat the
+     * revert would have fired on.
+     */
+    await active.triggerSet(Characteristic.Active.ACTIVE);
+    await delay(HYDRAWISE_REVERT_DELAY / 2);
+
+    h.abort();
+
+    await delay(HYDRAWISE_REVERT_DELAY * 3);
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 1, "the failed command reached the wire, so a revert was genuinely scheduled");
+    assert.equal(active.value, Characteristic.Active.ACTIVE, "a revert pending when the platform shuts down drains instead of landing");
+
+    // Phase two: the platform is down, so the registry is disposed and the revert this failed command asks for is never armed at all.
+    await active.triggerSet(Characteristic.Active.INACTIVE);
+    await delay(HYDRAWISE_REVERT_DELAY * 3);
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 2, "the second command reached the wire, so the revert site ran again");
+    assert.equal(active.value, Characteristic.Active.INACTIVE, "a revert scheduled after shutdown never fires");
   });
 
   test("the suspend command floors its timestamp to a whole second (the bug 14 fix)", async (t) => {

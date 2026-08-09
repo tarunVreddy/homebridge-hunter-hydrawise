@@ -3,13 +3,13 @@
  * controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT,
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY,
   HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
   sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse,
-  StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig,
+  HydrawiseZoneIdentity, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
@@ -48,9 +48,114 @@ interface HydrawiseZoneHints {
   isStopped: boolean;
 }
 
+/* The one owner of the zone hints a controller keeps. The map is private to this class, and every change to it arrives as a named intent - seed, mark, clear,
+ * observe, refresh, prune - rather than as a field write somewhere out in the poll walk or a set handler.
+ *
+ * Single ownership is what lets the relationships between those hints be enforced here instead of resting on the order call sites happen to run in. A zone the
+ * wire reports as not running is not manually activated, so the observation clears the manual flag itself, and an entry exists only for a zone the current
+ * poll's enabled projection names, so a zone that vanishes and reappears starts fresh rather than resurrecting stale flags.
+ *
+ * The views handed back are the LIVE stored entries, never defensive copies. The poll walk holds one for the rest of its pass and has to observe the writes
+ * that same pass makes through the ledger; a copy would hand it pre-write reads and quietly break the start, stop, and rain-sensor comparisons that follow.
+ */
+class HydrawiseZoneHintLedger {
+
+  private readonly hints = new Map<number, HydrawiseZoneHints>();
+
+  /* Resolve a zone's entry, seeding one on first sighting from the live rain-sensor reading alongside the falsy manual and running defaults. Seeding from the
+   * live reading rather than a static default is what keeps a zone first sighted during a rain delay from reporting a transition it never made. An existing
+   * entry comes back untouched, so its manual and running flags survive a valve rediscovery.
+   */
+  public ensure(relayId: number, isStopped: boolean): Readonly<HydrawiseZoneHints> {
+
+    let hint = this.hints.get(relayId);
+
+    if(!hint) {
+
+      hint = { isManual: false, isOn: false, isStopped };
+      this.hints.set(relayId, hint);
+    }
+
+    return hint;
+  }
+
+  // Mark a zone as manually activated. A zone with no entry is a silent no-op: the walk seeds an entry for every zone it projects, so a missing one means the
+  // zone is outside the current poll's enabled projection and has nothing to record.
+  public markManual(relayId: number): void {
+
+    const hint = this.hints.get(relayId);
+
+    if(hint) {
+
+      hint.isManual = true;
+    }
+  }
+
+  // Clear a zone's manual activation, on the same missing-entry terms markManual states.
+  public clearManual(relayId: number): void {
+
+    const hint = this.hints.get(relayId);
+
+    if(hint) {
+
+      hint.isManual = false;
+    }
+  }
+
+  /* Record what the wire says about a zone running, and take the consequence of it in the same step: a zone the wire reports as not running cannot still be
+   * manually activated, so the observation clears the manual flag rather than leaving a separate call site to remember to.
+   */
+  public observeRunning(relayId: number, isOn: boolean): void {
+
+    const hint = this.hints.get(relayId);
+
+    if(!hint) {
+
+      return;
+    }
+
+    hint.isOn = isOn;
+
+    if(!isOn) {
+
+      hint.isManual = false;
+    }
+  }
+
+  // Store a zone's rain-sensor state - the value the next transition check compares the live reading against.
+  public refreshStopped(relayId: number, isStopped: boolean): void {
+
+    const hint = this.hints.get(relayId);
+
+    if(hint) {
+
+      hint.isStopped = isStopped;
+    }
+  }
+
+  // Drop every entry the current poll's enabled projection does not name. Hosting never enters into it: a hint belongs to a zone, wherever that zone's valve
+  // lives.
+  public prune(liveRelayIds: Set<number>): void {
+
+    for(const relayId of this.hints.keys()) {
+
+      if(!liveRelayIds.has(relayId)) {
+
+        this.hints.delete(relayId);
+      }
+    }
+  }
+
+  // Read a zone's entry without seeding one, the view being the live stored entry on the same terms ensure states.
+  public get(relayId: number): Readonly<HydrawiseZoneHints> | undefined {
+
+    return this.hints.get(relayId);
+  }
+}
+
 export class HydrawiseController {
 
-  private readonly accessory: HydrawiseAccessory;
+  private readonly accessory: HydrawiseControllerAccessory;
   private readonly api: API;
   public readonly controller: HydrawiseControllerConfig;
   private enabledZones: HydrawiseZoneConfig[];
@@ -59,11 +164,11 @@ export class HydrawiseController {
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
   private status: StatusScheduleResponse;
-  private readonly zoneHints: Map<number, HydrawiseZoneHints>;
+  private readonly zoneHints: HydrawiseZoneHintLedger;
 
   // The constructor initializes key variables and calls configureDevice(). The platform passes the denormalized account roster - every account controller's identity,
   // enabled or not - so this controller can seed it into its own accessory context, giving any one accessory knowledge of all its siblings.
-  constructor(platform: HydrawisePlatform, accessory: HydrawiseAccessory, controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]) {
+  constructor(platform: HydrawisePlatform, accessory: HydrawiseControllerAccessory, controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]) {
 
     this.accessory = accessory;
     this.api = platform.api;
@@ -73,7 +178,7 @@ export class HydrawiseController {
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
     this.platform = platform;
-    this.zoneHints = new Map();
+    this.zoneHints = new HydrawiseZoneHintLedger();
 
     // Prefix every log line with this controller's live name. The platform's log.debug is already rebound to the platform's debug gate, so debug routing stays intact.
     this.log = prefixedLog(platform.log, (): string => this.name);
@@ -293,7 +398,9 @@ export class HydrawiseController {
 
       if(!status || (status.message_type === "error")) {
 
-        setTimeout(() => service.updateCharacteristic(this.hap.Characteristic.On, !value), 50);
+        // Put the switch back where it was after a brief beat. The write is scheduled through the platform's registry, which ties it to the plugin's lifetime: a
+        // revert still pending when Homebridge shuts down drains with the registry, and one scheduled after shutdown never fires.
+        this.platform.timers.schedule(() => service.updateCharacteristic(this.hap.Characteristic.On, !value), HYDRAWISE_REVERT_DELAY);
 
         return;
       }
@@ -379,18 +486,9 @@ export class HydrawiseController {
       presentRelayIds: new Set(status.relays.map(zone => zone.relay_id)),
       zones: standaloneZones.map(zone => ({ displayName: effectiveNames.get(zone.relay_id) ?? zone.name, identity: zoneIdentity(zone) })) });
 
-    // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive the hint prune from it. The hints map tracks
-    // only zones in the current poll's enabled projection, so a zone that vanishes and later reappears starts fresh instead of resurrecting its old manual and
-    // rain-stopped flags. Hosting never enters into it: a hint belongs to a zone, wherever that zone's valve lives.
-    const liveZoneIds = new Set(this.enabledZones.map(zone => zone.relay_id.toString()));
-
-    for(const relayId of this.zoneHints.keys()) {
-
-      if(!liveZoneIds.has(relayId.toString())) {
-
-        this.zoneHints.delete(relayId);
-      }
-    }
+    // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive the hint prune from it, so a zone that
+    // vanishes and later reappears starts fresh instead of resurrecting its old manual and rain-stopped flags.
+    this.zoneHints.prune(new Set(this.enabledZones.map(zone => zone.relay_id)));
 
     /* Remove the controller accessory's valves for zones that no longer exist, that the user has disabled, or that live on a standalone accessory of their own.
      * The keep-set is derived from the hosting map rather than from the enablement projection, so pruning and hosting read one source of truth: a promoted zone's
@@ -487,15 +585,9 @@ export class HydrawiseController {
       // during a rain delay.
       const isStopped = this.isStoppedBySensor(zone);
 
-      // Resolve this zone's hint entry, creating it on first sighting seeded with the live sensor state and the falsy manual and on defaults. An existing entry is
-      // left untouched here so its manual and on flags survive across refreshes.
-      let hints = this.zoneHints.get(zone.relay_id);
-
-      if(!hints) {
-
-        hints = { isManual: false, isOn: false, isStopped };
-        this.zoneHints.set(zone.relay_id, hints);
-      }
+      // Resolve this zone's hint entry, seeded on first sighting with the live sensor state. The view is the ledger's own entry, so the reads below see every
+      // write the rest of this pass makes to it.
+      const hints = this.zoneHints.ensure(zone.relay_id, isStopped);
 
       // Inform the user.
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
@@ -503,7 +595,7 @@ export class HydrawiseController {
 
         // Refresh our stopped state unconditionally on a first sighting or valve rediscovery, seeding the stored value with the live sensor reading so the
         // transition check below does not fire on the zone's first appearance.
-        hints.isStopped = isStopped;
+        this.zoneHints.refreshStopped(zone.relay_id, isStopped);
 
         this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
 
@@ -526,16 +618,13 @@ export class HydrawiseController {
           // Something went wrong in communicating with the Hydrawise API.
           if(!response) {
 
-            // Revert our state for this zone.
-            setTimeout(() => valveService.updateCharacteristic(this.hap.Characteristic.Active,
-              setOn ? this.hap.Characteristic.Active.INACTIVE : this.hap.Characteristic.Active.ACTIVE), 50);
+            // Revert our state for this zone. The write is scheduled through the platform's registry, which ties it to the plugin's lifetime: a revert still
+            // pending when Homebridge shuts down drains with the registry, and one scheduled after shutdown never fires.
+            this.platform.timers.schedule(() => valveService.updateCharacteristic(this.hap.Characteristic.Active,
+              setOn ? this.hap.Characteristic.Active.INACTIVE : this.hap.Characteristic.Active.ACTIVE), HYDRAWISE_REVERT_DELAY);
 
             return;
           }
-
-          // Resolve this zone's hint entry live at invocation time rather than capturing a reference at registration time, so this handler always acts on the current
-          // entry. A missing entry is a no-op we simply skip past.
-          const hint = this.zoneHints.get(zone.relay_id);
 
           // Update our valve state accordingly.
           if(setOn) {
@@ -545,21 +634,16 @@ export class HydrawiseController {
             irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
             irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
 
-            // Mark this zone as manually activated.
-            if(hint) {
-
-              hint.isManual = true;
-            }
+            // Mark this zone as manually activated. The ledger is addressed by relay id at invocation time rather than through an entry captured when this
+            // handler was registered, so it always acts on the current entry, and a zone with no entry is the no-op the ledger states.
+            this.zoneHints.markManual(zone.relay_id);
           } else {
 
             valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
             valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
 
-            // Clear out the manual activation tracker for this zone.
-            if(hint) {
-
-              hint.isManual = false;
-            }
+            // Clear out the manual activation for this zone, addressed by relay id at invocation time for the same reason the mark above is.
+            this.zoneHints.clearManual(zone.relay_id);
 
             // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state at invocation time so this
             // handler always acts on the current poll's enabled zones.
@@ -580,8 +664,9 @@ export class HydrawiseController {
         });
       }
 
-      // Determine whether the zone is currently running from the Hydrawise API.
-      hints.isOn = zone.time === 1;
+      // Record what the Hydrawise API says about this zone running. The ledger takes the not-running consequence with it: a zone the wire reports as stopped
+      // cannot still be manually activated.
+      this.zoneHints.observeRunning(zone.relay_id, zone.time === 1);
 
       // Retrieve whether the valve service is in use from HomeKit's perspective.
       const isValveInUse = valveService.getCharacteristic(this.hap.Characteristic.InUse).value === this.hap.Characteristic.InUse.IN_USE;
@@ -597,9 +682,6 @@ export class HydrawiseController {
         // Update the duration of the remaining runtime of this valve, in seconds.
         valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, 3600));
       } else {
-
-        // Clear out the manual activation tracker for this zone.
-        hints.isManual = false;
 
         // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
         valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
@@ -637,7 +719,7 @@ export class HydrawiseController {
       }
 
       // Save the new setting.
-      hints.isStopped = isStopped;
+      this.zoneHints.refreshStopped(zone.relay_id, isStopped);
     }
 
     // Update the irrigation system state.
