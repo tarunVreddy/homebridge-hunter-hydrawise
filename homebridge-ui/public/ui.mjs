@@ -76,10 +76,18 @@ const sessionControllers = new Map();
 const sessionFloorSerials = new Set();
 const sessionZones = new Map();
 
+/* The bound in seconds on the shared option-catalog fetch below. The bound exists so a bridge call that never settles rejects rather than wedging the cached
+ * promise for the life of the session, and it binds every consumer of that one fetch alike - the configuration wiring, the enable-state oracle, and the floor
+ * scan. The trade it carries: a fetch that is legitimately slow but would eventually have settled costs a retry cycle rather than resolving, which is cheap
+ * beside the permanent wedge the bound prevents, because the cache clears on rejection and a later read refetches fresh.
+ */
+const CATALOG_DEADLINE = 5;
+
 /* The option catalog, fetched once per session from the plugin's own UI server (a local IPC to /getOptions, never a cloud call) and shared by the floor scan
  * and the enable-state oracle. The framework fetches the same endpoint for its own catalog on every show cycle; the two reads are independent by design,
  * since the framework exposes no handle to its copy - the duplication is one static local request per session. The cached promise is cleared on failure so a
- * later read retries rather than pinning a transient fault for the session.
+ * later read retries rather than pinning a transient fault for the session, and the bound above is what makes a call that never answers a failure the clear
+ * can act on.
  */
 let catalogPromise = null;
 
@@ -101,7 +109,7 @@ let inFlightTick = null;
 
 const getCatalog = () => {
 
-  catalogPromise ??= homebridge.request("/getOptions").then((response) => {
+  catalogPromise ??= withDeadline({ promise: homebridge.request("/getOptions"), seconds: CATALOG_DEADLINE }).then((response) => {
 
     // A response without the catalog shape the server publishes is a failure, not a default. Shaping it into an empty catalog would make the enable-state
     // oracle read every controller as disabled off the engine's false fallback, so a malformed response throws and the guarded callers surface it instead.
@@ -127,79 +135,10 @@ const getCatalog = () => {
   return catalogPromise;
 };
 
-/* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
- * wiring step that hangs against an unresponsive host can never be what makes the settings panel look broken.
- */
-const WIRING_DEADLINE = 5;
-
 /* The interpreter every configuration read in this file goes through. It is declared already holding the degraded-mode interpreter, so the binding is never
  * undefined in any window and no consumer needs a guard; the wiring below swaps in the catalog-backed interpreter the moment the catalog is in hand.
  */
 let hydrawiseConfig = makeLegacyHydrawiseConfig();
-
-// The load-time wiring's own lifecycle. Aborting it is how an envelope that failed or expired tells a continuation still running underneath it that it must not
-// stage anything after the fact.
-const wiringController = new AbortController();
-
-/* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
- *
- * The whole envelope is awaited at module top level, which is what makes every consumer below safe without any of them knowing this ran: module evaluation is
- * suspended until the wiring settles, so the webUI is constructed, the refresh listener is bound, and ui.show() is called only afterwards. Two consequences
- * follow. The framework opens its own configuration session inside the launch path that ui.show() starts, so every replica it hands to a hook - the first-run
- * config, the options page's persist path - is read after the migration has settled, and none of them can commit a pre-migration snapshot over it. And no
- * first-run hook or refresh handler can observe a half-wired interpreter, because nothing that consumes it can run at all until module evaluation completes.
- * Bounding evaluation is what makes that safe rather than reckless: the library's deadline settles the envelope either way, and every failure path assigns
- * rather than throws.
- *
- * A migration that composes a patch persists it to disk itself, without waiting for the user to press Save. Most people never open this panel to save
- * anything, so a migration that waited for one would leave a fleet split between two configuration shapes indefinitely, and the plumbing that reconciles them
- * could never retire. The write is gated on there being a patch, which is what bounds it: only a session that actually found legacy settings writes, so a
- * migrated install's every later open reads, finds nothing to do, and touches the disk not at all. The host's restart indicator therefore appears at most once
- * per install, in the single session that converts it.
- *
- * The weaker outcomes are deliberate. A save the deadline overtakes, and a save the host rejects, both leave the migration sitting in the modal's pending
- * configuration, where the user's own Save picks it up.
- *
- * Reopening the panel is convergent rather than racing. The settings frame is reused and each open imports a fresh copy of this module whose wiring runs
- * independently, but a second copy reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely
- * simultaneous wirings read the same configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state.
- *
- * When the envelope fails, the interpreter settles at whatever the wiring reached. A catalog fetch that never succeeded leaves the degraded-mode interpreter in
- * place, which reads and writes the legacy properties, so the page still loads and first run still works; a migration that stumbled after the catalog arrived
- * keeps the catalog-backed interpreter, because one failed attempt is no reason to degrade every read for the session. The migration itself simply waits for a
- * session whose fetches succeed.
- */
-const wireHydrawiseConfig = async () => {
-
-  hydrawiseConfig = makeHydrawiseConfig({ FeatureOptions, catalog: await getCatalog() });
-
-  // The library's session is the single conduit the framework's own writes use, so the patch merges onto a replica synced just now rather than onto a snapshot
-  // taken before the page opened.
-  const session = await PluginConfigSession.open({ host: homebridge, name: "Hydrawise" });
-  const patch = hydrawiseConfig.migrate(session.platform);
-
-  // The abort is read immediately before the write, so an envelope that expired while the session was still opening cannot stage a patch after the page has
-  // given up waiting for it.
-  if(patch && !wiringController.signal.aborted) {
-
-    await session.commit(patch);
-
-    // The signal is read a second time, because the commit itself was an await and the envelope may have expired across it. A save the deadline overtakes is
-    // skipped rather than forced, which leaves the migration staged for the user's own save - the weaker outcome, and the honest one.
-    if(!wiringController.signal.aborted) {
-
-      await homebridge.savePluginConfig();
-    }
-  }
-};
-
-try {
-
-  await withDeadline({ promise: wireHydrawiseConfig(), seconds: WIRING_DEADLINE, signal: wiringController.signal });
-} catch(error) {
-
-  wiringController.abort(error);
-}
 
 // Build the feature-option engine over the cached catalog and the user's configured options. The engine is rebuilt per call because the configured options change
 // underneath us as the user edits them, so an edit the user just saved is reflected the next time we ask. Every consult in this file resolves through here, which
@@ -1433,6 +1372,85 @@ const onRefreshControllers = async () => {
 
 // Wire the HBHH-owned refresh control. The button lives in index.html, present before this module loads, so we bind its listener once at load.
 document.getElementById("hbhhRefreshControllers")?.addEventListener("click", () => void onRefreshControllers());
+
+/* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
+ * wiring step that hangs against an unresponsive host can never be what makes the settings panel look broken.
+ */
+const WIRING_DEADLINE = 5;
+
+// The load-time wiring's own lifecycle. Aborting it is how an envelope that failed or expired tells a continuation still running underneath it that it must not
+// stage anything after the fact.
+const wiringController = new AbortController();
+
+/* The signal the wiring's cancellation points read, composed from the envelope's own controller and this module copy's claim on the window. The epoch half
+ * matters because a reopened settings panel mints a successor copy and retires this one: composing the two aborts a superseded copy's wiring at the same
+ * chokepoints the deadline uses, rather than letting a retired copy write config underneath the copy the user is looking at.
+ */
+const wiringSignal = AbortSignal.any([ wiringController.signal, ui.epochSignal ]);
+
+/* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
+ *
+ * The envelope is awaited here rather than at module top, so the page's chrome and the refresh control arm immediately instead of waiting on a bridge round
+ * trip. ui.show() runs only after the envelope settles, which is the ordering that matters: the framework opens its own configuration session inside the
+ * launch path that ui.show() starts, so every replica it hands to a hook - the first-run config, the options page's persist path - is read after the migration
+ * has settled, and none of them can commit a pre-migration snapshot over it.
+ *
+ * A migration that composes a patch persists it to disk itself, without waiting for the user to press Save. Most people never open this panel to save
+ * anything, so a migration that waited for one would leave a fleet split between two configuration shapes indefinitely, and the plumbing that reconciles them
+ * could never retire. The write is gated on there being a patch, which is what bounds it: only a session that actually found legacy settings writes, so a
+ * migrated install's every later open reads, finds nothing to do, and touches the disk not at all. The host's restart indicator therefore appears at most once
+ * per install, in the single session that converts it.
+ *
+ * The weaker outcomes are deliberate. A save the deadline overtakes, and a save the host rejects, both leave the migration sitting in the modal's pending
+ * configuration, where the user's own Save picks it up.
+ *
+ * Reopening the panel is convergent rather than racing. The settings frame is reused and each open imports a fresh copy of this module whose wiring runs
+ * independently, but a second copy reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely
+ * simultaneous wirings read the same configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state.
+ * A refresh click that lands before the envelope settles reads the degraded interpreter, whose canonical-prefix option scan answers for a migrated install,
+ * and that window closes at settlement.
+ *
+ * One bound stated honestly: the check before the commit is the last cancellation point. A commit whose bridge round trip is already in flight cannot be
+ * recalled - the session takes no signal, and the deadline bounds only the await - so composing the epoch into the signal narrows the stale-write window to
+ * that in-flight instant rather than closing it. It is harmful only if a successor commits a differing edit inside the same instant, and two migration wirings
+ * are convergent regardless.
+ *
+ * When the envelope fails, the interpreter settles at whatever the wiring reached. A catalog fetch that never succeeded leaves the degraded-mode interpreter in
+ * place, which reads and writes the legacy properties, so the page still loads and first run still works; a migration that stumbled after the catalog arrived
+ * keeps the catalog-backed interpreter, because one failed attempt is no reason to degrade every read for the session. The migration itself simply waits for a
+ * session whose fetches succeed.
+ */
+const wireHydrawiseConfig = async () => {
+
+  hydrawiseConfig = makeHydrawiseConfig({ FeatureOptions, catalog: await getCatalog() });
+
+  // The library's session is the single conduit the framework's own writes use, so the patch merges onto a replica synced just now rather than onto a snapshot
+  // taken before the page opened.
+  const session = await PluginConfigSession.open({ host: homebridge, name: "Hydrawise" });
+  const patch = hydrawiseConfig.migrate(session.platform);
+
+  // The signal is read immediately before the write, so an envelope that expired while the session was still opening - or a copy the window has retired -
+  // cannot stage a patch after the fact.
+  if(patch && !wiringSignal.aborted) {
+
+    await session.commit(patch);
+
+    // The signal is read a second time, because the commit itself was an await and the envelope may have expired across it. A save the deadline overtakes is
+    // skipped rather than forced, which leaves the migration staged for the user's own save - the weaker outcome, and the honest one.
+    if(!wiringSignal.aborted) {
+
+      await homebridge.savePluginConfig();
+    }
+  }
+};
+
+try {
+
+  await withDeadline({ promise: wireHydrawiseConfig(), seconds: WIRING_DEADLINE, signal: wiringSignal });
+} catch(error) {
+
+  wiringController.abort(error);
+}
 
 // Display the webUI.
 ui.show();

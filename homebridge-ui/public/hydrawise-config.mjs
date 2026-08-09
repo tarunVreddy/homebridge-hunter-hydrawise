@@ -39,9 +39,9 @@ const CONSOLIDATED_SETTINGS = {
  */
 export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
 
-  // A feature-option engine over the served catalog and a copy of the config's own entries. The copy matters: setOption mutates the array it was given, and a
-  // migration must never reach back into the caller's config while it is deciding what to stage.
-  const engineFor = (config) => new FeatureOptions(catalog.categories, catalog.options, Array.isArray(config?.options) ? [...config.options] : []);
+  // A feature-option engine over the served catalog and the config's own entries. The array is handed in directly rather than copied: the engine's set-option
+  // path is a pure transform that composes a fresh array and reassigns its own field, so the array it was given is never written to.
+  const engineFor = (config) => new FeatureOptions(catalog.categories, catalog.options, Array.isArray(config?.options) ? config.options : []);
 
   /* The value the catalog registers as an option's default, read from the served entry's own defaultValue field. The engine exposes a same-named method that
    * answers a different question - the boolean enabled-state default - so this walks the catalog data instead. The migration needs this to tell a value the
