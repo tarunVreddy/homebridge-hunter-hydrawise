@@ -8,13 +8,14 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
 import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
-import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
+import { bareSensors, sentinelZoneMatrix } from "./api.fixtures.ts";
+import { buildController, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
-import { bareSensors } from "./api.fixtures.ts";
 
 // Compose a fast-cadence single-zone schedule.
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
@@ -193,6 +194,35 @@ describe("HydrawiseController updateState defect pins", () => {
     assert.equal(suspend.getCharacteristic(Characteristic.On).value, false, "a rain stop is not a suspend, so the suspend switch stays off");
   });
 
+  test("a live sensor reporting itself quiet lifts the program mode the group inference alone would hold down", async (t) => {
+
+    /* The credentialed twin of the rain-stopped pin directly above, and the two together are what make the account-credentialed sharpening visible at the
+     * aggregate. Both drive the IDENTICAL wire fixture - the all-covered shape whose group inference says every zone is stopped - so the only thing that can move
+     * the answer between them is whether a live sensor reading reached the classification.
+     *
+     * This has to run the REAL poll path rather than the classifier directly, because the routing under test is the whole chain: the classified state feeds the
+     * hint ledger's stopped flag, and that flag is what the program-mode aggregate counts. A classifier-level assertion would prove the first link and say nothing
+     * about the rest, which is exactly where a threading mistake would hide. ProgramMode is the observable end of that chain; the ledger itself is private.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // The facts land before the first poll completes, so that poll's own walk classifies against them rather than against a snapshot that arrived too late.
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ sensorStopped: false }) ]) }),
+      fetchedAt: Math.floor(Date.now() / 1000) });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
+      "a rain stop the live sensor disproves stops counting toward the aggregate, so the schedule reads as standing");
+  });
+
   test("a steady-state poll failure after a success recovers through the short backoff arm", async (t) => {
 
     const h = buildController({ program: (recorder) => {
@@ -231,5 +261,159 @@ describe("HydrawiseController updateState defect pins", () => {
     assert.ok(!loggedAt(h.lines(), "error", "stopped unexpectedly"), "a shutdown abort should unwind the loop without a fault report");
 
     cleanup();
+  });
+});
+
+describe("HydrawiseController suspend switch with account facts", () => {
+
+  // The suspension instant the live account capture recorded, kept verbatim so these pins run against a real far-future value.
+  const SUSPENDED_UNTIL = 1903928399;
+
+  // Every zone of the shared fixture matrix, reported as suspended until that instant.
+  function allZonesSuspended(): HydrawiseControllerV2Facts {
+
+    return makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]) });
+  }
+
+  // The switch service, which every pin below reads its answer from.
+  function suspendSwitch(h: BuildControllerResult): { getCharacteristic: (type: typeof Characteristic.On) => { value: unknown } } {
+
+    const service = h.accessory.getServiceById(Service.Switch, "All");
+
+    assert.ok(service, "the suspend switch should exist");
+
+    return service;
+  }
+
+  test("a commanded suspend-all reads ON even where every zone is rain-covered", async (t) => {
+
+    /* The blind spot this whole path exists to close, and the fixture is what makes the pin tell the two implementations apart. The rain-stopped shape has every
+     * zone covered by a tripped sensor, so the key-based heuristic classifies every zone sensor-stopped and answers OFF - a 2026-08-04 live capture recorded
+     * exactly that during a commanded suspend-all. Built on the all-suspended fixture instead, this pin would pass against unmodified code.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "the key-based heuristic reads this shape as not suspended");
+
+    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "the account facts resolve what the wire alone could not");
+  });
+
+  test("a zone forced into a manual run reads the switch OFF, even with every zone suspended", async (t) => {
+
+    /* The case that makes reading the CLASSIFIED states right where reading the raw suspension facts would be wrong. The wire outranks the facts for a running
+     * zone, so water actually flowing means the account is not all-suspended - exactly what the key-based heuristic has always answered.
+     */
+    const running = makeZone({ name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 600, time: 1, timestr: "" });
+    const relays = [ ...sentinelZoneMatrix.filter(zone => zone.relay_id !== 700019).map(zone => ({ ...zone })), running ];
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(relays), kind: "response" }),
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+
+    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "a zone the user forced into a run means the account is not all-suspended");
+  });
+
+  test("a zone the snapshot does not name leaves the account short of all-suspended", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+
+    // Every zone but one is reported suspended. The omitted zone is an unknown rather than an implicit suspension, so the account is not all-suspended.
+    const partial = makeV2Facts({ zones: sentinelZoneMatrix.filter(zone => zone.relay_id !== 700019)
+      .map(zone => [ zone.relay_id, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]) });
+
+    h.controller.applyFacts({ facts: partial, fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "one unaccounted zone is enough to fall short of all-suspended");
+  });
+
+  test("a snapshot older than the user's own command never flips the switch back", async (t) => {
+
+    /* The race the command guard closes, constructed so a guarded and an unguarded implementation visibly disagree. The wire is the all-suspended shape, which the
+     * key-based heuristic answers ON; the stale snapshot reports every zone unsuspended, which an unguarded facts path would answer OFF. The switch reads ON only
+     * through the guard, so a missing or inverted comparison reds here.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+
+    const service = h.accessory.getServiceById(Service.Switch, "All");
+
+    assert.ok(service, "the suspend switch should exist");
+
+    // The user commands a suspend-all, which stamps the instant every later snapshot is judged against.
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    // A fetch that was already in flight when that command landed answers with facts that predate it, and so cannot know about it.
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts() ]) }),
+      fetchedAt: Math.floor(Date.now() / 1000) - 100 });
+
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "a snapshot older than the command is ignored in favor of the wire heuristic");
+  });
+
+  test("the two key-based topology pins are untouched by an install without credentials", async (t) => {
+
+    // The parity restatement: with no credentials nothing above applies at all, and the heuristic answers exactly as it always has for both topologies.
+    const suspended = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()),
+      kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+
+    t.after(() => suspended.abort());
+
+    await waitFor(() => suspended.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    assert.equal(suspendSwitch(suspended).getCharacteristic(Characteristic.On).value, true, "an all-sentinel account still reads as suspended");
+  });
+});
+
+describe("HydrawiseController program mode reads the sensor, not the classification", () => {
+
+  const SUSPENDED_UNTIL = 1903928399;
+
+  test("a suspended zone a tripped sensor still covers counts toward the stopped aggregate", async (t) => {
+
+    /* The aggregate half of the rain-hint fix. Every zone is covered by a tripped sensor and one of them is also suspended, so a hint derived from the classified
+     * state would drop that zone out of the stopped count - suspension outranks the sensor for DISPLAY - and lift the whole controller back to program-scheduled
+     * while rain was still falling. Reading the sensor keeps the aggregate honest, which is also what it reported before the account facts existed at all.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id,
+      { sensorStopped: true, suspendedUntil: (zone.relay_id === 700019) ? SUSPENDED_UNTIL : null } ]) }), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+
+    const irrigation = h.accessory.getService(Service.IrrigationSystem);
+
+    assert.ok(irrigation, "the irrigation system service should exist");
+    assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED,
+      "a suspended zone under a tripped sensor is still sensor-blocked, so the aggregate stays at no program scheduled");
   });
 });

@@ -77,6 +77,24 @@ For example:
 > ]
 > ```
 
+#### Additional fields with enhanced features
+
+If you have configured your Hydrawise account username and password, each zone entry carries two further fields. They appear only while the enhanced-features data is current - if those credentials are not configured, or the plugin has not been able to refresh that data recently, the payload is exactly the five-field shape above:
+
+| Field                 | Description
+|-----------------------|----------------------------------
+| **state**             | What the zone is doing, as one of `running`, `scheduled`, `sensor-stopped`, `suspended`, or `unscheduled`. This is the same reading the Homebridge log and the plugin's settings page show for the zone.
+| **suspendedUntil**    | Present only on a suspended zone: the time its suspension lifts, as a Unix timestamp in seconds.
+
+For example, with the account credentials configured:
+
+> ```json
+> [
+>   { "name": "Front Lawn", "relay": 1, "run": 600, "time": 1, "timestr": "", "state": "running" },
+>   { "name": "Rear Lawn", "relay": 2, "run": 0, "time": 1576800000, "timestr": "", "state": "suspended", "suspendedUntil": 1903928399 }
+> ]
+> ```
+
 Messages are published to MQTT when an action occurs on a device that triggers the respective event, or when an MQTT message is received for one of the topics `homebridge-hunter-hydrawise` subscribes to.
 
 ### <A NAME="subscribe"></A>Topics Subscribed

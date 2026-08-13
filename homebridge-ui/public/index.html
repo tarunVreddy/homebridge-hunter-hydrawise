@@ -175,8 +175,12 @@
   }
 
   /* The state colors. Blue for water actually flowing, and one green hue for what is coming - filling from a hollow ring to a solid dot as a run becomes imminent,
-   * so the progression itself reads as urgency rather than asking the eye to tell two greens apart. Amber marks a zone a rain sensor has stopped, and a dim gray
-   * marks one with nothing scheduled. These are mid-tones, which is what keeps them legible against both light and dark Homebridge themes.
+   * so the progression itself reads as urgency rather than asking the eye to tell two greens apart. Amber marks a zone a rain sensor has stopped, purple marks one
+   * the owner suspended, and a dim gray marks one with nothing scheduled. These are mid-tones, which is what keeps them legible against both light and dark
+   * Homebridge themes.
+   *
+   * Suspension takes a hue of its own rather than a shade of the rain amber, because the two are unlike in the way that matters to someone scanning the sidebar:
+   * a rain delay lifts by itself when the weather turns, and a suspension stands until the owner clears it.
    */
   .hbhh-dot-running {
     background-color: #2196f3;
@@ -193,6 +197,10 @@
 
   .hbhh-dot-sensor-stopped {
     background-color: #fb8c00;
+  }
+
+  .hbhh-dot-suspended {
+    background-color: #8e24aa;
   }
 
   .hbhh-dot-unscheduled {

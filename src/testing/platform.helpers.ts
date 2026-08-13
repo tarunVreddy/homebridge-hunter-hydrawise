@@ -16,7 +16,8 @@ import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
 import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity } from "../types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
+  HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
@@ -594,12 +595,12 @@ export function v2DispatcherOf(platform: HydrawisePlatform): { destroyed: boolea
   return (platform as unknown as { v2Client?: { dispatcher: { destroyed: boolean } } }).v2Client?.dispatcher;
 }
 
-// The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, and the whole-account hardware fetch its discovery
-// dispatches. A distribution test supplies this shape rather than a real client, so no test ever reaches the live account API.
+// The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, and the whole-account facts fetch its refresh loop
+// drives. A distribution test supplies this shape rather than a real client, so no test ever reaches the live account API.
 export interface TestV2Client {
 
   dispatcher: { destroy: () => Promise<void> };
-  fetchHardware: () => Promise<Nullable<Map<number, HydrawiseControllerHardware>>>;
+  fetchAccountFacts: () => Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>>;
 }
 
 /**
@@ -619,24 +620,79 @@ export function installV2Client(platform: HydrawisePlatform, client: TestV2Clien
 }
 
 /**
- * Build a recording double of the account-credentialed client, answering a programmed hardware result and counting how many times it was asked. The count is what a
- * one-shot pin reads: a second discovery pass that re-fetched would show up here as a second call.
+ * Run ONE refresh tick against the platform's installed client, exactly as the recurring loop's body runs it.
  *
- * @param hardware - The result fetchHardware resolves to, or null for a failed fetch.
+ * This exists because the loop sleeps a quarter hour between ticks on a promisified timer, and Node's own test-runner timer mocking cannot advance that shape at
+ * all - the same gap this package's Clock utility documents. Driving the tick directly is what lets a test observe the SECOND tick's behavior, above all that a
+ * failed fetch ends only its own tick and leaves the loop able to distribute on the next one. It is the production method, not a reimplementation of it: what the
+ * loop adds around this call is the sleep, which is what these tests deliberately do not wait on.
+ *
+ * The cast is confined here for the same reason every other private reach in this module is.
+ *
+ * @param platform - The constructed HydrawisePlatform, whose client the tick will ask.
+ *
+ * @returns A promise resolving when the tick has fetched and distributed.
+ */
+export async function refreshV2FactsOnce(platform: HydrawisePlatform): Promise<void> {
+
+  const slot = platform as unknown as { refreshV2Facts: (client: TestV2Client) => Promise<void>; v2Client?: TestV2Client };
+
+  if(!slot.v2Client) {
+
+    throw new Error("refreshV2FactsOnce: the platform has no account-credentialed client installed.");
+  }
+
+  await slot.refreshV2Facts(slot.v2Client);
+}
+
+/**
+ * Build a recording double of the account-credentialed client, answering a programmed facts result and counting how many times it was asked. The count is what the
+ * single-start and cadence pins read: a second refresh loop, or a discovery re-entry that started one, shows up here as extra calls.
+ *
+ * The programmed result may be a FUNCTION of the call number, which is what lets a test answer differently tick by tick - a failed first fetch followed by a
+ * successful retry, say - without reaching for a mutable variable in the test body.
+ *
+ * @param facts - The result fetchAccountFacts resolves to, or null for a failed fetch; a function is called with the one-based fetch number.
  *
  * @returns The double, plus a reader for the number of fetches it served.
  */
-export function makeTestV2Client(hardware: Nullable<Map<number, HydrawiseControllerHardware>>): { client: TestV2Client; fetches: () => number } {
+export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseControllerV2Facts>> |
+  ((fetch: number) => Nullable<Map<number, HydrawiseControllerV2Facts>>)): { client: TestV2Client; fetches: () => number } {
 
   let fetches = 0;
 
   return { client: { dispatcher: { destroy: async (): Promise<void> => undefined },
-    fetchHardware: async (): Promise<Nullable<Map<number, HydrawiseControllerHardware>>> => {
+    fetchAccountFacts: async (): Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>> => {
 
       fetches++;
 
-      return hardware;
+      return (typeof facts === "function") ? facts(fetches) : facts;
     } }, fetches: (): number => fetches };
+}
+
+/**
+ * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually pinning.
+ *
+ * @param overrides - The facts to state: the hardware, the availability, and the per-zone entries keyed by relay id.
+ *
+ * @returns A fresh facts value.
+ */
+export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseControllerHardware>; online?: Nullable<boolean>;
+  zones?: Iterable<readonly [ number, HydrawiseZoneV2Facts ]>; } = {}): HydrawiseControllerV2Facts {
+
+  return { hardware: overrides.hardware ?? null, online: overrides.online ?? null, zones: new Map(overrides.zones ?? []) };
+}
+
+/**
+ * Compose one zone's account-credentialed facts, defaulting both fields to the answer that says nothing: no sensor reading, and no suspension.
+ *
+ * @param overrides - The facts to state.
+ *
+ * @returns A fresh per-zone facts value.
+ */
+export function makeZoneV2Facts(overrides: Partial<HydrawiseZoneV2Facts> = {}): HydrawiseZoneV2Facts {
+
+  return { sensorStopped: overrides.sensorStopped ?? null, suspendedUntil: overrides.suspendedUntil ?? null };
 }
 
 // Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter. The account credentials travel as feature

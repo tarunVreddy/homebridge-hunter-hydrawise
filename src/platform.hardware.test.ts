@@ -1,18 +1,23 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.hardware.test.ts: The platform's optional hardware enrichment, exercised against a REAL HydrawisePlatform whose account-credentialed client is a
- * recording double, so the credential gate, the one-shot dispatch, and the distribution all run production code with no cloud call of any kind.
+ * platform.hardware.test.ts: The platform's optional account-credentialed enrichment, exercised against a REAL HydrawisePlatform whose client is a recording
+ * double, so the credential gate, the refresh loop's single start, and the distribution all run production code with no cloud call of any kind.
  *
  * Two things are being told apart throughout. The GATE decides whether a client exists at all, and it answers to the configured credentials; the DISTRIBUTION
  * decides which controller receives which facts, and it answers to the correlation id v1 and the account API agree about. A test that conflated them could pass
  * with the wrong controller enriched.
+ *
+ * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. Node's test-runner timer mocking cannot advance a promisified timer at all - the
+ * gap this package's own Clock utility documents - so the second tick is driven through the production refresh method directly, and the sleep between ticks is
+ * covered by the constants receipt in the settings suite rather than by a test that would have to wait it out.
  */
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import type { CharacteristicType, TestAccessory } from "./testing/hap.helpers.ts";
 import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS } from "./settings.ts";
-import { buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, programJsonReply, v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
+import { buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce, v2BudgetOf,
+  waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import type { HydrawiseControllerHardware } from "./types.ts";
@@ -95,15 +100,15 @@ describe("HydrawisePlatform hardware distribution", () => {
     /* The map is deliberately keyed in the OPPOSITE order to the account's controller list, and both entries carry facts the other controller could plausibly own.
      * A distribution that matched positionally rather than by id would swap them, and each assertion below would then read the sibling's model.
      */
-    installV2Client(platform, makeTestV2Client(new Map([ [ SECOND_CONTROLLER.controller_id, SECOND_HARDWARE ],
-      [ syntheticController.controller_id, FIRST_HARDWARE ] ])).client);
+    installV2Client(platform, makeTestV2Client(new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts({ hardware: SECOND_HARDWARE }) ],
+      [ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ] ])).client);
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...SECOND_CONTROLLER } ] }));
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
 
-    // The enrichment is dispatched rather than awaited, so each wait is on the characteristic actually landing rather than on discovery returning.
+    // The refresh loop's first tick runs on its own schedule, so each wait is on the characteristic actually landing rather than on discovery returning.
     const first = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()));
     const second = await waitFor(() => registered.find(accessory => accessory.UUID === SECOND_CONTROLLER.controller_id.toString()));
 
@@ -146,14 +151,14 @@ describe("HydrawisePlatform hardware distribution", () => {
       "a failed fetch leaves the firmware exactly as HAP constructed it, because the credentialed path never writes it");
   });
 
-  test("a second discovery pass spends no second fetch", async (t) => {
+  test("a second discovery pass starts no second refresh loop", async (t) => {
 
     const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, FIRST_HARDWARE ]]));
+    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -162,19 +167,81 @@ describe("HydrawisePlatform hardware distribution", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitFor(() => (fetches() >= 1) ? true : undefined);
 
-    // Re-entering discovery is a real cadence - the launch event can fire again, and the supervisor can re-enter the loop - while hardware is static, so the query
-    // is worth exactly one call for the life of the plugin. The counter is what catches a re-entry that spent another.
+    /* Re-entering discovery is a real cadence - the launch event can fire again, and the supervisor can re-enter the loop - and each re-entry would start a whole
+     * second refresh loop running forever beside the first, doubling this account's spend against a ceiling measured in single digits. The count is EXACT rather
+     * than a lower bound: the loop's own next tick is a quarter hour away and cannot reach this assertion, so any second fetch here is a second loop.
+     */
     const connections = lines().filter(line => line.message.includes("Successfully connected")).length;
 
     emit(DID_FINISH_LAUNCHING);
     await waitFor(() => (lines().filter(line => line.message.includes("Successfully connected")).length > connections) ? true : undefined);
 
-    assert.equal(fetches(), 1, "a re-entered discovery pass should spend no second fetch");
+    assert.equal(fetches(), 1, "a re-entered discovery pass should start no second loop and spend no second fetch");
   });
 
-  test("no fetch fires at all without credentials", async (t) => {
+  test("a failed tick ends only that tick, and a later one still distributes", async (t) => {
 
-    const { emit, registered } = buildPlatform();
+    const { emit, platform, registered } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    // The first fetch fails and every later one succeeds, which is exactly the transient the retry exists for.
+    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? null :
+      new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+
+    installV2Client(platform, client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+
+    const accessory = await waitFor(() => registered[0]);
+
+    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "the failed first tick enriched nothing and left the placeholder standing");
+
+    /* The property this pins is the METHOD BOUNDARY. A failed fetch returns from the tick, not from the loop, so the refresh survives its first transient
+     * failure; the same early return written inline in the loop body would leave the loop function entirely and end the refresh for the life of the plugin. The
+     * tick is driven directly because the loop's own next one is a quarter hour away.
+     */
+    await refreshV2FactsOnce(platform);
+
+    assert.equal(informationValue(accessory, Characteristic.Model), FIRST_HARDWARE.model, "a later tick distributes normally, so the failure was not terminal");
+    assert.equal(fetches(), 2, "each tick spends exactly one fetch");
+  });
+
+  test("a shutdown ends the refresh loop without reporting a fault", async () => {
+
+    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    await using dispatcher = installMockDispatcher();
+
+    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+
+    installV2Client(platform, client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (fetches() >= 1) ? true : undefined);
+
+    const spent = fetches();
+
+    emit(SHUTDOWN);
+
+    // The loop rides the platform's shutdown signal, so the abort ends the sleep it is sitting in and unwinds it. A teardown is orderly rather than a fault, so
+    // the supervisor swallows it silently - a reported fault here would tell every user their plugin broke every time Homebridge stopped.
+    await waitFor(() => true);
+
+    assert.equal(fetches(), spent, "no further tick runs after shutdown");
+    assert.ok(!lines().some(line => (line.level === "error") && line.message.includes("stopped unexpectedly")),
+      "a shutdown unwinds the loop quietly rather than reporting a fault");
+  });
+
+  test("no loop starts, no call is spent, and nothing is logged without credentials", async (t) => {
+
+    const { emit, lines, registered } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -193,5 +260,93 @@ describe("HydrawisePlatform hardware distribution", () => {
     assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "the model is the product-line placeholder");
     assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
       "the firmware is the unknown marker Homebridge itself uses");
+
+    // Silence is part of the contract, not incidental: a user who configured nothing but an API key should see no trace of a capability they never turned on.
+    assert.ok(!lines().some(line => line.message.includes("Enhanced features")), "no enhanced-features line appears at all");
+    assert.ok(!lines().some(line => line.message.includes("enhanced features refresh")), "and no refresh loop reports itself");
+  });
+});
+
+describe("HydrawisePlatform connection reporting", () => {
+
+  test("the account tier reports itself connected ONCE, on the first successful refresh", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+
+    await using dispatcher = installMockDispatcher();
+
+    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+
+    installV2Client(platform, client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (fetches() >= 1) ? true : undefined);
+
+    const connected = (): number => lines().filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+
+    await waitFor(() => (connected() >= 1) ? true : undefined);
+
+    // The two tiers are delineated: the key-based line names the API key, and the account line names the enhanced features it unlocks.
+    assert.ok(lines().some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")),
+      "the key-based tier names how it connected");
+    assert.equal(connected(), 1, "the account tier reports itself connected exactly once");
+
+    /* A second successful refresh is not a second connection. Without the latch every refresh tick would republish the same line every quarter hour for the life
+     * of the plugin, which is log noise rather than news.
+     */
+    await refreshV2FactsOnce(platform);
+
+    assert.equal(fetches(), 2, "the second refresh really did run");
+    assert.equal(connected(), 1, "and it reported no second connection");
+  });
+
+  test("a failed first refresh reports no connection, and a later success reports one", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+
+    await using dispatcher = installMockDispatcher();
+
+    // The first fetch fails and every later one succeeds, so the line has to wait for an answer that actually arrived.
+    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? null :
+      new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+
+    installV2Client(platform, client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (fetches() >= 1) ? true : undefined);
+
+    const connected = (): number => lines().filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+
+    assert.equal(connected(), 0, "a failed tick claims no connection - the client already reported the failure in its own words");
+
+    await refreshV2FactsOnce(platform);
+
+    assert.equal(connected(), 1, "the first tick that actually answered reports the connection");
+  });
+
+  test("an install with no credentials reports only the key-based tier", async (t) => {
+
+    const { emit, lines, registered } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+
+    await using dispatcher = installMockDispatcher();
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => registered[0]);
+
+    assert.ok(lines().some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")), "the key-based line still reports");
+    assert.equal(lines().filter(line => line.message.includes("account API")).length, 0, "and nothing claims an account connection that was never made");
   });
 });

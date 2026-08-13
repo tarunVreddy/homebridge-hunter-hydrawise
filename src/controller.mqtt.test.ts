@@ -7,11 +7,14 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
-import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
+import { HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
@@ -179,5 +182,110 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(loggedAt(h.lines(), "error", "MQTT publish (controller) handler failed"), "a rejected publish should be logged by the guarded dispatch");
 
     cleanup();
+  });
+});
+
+describe("HydrawiseController MQTT with account facts", () => {
+
+  // The suspension instant the live account capture recorded, kept verbatim so the payload carries a real far-future value.
+  const SUSPENDED_UNTIL = 1903928399;
+
+  // Two zones carrying the ambiguous sentinel shape, so which one reads as suspended rests entirely on the facts rather than on anything in the wire body.
+  function sentinelPair(): HydrawiseZoneConfig[] {
+
+    return [ makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" }),
+      makeZone({ name: "Beta", relay: 2, relay_id: 700002, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" }) ];
+  }
+
+  // Only the first zone is suspended, which is what lets an attribution error show up as the wrong zone carrying the instant.
+  function oneSuspended(): HydrawiseControllerV2Facts {
+
+    return makeV2Facts({ online: true,
+      zones: [ [ 700001, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ], [ 700002, makeZoneV2Facts() ] ] });
+  }
+
+  // One zone entry as the payload publishes it: the five wire fields this topic has always carried, and the two the account credentials add. Every field is
+  // optional because the additive pair is present only on a credentialed install whose facts are current, which is exactly what these pins are checking.
+  interface PublishedZone {
+
+    name?: string;
+    relay?: number;
+    run?: number;
+    state?: string;
+    suspendedUntil?: number;
+    time?: number;
+    timestr?: string;
+  }
+
+  // The parsed payload the get handler answers, which every pin below reads rather than matching substrings against the raw JSON.
+  function payloadOf(h: BuildControllerResult): PublishedZone[] {
+
+    assert.ok(h.mqtt, "the MQTT recorder should be attached");
+
+    const raw = h.mqtt.invokeGet("controller");
+
+    assert.ok(raw, "the get handler should answer a payload");
+
+    return JSON.parse(raw) as PublishedZone[];
+  }
+
+  test("an install with no credentials publishes exactly the five-field shape", async (t) => {
+
+    /* The parity pin, asserted as a DEEP EQUALITY rather than a field spot-check: any additive key leaking into an install that configured no credentials would
+     * show up here, which a substring or per-field assertion would miss.
+     */
+    const h = buildController({ mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(sentinelPair()), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    assert.deepEqual(payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
+      { name: "Beta", relay: 2, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" } ], "no additive key reaches a key-based install");
+  });
+
+  test("a credentialed install carries the classified state, and the suspension lands on its OWN zone", async (t) => {
+
+    const h = buildController({ hasV2Client: true, mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(sentinelPair()), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    const parsed = payloadOf(h);
+
+    /* Attribution is the claim, so each zone is checked individually: the suspended zone carries its own instant and its sibling carries none at all. A substring
+     * check against the whole payload could not tell a correctly attributed instant from one landed on the wrong zone.
+     */
+    assert.equal(parsed[0]?.state, "suspended", "the suspended zone reports its classified state");
+    assert.equal(parsed[0]?.suspendedUntil, SUSPENDED_UNTIL, "and carries its own suspension instant");
+    assert.equal(parsed[1]?.state, "unscheduled", "its sibling reports its own state");
+    assert.ok(!("suspendedUntil" in (parsed[1] ?? {})), "and carries no suspension instant at all");
+
+    // The five wire fields are untouched beneath the additions, which is what makes this sharpening additive rather than a reshaping.
+    assert.equal(parsed[0]?.name, "Alpha", "the wire name is unchanged");
+    assert.equal(parsed[0]?.time, HYDRAWISE_UNSCHEDULED_SENTINEL, "and so is the wire time");
+  });
+
+  test("a credentialed install whose snapshot has aged out publishes the key-based payload byte for byte", async (t) => {
+
+    /* The freshness gate's whole job. The credentials are configured and the projection exists either way, so without the gate a stale snapshot would go on
+     * publishing classifications nothing is left to confirm.
+     */
+    const h = buildController({ hasV2Client: true, mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(sentinelPair()), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) - (HYDRAWISE_V2_FACTS_TTL + 1) });
+
+    assert.deepEqual(payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
+      { name: "Beta", relay: 2, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" } ], "an expired snapshot publishes exactly what a key-based install does");
   });
 });

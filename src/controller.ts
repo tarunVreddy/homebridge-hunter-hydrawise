@@ -4,12 +4,13 @@
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
-  HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
+  HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
   sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
+  HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, SetZoneResponse,
+  StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
@@ -40,12 +41,13 @@ interface HydrawisePollUpdate {
   readonly status: StatusScheduleResponse;
 }
 
-// Per-zone state we track across polling cycles so we can detect and report start, stop, and rain-sensor transitions.
+// Per-zone state we track across polling cycles so we can detect and report start, stop, rain-sensor, and suspension transitions.
 interface HydrawiseZoneHints {
 
   isManual: boolean;
   isOn: boolean;
   isStopped: boolean;
+  isSuspended: boolean;
 }
 
 /* The one owner of the zone hints a controller keeps. The map is private to this class, and every change to it arrives as a named intent - seed, mark, clear,
@@ -62,17 +64,17 @@ class HydrawiseZoneHintLedger {
 
   private readonly hints = new Map<number, HydrawiseZoneHints>();
 
-  /* Resolve a zone's entry, seeding one on first sighting from the live rain-sensor reading alongside the falsy manual and running defaults. Seeding from the
-   * live reading rather than a static default is what keeps a zone first sighted during a rain delay from reporting a transition it never made. An existing
-   * entry comes back untouched, so its manual and running flags survive a valve rediscovery.
+  /* Resolve a zone's entry, seeding one on first sighting from the live rain-sensor and suspension readings alongside the falsy manual and running defaults.
+   * Seeding from the live readings rather than static defaults is what keeps a zone first sighted during a rain delay, or already suspended, from reporting a
+   * transition it never made. An existing entry comes back untouched, so its manual and running flags survive a valve rediscovery.
    */
-  public ensure(relayId: number, isStopped: boolean): Readonly<HydrawiseZoneHints> {
+  public ensure(relayId: number, isStopped: boolean, isSuspended: boolean): Readonly<HydrawiseZoneHints> {
 
     let hint = this.hints.get(relayId);
 
     if(!hint) {
 
-      hint = { isManual: false, isOn: false, isStopped };
+      hint = { isManual: false, isOn: false, isStopped, isSuspended };
       this.hints.set(relayId, hint);
     }
 
@@ -133,6 +135,17 @@ class HydrawiseZoneHintLedger {
     }
   }
 
+  // Store a zone's suspension state, the suspension twin of the rain-sensor store above and the value its own transition check compares against.
+  public refreshSuspended(relayId: number, isSuspended: boolean): void {
+
+    const hint = this.hints.get(relayId);
+
+    if(hint) {
+
+      hint.isSuspended = isSuspended;
+    }
+  }
+
   // Drop every entry the current poll's enabled projection does not name. Hosting never enters into it: a hint belongs to a zone, wherever that zone's valve
   // lives.
   public prune(liveRelayIds: Set<number>): void {
@@ -153,6 +166,15 @@ class HydrawiseZoneHintLedger {
   }
 }
 
+/* One controller's account-credentialed facts as this class holds them: what the account API reported, plus the local instant the request that fetched them was
+ * made. The timestamp's name is deliberately not `asOf`: the persisted projection's asOf carries the WIRE's own clock, this carries ours, and giving the two
+ * different names keeps a reader from ever mistaking one contract for the other.
+ */
+interface HydrawiseControllerFactsSnapshot extends HydrawiseControllerV2Facts {
+
+  fetchedAt: number;
+}
+
 export class HydrawiseController {
 
   private readonly accessory: HydrawiseControllerAccessory;
@@ -161,9 +183,31 @@ export class HydrawiseController {
   private enabledZones: HydrawiseZoneConfig[];
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
+
+  /* The last availability the account API actually reported, and the seed the transition line compares against. It is deliberately NOT read from the
+   * characteristic: that is constructed carrying no-fault, which is indistinguishable from a genuine first report of "online", so a controller that is offline
+   * the very first time it is heard from would otherwise narrate a transition that never happened. Null means nothing has reported yet, so the first arrival
+   * seeds silently whatever it says.
+   *
+   * It lives in memory and dies with the process by design, on the same terms as the zone ledger's own seeds: after a restart the first arrival re-seeds
+   * silently, so restarting never manufactures a transition either.
+   */
+  private lastKnownOnline: Nullable<boolean> = null;
+
+  /* When this controller last successfully commanded a suspend-all or a resume, in epoch seconds. A facts snapshot older than the user's own command cannot know
+   * about it, so the suspend switch ignores such a snapshot and answers from the wire heuristic until a refresh that postdates the command arrives. Zero means no
+   * command has been issued this session, which every real snapshot postdates.
+   */
+  private lastSuspendCommandAt = 0;
+
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
   private status: StatusScheduleResponse;
+
+  // The most recent account-credentialed facts this controller was handed, or null when none have ever arrived. Every reader goes through the freshness
+  // chokepoint below rather than touching this directly, so "never arrived", "gone stale", and "no credentials configured" are one answer at every consumer.
+  private v2Facts: Nullable<HydrawiseControllerFactsSnapshot> = null;
+
   private readonly zoneHints: HydrawiseZoneHintLedger;
 
   // The constructor initializes key variables and calls configureDevice(). The platform passes the denormalized account roster - every account controller's identity,
@@ -307,23 +351,204 @@ export class HydrawiseController {
     return true;
   }
 
-  /* Adopt the hardware facts the account-credentialed API reported for this controller: display them, then make them durable.
+  /* Adopt the facts the account-credentialed API reported for this controller: display them, project them, and make whatever moved durable.
    *
-   * The characteristics are the only store these facts have. HAP round-trips them through Homebridge's on-disk accessory cache, so writing them here and flushing
-   * once is the whole of the persistence - no parallel copy is kept, which is what keeps a restart from having two answers to reconcile.
+   * The ORDER here is part of the contract. The prior snapshot is captured in a local BEFORE the new one is stored, because the hardware comparison below reads
+   * the snapshot this controller was holding on entry; a comparison written against the field after the store would read the new value on both sides and could
+   * never report a change. The first arrival counts as a change whenever it carries hardware, since that arrival is the one that has to reach the disk.
    *
-   * The flush is explicit, unlike every other durable write this class makes. Those ride the polling projection's single chokepoint, which turns whatever moved in
-   * a poll into that poll's one cache write; this arrives from outside a poll entirely, so it owns its own persistence or the values are gone at the next restart -
-   * and losing them would spend a cloud call on every launch to relearn a fact that never changes.
+   * The characteristics are the only store the hardware facts have. HAP round-trips them through Homebridge's on-disk accessory cache, so writing them here and
+   * flushing is the whole of the persistence - no parallel copy is kept, which is what keeps a restart from having two answers to reconcile.
    *
-   * @param hardware - The model and firmware this controller reports.
+   * The flush is CHANGE-GATED, and on a recurring cadence that gate is the point: a tick that moved nothing would otherwise write the accessory cache to disk
+   * every quarter hour for no reason at all. It fires when the projection moved or when the hardware genuinely differs from what this controller already held.
+   *
+   * @param facts     - The hardware, availability, and per-zone facts the account API reported for this controller.
+   * @param fetchedAt - The local instant, in epoch seconds, the request that fetched them was made.
    */
-  public applyHardware(hardware: HydrawiseControllerHardware): void {
+  public applyFacts({ facts, fetchedAt }: { facts: HydrawiseControllerV2Facts; fetchedAt: number }): void {
 
-    this.configureInfo({ accessory: this.accessory, hardware, serialNumber: this.controller.serial_number });
-    this.api.updatePlatformAccessories([this.accessory]);
+    const prior = this.v2Facts;
 
-    this.log.debug("Hardware details updated: %s (firmware %s).", hardware.model, hardware.firmware);
+    this.v2Facts = { ...facts, fetchedAt };
+
+    if(facts.hardware) {
+
+      this.configureInfo({ accessory: this.accessory, hardware: facts.hardware, serialNumber: this.controller.serial_number });
+    }
+
+    this.reportAvailability(facts.online);
+
+    const projectionChanged = this.applyProjection(this.currentFacts);
+    const hardwareChanged = !this.sameHardware(prior?.hardware ?? null, facts.hardware);
+
+    if(projectionChanged || hardwareChanged) {
+
+      this.api.updatePlatformAccessories([this.accessory]);
+    }
+
+    // A refresh tick that moved nothing stays silent on MQTT too, unlike the poll cadence, which publishes unconditionally.
+    if(projectionChanged) {
+
+      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(this.currentFacts)); },
+        label: "MQTT publish (controller)", log: this.log });
+    }
+
+    this.log.debug("Enhanced details updated: model %s, firmware %s, reachable %s, zones %s.", facts.hardware?.model ?? "unknown",
+      facts.hardware?.firmware ?? "unknown", facts.online ?? "unknown", facts.zones.size.toString());
+  }
+
+  // Compare two hardware answers field-wise, treating an absent answer as a value of its own so the first arrival against a null baseline reports as a change.
+  // Never by reference: each refresh composes a fresh object, so a reference check would call every tick a change and flush the accessory cache on every one.
+  private sameHardware(a: Nullable<HydrawiseControllerHardware>, b: Nullable<HydrawiseControllerHardware>): boolean {
+
+    if(!a || !b) {
+
+      return a === b;
+    }
+
+    return (a.firmware === b.firmware) && (a.model === b.model);
+  }
+
+  /* Report a change in whether Hydrawise can reach this controller, and remember what was reported. The line fires only when a new non-null reading DIFFERS from
+   * a non-null one already recorded, so the first arrival seeds silently whatever it says and a refresh that simply cannot tell changes nothing.
+   */
+  private reportAvailability(online: Nullable<boolean>): void {
+
+    if(online === null) {
+
+      return;
+    }
+
+    if((this.lastKnownOnline !== null) && (this.lastKnownOnline !== online)) {
+
+      this.log.info(online ? "The controller is back online." : "The controller is offline.");
+    }
+
+    this.lastKnownOnline = online;
+  }
+
+  /* The account-credentialed facts if and only if they can still be trusted, and null otherwise. This is the single freshness judgment in the class, and the
+   * three ways there is nothing to trust - none ever arrived, the last ones have aged past their lifetime, and no credentials are configured at all - all answer
+   * the same null, so no consumer has to tell them apart.
+   *
+   * It hands back the WHOLE snapshot rather than the zones map alone, because every gated consumer draws the same judgment: the per-zone classifier inputs, the
+   * projection's availability stamp, the MQTT payload's additive fields, and the fault characteristic. Returning the map alone would force a second, parallel
+   * freshness read for the facts that are not per-zone, which is exactly the divergence one chokepoint exists to prevent.
+   *
+   * A pass resolves this ONCE and threads the answer down, so a lifetime boundary crossed midway through a poll can never split that poll's classifications
+   * between two different answers.
+   */
+  private get currentFacts(): Nullable<HydrawiseControllerFactsSnapshot> {
+
+    if(!this.v2Facts) {
+
+      return null;
+    }
+
+    return ((Math.floor(Date.now() / 1000) - this.v2Facts.fetchedAt) <= HYDRAWISE_V2_FACTS_TTL) ? this.v2Facts : null;
+  }
+
+  /* Re-derive everything that follows from the classified projection, and report whether that projection moved. Both cadences that can change a zone's
+   * classification run this - the poll, which brings fresh wire truth, and a refresh tick, which brings fresh account facts - so a suspension arriving on a
+   * refresh reaches HomeKit, the log, and the accessory cache with that refresh rather than waiting up to a poll for the next one.
+   *
+   * The flush is deliberately NOT performed here. Each caller owns its own write policy - the poll folds this into the single cache write it already makes, and a
+   * refresh gates its write on the boolean returned here - so this method persists and reports, and never decides.
+   *
+   * This is deliberately not a whole applyStatus re-run. That method also drives the standalone-accessory reconcile, whose wire-absence grace COUNTS POLLS, so
+   * re-entering it outside a poll would double-count that grace and could demote an accessory the wire never actually dropped.
+   *
+   * Before the first completed poll there is nothing to classify, so only the fault characteristic - which answers to the facts alone - is refreshed.
+   */
+  private applyProjection(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+
+    this.refreshStatusFault(facts);
+
+    if(!this.status.relays.length) {
+
+      return false;
+    }
+
+    const changed = this.persistScheduleStatus(facts);
+
+    this.refreshSuspensionStates();
+
+    // The suspend switch reads the classification this pass just persisted, so it is refreshed here rather than at either caller: one derivation, one position.
+    this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
+      this.isAllSuspended(facts));
+
+    return changed;
+  }
+
+  /* Project whether Hydrawise can currently reach this controller onto the irrigation system's fault characteristic, which exists only where the plugin can
+   * actually learn the answer.
+   *
+   * The three readings are distinct on purpose. A live "reachable" clears the fault and a live "unreachable" raises it. A refresh that carried no reading at all
+   * leaves whatever is displayed standing, because overwriting a real answer with a guess is worse than a moment of staleness. And no trustworthy snapshot -
+   * never arrived, or aged out because the refresh loop has stopped - clears the fault, since an unknown state is not a fault and freezing an offline reading on
+   * display forever would be a lie the user cannot clear.
+   */
+  private refreshStatusFault(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
+
+    if(!this.platform.hasV2Client) {
+
+      return;
+    }
+
+    const service = this.accessory.getService(this.hap.Service.IrrigationSystem);
+
+    if(!service) {
+
+      return;
+    }
+
+    if(!facts) {
+
+      service.updateCharacteristic(this.hap.Characteristic.StatusFault, this.hap.Characteristic.StatusFault.NO_FAULT);
+
+      return;
+    }
+
+    if(facts.online === null) {
+
+      return;
+    }
+
+    service.updateCharacteristic(this.hap.Characteristic.StatusFault,
+      facts.online ? this.hap.Characteristic.StatusFault.NO_FAULT : this.hap.Characteristic.StatusFault.GENERAL_FAULT);
+  }
+
+  /* Narrate each zone whose suspension state changed, and store the new state for the next comparison. The states come from the projection this pass persisted,
+   * so what the log says and what the webUI shows are the same reading rather than two derivations that can drift.
+   *
+   * A zone with no ledger entry is skipped rather than seeded here: the poll walk seeds every zone it projects, from the live reading, which is what keeps a zone
+   * first sighted while already suspended from announcing a transition it never made.
+   */
+  private refreshSuspensionStates(): void {
+
+    for(const entry of this.accessory.context.schedule?.zones ?? []) {
+
+      const hint = this.zoneHints.get(entry.relayId);
+      const isSuspended = entry.state === "suspended";
+
+      if(!hint || (hint.isSuspended === isSuspended)) {
+
+        continue;
+      }
+
+      this.zoneHints.refreshSuspended(entry.relayId, isSuspended);
+
+      const zone = this.status.relays.find(candidate => candidate.relay_id === entry.relayId);
+
+      if(!zone || !this.hasZoneFeature("Log.Zone", entry.relayId.toString())) {
+
+        continue;
+      }
+
+      this.log.info("%s: %s", this.zoneLabel(zone), (entry.state === "suspended") ? "Suspended until " + this.formatInstant(entry.until) + "." :
+        "Suspension lifted.");
+    }
   }
 
   // Compose the wire-level MQTT topic for this controller. Every publish and subscription routes through this helper so the per-controller prefix shape
@@ -337,7 +562,7 @@ export class HydrawiseController {
   private configureMqtt(): boolean {
 
     // Return our irrigation controller state.
-    this.platform.mqtt?.subscribeGet(this.mqttTopic("controller"), "controller", (): string => this.statusJson);
+    this.platform.mqtt?.subscribeGet(this.mqttTopic("controller"), "controller", (): string => this.statusJson(this.currentFacts));
 
     // Set the state of a given irrigation zone.
     this.platform.mqtt?.subscribeSet(this.mqttTopic("controller"), "controller", async (value: string): Promise<void> => {
@@ -400,6 +625,21 @@ export class HydrawiseController {
     service.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
     service.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
 
+    /* Whether Hydrawise can reach this controller is a fact only the account-credentialed API reports, so the characteristic that shows it exists only on an
+     * install that configured those credentials. It is one of the optional characteristics the specification permits on this service, and it is stamped with an
+     * explicit starting state because construction runs synchronously, long before any refresh can have answered.
+     *
+     * The removal arm is the same clean revert the firmware reset above performs, and it matters for the same reason: HAP round-trips characteristics through the
+     * accessory cache, so an accessory restored from a session that HAD credentials would otherwise keep displaying a reachability nothing is left to update.
+     */
+    if(this.platform.hasV2Client) {
+
+      service.updateCharacteristic(this.hap.Characteristic.StatusFault, this.hap.Characteristic.StatusFault.NO_FAULT);
+    } else if(service.testCharacteristic(this.hap.Characteristic.StatusFault)) {
+
+      service.removeCharacteristic(service.getCharacteristic(this.hap.Characteristic.StatusFault));
+    }
+
     return true;
   }
 
@@ -426,7 +666,7 @@ export class HydrawiseController {
     }
 
     // Suspend or resume the irrigation schedule.
-    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAllSuspended);
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAllSuspended(this.currentFacts));
 
     service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
 
@@ -466,10 +706,16 @@ export class HydrawiseController {
         return;
       }
 
+      /* Stamp the instant this command succeeded. A facts snapshot fetched before it cannot know about it, so the switch ignores any snapshot older than this and
+       * answers from the wire heuristic until a refresh that postdates the command lands - which is what stops a fetch already in flight when the user pressed
+       * the switch from flipping it straight back. A resume stamps too, for the same reason in the other direction.
+       */
+      this.lastSuspendCommandAt = Math.floor(Date.now() / 1000);
+
       this.log.info("%s scheduled watering for all zones.", value ? "Suspending" : "Resuming");
     });
 
-    service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended);
+    service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
 
     this.platform.featureOptions.logFeature("Device.Suspend", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
 
@@ -515,17 +761,25 @@ export class HydrawiseController {
 
     const { isFirstRun, status } = update;
 
+    // Resolve the account-credentialed facts ONCE for this whole pass and thread the answer through everything below, so a lifetime boundary crossed partway
+    // through cannot split one poll's classifications between two different answers.
+    const facts = this.currentFacts;
+
     /* Persist the identity roster and the schedule projection, each on change, through one flush: whichever moved this poll rides a single updatePlatformAccessories
      * call, so a poll costs at most one cache write no matter how many projections it advanced. Both run before the enablement projection below, so what is persisted
      * covers every reported zone, feature-disabled or not - the complete listing and schedule the webUI reads back from cache with no cloud call.
      */
     const rosterChanged = this.persistZoneRoster();
-    const scheduleChanged = this.persistScheduleStatus();
+    const scheduleChanged = this.applyProjection(facts);
 
     if(rosterChanged || scheduleChanged) {
 
       this.api.updatePlatformAccessories([this.accessory]);
     }
+
+    // The classification this pass just persisted, keyed by relay. Every consumer below - the zone walk's seeds, its rain and status sentences - reads a zone's
+    // state from here rather than classifying again, so the log, HomeKit, and the accessory cache cannot tell different stories about the same zone.
+    const classified = new Map((this.accessory.context.schedule?.zones ?? []).map(entry => [ entry.relayId, entry ]));
 
     // Project the reported zones onto the set the user has enabled. Every HomeKit surface in this pass - valves, aggregates, logging - works from this
     // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
@@ -641,14 +895,26 @@ export class HydrawiseController {
         this.api.updatePlatformAccessories([host]);
       }
 
-      // See if the zone has been stopped due to a rain sensor event. We compute this before resolving the hint entry so a first-sighted zone seeds its stored rain
-      // state with the live sensor value rather than a static default, which would otherwise fire a spurious rain-sensor transition on the zone's first appearance
-      // during a rain delay.
-      const isStopped = this.isStoppedBySensor(zone);
+      /* This zone's classified state, which decides what the user is SHOWN, and the sensor reading the rain transition and the program-mode aggregate answer to.
+       * They are deliberately different questions, and conflating them is what produces a false log line.
+       *
+       * The classification gives suspension precedence over a sensor claim, which is right for display: a suspended zone should read as suspended. The rain hint
+       * has to speak for the SENSOR itself, because a zone that is suspended AND sitting under a tripped sensor is still sensor-blocked. Deriving this hint from
+       * the classification instead would let a suspension landing on a covered zone read as the sensor clearing, and narrate a rain transition that never
+       * happened while the sensor was still tripping.
+       *
+       * The reading prefers the account API's own live answer and falls back to the group inference drawn from the wire, which is the order the classifier
+       * applies to the same question.
+       *
+       * Both are resolved before the hint entry so a first-sighted zone seeds its stored state from the live readings rather than from static defaults, which
+       * would otherwise fire a spurious transition the first time a zone appears during a rain delay or under a suspension.
+       */
+      const state = classified.get(zone.relay_id);
+      const isStopped = facts?.zones.get(zone.relay_id)?.sensorStopped ?? this.isStoppedBySensor(zone);
 
-      // Resolve this zone's hint entry, seeded on first sighting with the live sensor state. The view is the ledger's own entry, so the reads below see every
-      // write the rest of this pass makes to it.
-      const hints = this.zoneHints.ensure(zone.relay_id, isStopped);
+      // Resolve this zone's hint entry, seeded on first sighting with the live state. The view is the ledger's own entry, so the reads below see every write the
+      // rest of this pass makes to it.
+      const hints = this.zoneHints.ensure(zone.relay_id, isStopped, state?.state === "suspended");
 
       // Inform the user.
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
@@ -658,7 +924,7 @@ export class HydrawiseController {
         // transition check below does not fire on the zone's first appearance.
         this.zoneHints.refreshStopped(zone.relay_id, isStopped);
 
-        this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
+        this.log.info("%s: %s", this.zoneLabel(zone, valveService), this.zoneStatus(zone, state));
 
         // Manually control the zone valve.
         valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue): Promise<void> => {
@@ -720,7 +986,7 @@ export class HydrawiseController {
             }
           }
 
-          this.log.info("%s: Manually %s%s.", this.getValveName(valveService, zone), setOn ? "started" : "stopped",
+          this.log.info("%s: Manually %s%s.", this.zoneLabel(zone, valveService), setOn ? "started" : "stopped",
             setOn ? " (duration: " + this.getMinutes(duration) + ")" : "");
         });
       }
@@ -752,7 +1018,7 @@ export class HydrawiseController {
       if((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR)) {
 
         valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
-        this.log.debug("Setting %s as active.", this.getValveName(valveService, zone));
+        this.log.debug("Setting %s as active.", this.zoneLabel(zone, valveService));
       } else {
 
         valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.INACTIVE);
@@ -768,14 +1034,14 @@ export class HydrawiseController {
         // Inform the user if the zone has been started or stopped.
         if(isValveInUse !== hints.isOn) {
 
-          this.log.info("%s: %s %s", this.getValveName(valveService, zone), hints.isOn ? "Started" : "Stopped.",
-            hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone));
+          this.log.info("%s: %s %s", this.zoneLabel(zone, valveService), hints.isOn ? "Started" : "Stopped.",
+            hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone, state));
         }
 
         // Inform the user if the zone has been stopped due to a rain sensor.
         if(isStopped !== hints.isStopped) {
 
-          this.log.info("%s: Rain sensor is %s irrigation.", this.getValveName(valveService, zone), isStopped ? "stopping" : "allowing");
+          this.log.info("%s: Rain sensor is %s irrigation.", this.zoneLabel(zone, valveService), isStopped ? "stopping" : "allowing");
         }
       }
 
@@ -801,12 +1067,8 @@ export class HydrawiseController {
 
     // Publish our status to MQTT if configured to do so, routing through guardedDispatch so a rejected publish - the broker vanishing mid-write, a teardown race -
     // lands in the log instead of floating as an unhandled rejection.
-    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson); },
+    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
       label: "MQTT publish (controller)", log: this.log });
-
-    // Update our suspend status.
-    this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
-      this.isAllSuspended);
   }
 
   // Send a command to the Hydrawise API.
@@ -895,9 +1157,9 @@ export class HydrawiseController {
    * Every state the union declares is named here with no default arm, so a state added to the union surfaces as a compile error - a return path the analysis can
    * see falling off the end - rather than as a zone silently rendering someone else's sentence.
    */
-  private zoneStatus(zone: HydrawiseZoneConfig): string {
+  private zoneStatus(zone: HydrawiseZoneConfig, state: HydrawiseZoneScheduleStatus | undefined = zoneScheduleStatus(zone, this.status)): string {
 
-    switch(zoneScheduleStatus(zone, this.status).state) {
+    switch(state.state) {
 
       case "running":
 
@@ -912,12 +1174,41 @@ export class HydrawiseController {
 
         return "Rain sensor is preventing irrigation.";
 
+      case "suspended":
+
+        return "Watering is suspended until " + this.formatInstant(state.until) + ".";
+
       case "unscheduled":
 
-        // The wire reports no upcoming run, and that is the whole claim: a zone between schedule computations and a zone the owner suspended read identically, so
-        // the sentence states the absence rather than guessing at its cause.
+        // The wire reports no upcoming run, and that is the whole claim: without account credentials a zone between schedule computations and a zone the owner
+        // suspended read identically, so the sentence states the absence rather than guessing at its cause.
         return "No runs are currently scheduled.";
     }
+  }
+
+  /* Render an absolute instant for the operator reading the Homebridge log, in the host's own timezone: the clock alone when it falls today, a short weekday
+   * ahead of it within the coming week, and a locale date beyond that, where a weekday alone would be ambiguous.
+   *
+   * The display tier keeps a formatter of its own for the browser's reader, deliberately - each tier renders for its own audience - so this is one formatter per
+   * tier rather than one per sentence: the suspension status line and the ledger's suspension transition both render their instant through here.
+   */
+  private formatInstant(epochSeconds: number): string {
+
+    const when = new Date(epochSeconds * 1000);
+    const now = new Date();
+    const clock = when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+    if(when.toDateString() === now.toDateString()) {
+
+      return clock;
+    }
+
+    if(Math.abs(epochSeconds - Math.floor(now.getTime() / 1000)) < (7 * 24 * 60 * 60)) {
+
+      return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + clock;
+    }
+
+    return when.toLocaleDateString();
   }
 
   // Retrieve the current status from the Hydrawise API.
@@ -1012,10 +1303,10 @@ export class HydrawiseController {
    *
    * Like the roster it never flushes, and the applyStatus chokepoint is the single consumer of the signal it returns.
    */
-  private persistScheduleStatus(): boolean {
+  private persistScheduleStatus(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
-    const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR);
     const previous = this.accessory.context.schedule;
+    const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: facts ?? undefined, priorSuspended: this.priorSuspended(previous) });
 
     if(previous && sameScheduleStatus(previous, schedule)) {
 
@@ -1025,6 +1316,23 @@ export class HydrawiseController {
     this.accessory.context.schedule = schedule;
 
     return true;
+  }
+
+  /* The suspension instants the prior projection recorded, which the classifier carries forward for any zone this pass has no fresh answer about.
+   *
+   * The carry exists to stop a suspended zone flapping to "not scheduled" and back across a restart or a gap between refreshes, and it is offered only on an
+   * install that HAS the credentials: without them nothing could ever confirm or clear a carried suspension, so a cache restored from a credentialed past
+   * re-classifies cleanly instead of stranding a claim forever. The classifier applies the remaining limits - the zone must still carry the unscheduled shape,
+   * and the instant must still be ahead of the wire clock - and passes the recorded value through untouched, which is what keeps a carried arm byte-stable.
+   */
+  private priorSuspended(previous: HydrawiseScheduleStatus | undefined): Map<number, number> | undefined {
+
+    if(!this.platform.hasV2Client) {
+
+      return undefined;
+    }
+
+    return new Map((previous?.zones ?? []).flatMap(entry => (entry.state === "suspended") ? [[ entry.relayId, entry.until ] as [ number, number ]] : []));
   }
 
   // Guard that a persisted context value is a well-formed zone roster: an array whose every entry passes the shared zone-identity shape check. A malformed prior
@@ -1083,26 +1391,69 @@ export class HydrawiseController {
     return name?.length ? name : undefined;
   }
 
-  // Utility function to get the configured name of a valve, if set.
-  private getValveName(service: Service, zone: HydrawiseZoneConfig): string {
+  /* The label a zone's log lines carry: the configured name of its valve where one exists, the name Hydrawise reports otherwise, and the zone number the operator
+   * sees on the controller itself.
+   *
+   * Both cadences that narrate a zone compose through here, which is what makes their lines read identically. The poll walk already holds the valve service and
+   * hands it over; the refresh tail holds only the wire zone, so it lets this look the service up on the controller's own accessory - a zone promoted onto a
+   * standalone accessory is not found there and falls back to its wire name, which is a truthful label rather than a wrong one.
+   */
+  private zoneLabel(zone: HydrawiseZoneConfig, service?: Service): string {
 
-    return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
+    const valve = service ?? this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString());
+
+    return ((valve?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
   }
 
-  /* Utility to return whether the account reads as fully suspended, which is what drives the suspend-all switch's state. Every zone carrying the unscheduled
-   * sentinel with no sensor stop is the strongest evidence the v1 wire offers for a suspend-all, and it is what the API itself normalizes a suspend-all command to.
-   * The wire cannot distinguish that from an account whose every zone merely sits between runs, so the switch can read on without a suspension having been
-   * commanded - the standing v1 ambiguity, resolved here in favor of reflecting the commanded state whenever one was issued.
+  /* Whether the account reads as fully suspended, which is what drives the suspend-all switch's state. There are two answers, and which one applies depends on
+   * what this controller can actually know.
+   *
+   * With trustworthy account facts that POSTDATE the last suspend-all command, the answer comes from the classified states: the account is suspended when every
+   * reported zone classifies suspended. Reading the classification rather than the raw suspension facts keeps this the projection's single truth, and it is also
+   * the behaviorally right answer where a raw read would be wrong - a zone the user forced into a manual run classifies as running, so the switch reads off while
+   * water flows, exactly as the wire heuristic reads today. The command-recency condition closes the other half: a snapshot fetched before the user's own command
+   * cannot know about it, and letting one answer here would flip the switch straight back.
+   *
+   * Otherwise the wire heuristic stands. Every zone carrying the unscheduled sentinel with no sensor stop is the strongest evidence the key-based wire offers for
+   * a suspend-all, and it is what the API itself normalizes a suspend-all command to. It carries two documented ambiguities: it cannot tell a suspend-all from an
+   * account whose every zone merely sits between runs, so the switch can read on with nothing commanded; and on a controller whose rain sensor covers every zone
+   * it reads OFF during a genuine suspend-all, because the sensor classification claims those zones first - a 2026-08-04 live capture recorded exactly that. The
+   * facts path above is what resolves the second; the heuristic remains the honest fallback for an install that cannot reach it.
    */
-  private get isAllSuspended(): boolean {
+  private isAllSuspended(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+
+    if(facts && (facts.fetchedAt > this.lastSuspendCommandAt)) {
+
+      const zones = this.accessory.context.schedule?.zones ?? [];
+
+      return (zones.length > 0) && zones.every(entry => entry.state === "suspended");
+    }
 
     return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== HYDRAWISE_UNSCHEDULED_SENTINEL) || this.isStoppedBySensor(zone));
   }
 
-  // Utility to return our status as a JSON for MQTT.
-  private get statusJson(): string {
+  /* Our status as JSON for MQTT: one entry per reported zone, carrying the wire fields this payload has always published.
+   *
+   * The account-credentialed facts add to that rather than reshaping it. With a trustworthy snapshot in hand each entry also carries its classified state, and a
+   * suspended zone the instant its suspension lifts; with nothing trustworthy - no credentials, no refresh yet, or a snapshot aged out - the payload is byte for
+   * byte what an install with only an API key publishes. The gate is what makes that promise good, since the projection itself exists in both cases.
+   */
+  private statusJson(facts: Nullable<HydrawiseControllerFactsSnapshot>): string {
 
-    return JSON.stringify(this.status.relays.map(x => ({ name: x.name, relay: x.relay, run: x.run, time: x.time, timestr: x.timestr })));
+    const classified = facts ? new Map((this.accessory.context.schedule?.zones ?? []).map(entry => [ entry.relayId, entry ])) : undefined;
+
+    return JSON.stringify(this.status.relays.map(x => {
+
+      const base = { name: x.name, relay: x.relay, run: x.run, time: x.time, timestr: x.timestr };
+      const state = classified?.get(x.relay_id);
+
+      if(!state) {
+
+        return base;
+      }
+
+      return (state.state === "suspended") ? { ...base, state: state.state, suspendedUntil: state.until } : { ...base, state: state.state };
+    }));
   }
 
   // Utility function to return the name of this controller.

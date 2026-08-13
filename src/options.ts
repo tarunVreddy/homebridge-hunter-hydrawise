@@ -96,8 +96,8 @@ export const featureOptionCategories = [
 const accountOptions: HydrawiseFeatureOption[] = [
 
   { default: false, defaultValue: "", description: "The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website.", inputSize: 19, name: "ApiKey", scopes: ["global"], secret: true },
-  { default: false, defaultValue: "", description: "The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features, currently the real model name and firmware version of each controller in HomeKit.", inputSize: 30, name: "Username", scopes: ["global"] },
-  { default: false, defaultValue: "", description: "The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features, currently the real model name and firmware version of each controller in HomeKit.", inputSize: 20, name: "Password", scopes: ["global"], secret: true }
+  { default: false, defaultValue: "", description: "The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI.", inputSize: 30, name: "Username", scopes: ["global"] },
+  { default: false, defaultValue: "", description: "The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI.", inputSize: 20, name: "Password", scopes: ["global"], secret: true }
 ];
 
 // Device options.

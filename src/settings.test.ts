@@ -4,7 +4,8 @@
  */
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC,
-  HYDRAWISE_SUSPEND_DURATION, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME,
+  PLUGIN_NAME } from "./settings.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -28,6 +29,24 @@ describe("settings", () => {
     assert.equal(HYDRAWISE_COMMAND_BUDGET_CALLS, 3, "the zone-command ceiling admits 3 calls");
     assert.equal(HYDRAWISE_COMMAND_BUDGET_WINDOW, 30, "the zone-command ceiling is measured over 30 seconds");
     assert.equal(HYDRAWISE_COMMAND_ENDPOINT, "setzone.php", "setzone.php is the endpoint under the stricter command ceiling");
+  });
+
+  test("the enhanced-features cadence fits inside the ceiling it is paced against", () => {
+
+    /* The arithmetic is the receipt, not the literal. The refresh spends one read per tick, so the reads a whole budget window admits has to leave room for the
+     * token grants those reads carry - each of which draws the same ceiling. Asserting the RELATIONSHIP rather than the number is what makes a future change to
+     * either constant fail here if it breaks the pacing, instead of silently spending an account into throttling.
+     */
+    assert.equal(HYDRAWISE_V2_REFRESH_INTERVAL, 900, "the refresh runs every 15 minutes");
+    assert.equal(HYDRAWISE_V2_BUDGET_WINDOW / HYDRAWISE_V2_REFRESH_INTERVAL, 2, "which is two reads per budget window");
+    assert.ok((HYDRAWISE_V2_BUDGET_WINDOW / HYDRAWISE_V2_REFRESH_INTERVAL) < HYDRAWISE_V2_BUDGET_CALLS,
+      "leaving headroom inside the ceiling for the token grants those reads carry");
+  });
+
+  test("the facts lifetime is derived from the cadence rather than restated beside it", () => {
+
+    // Twice the cadence is the deliberate ratio: one missed refresh never flips a consumer to its fallback, while a refresh loop that has stopped does.
+    assert.equal(HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL * 2, "a facts snapshot outlives exactly one missed refresh");
   });
 
   test("pins the MQTT and platform identity constants", () => {

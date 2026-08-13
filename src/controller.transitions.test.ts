@@ -7,13 +7,15 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { bareSensors, rainSensors } from "./api.fixtures.ts";
-import { buildController, countLogged, loggedAt, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, countLogged, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
+import util from "node:util";
 
 // Compose a fast-cadence schedule from a zone list and an optional sensor block (the bare, non-referencing sensor by default).
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
@@ -248,5 +250,226 @@ describe("HydrawiseController updateState transitions", () => {
     assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the zone with the enable override should have a valve");
     assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "a sibling zone under the controller disable should have no valve");
     assert.equal(h.accessory.getServiceById(Service.Valve, "700003"), undefined, "a sibling zone under the controller disable should have no valve");
+  });
+});
+
+describe("HydrawiseController suspension transitions", () => {
+
+  // The suspension instant the live account capture recorded, kept verbatim so the narrated date is rendered from a real far-future value.
+  const SUSPENDED_UNTIL = 1903928399;
+
+  // One zone under the ambiguous sentinel shape, so whether it reads as suspended rests entirely on the account facts.
+  function sentinelZone(): HydrawiseZoneConfig {
+
+    return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
+  }
+
+  function suspendedFacts(): HydrawiseControllerV2Facts {
+
+    return makeV2Facts({ zones: [[ 700001, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] });
+  }
+
+  test("a suspension arriving on a refresh is narrated with that refresh, and lifting it is narrated once", async (t) => {
+
+    /* The transition is narrated from the REFRESH cadence rather than waiting for the next poll, which is the point of running the projection tail from both
+     * cadences: a quarter hour is a long time to show a zone the wrong state.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "the suspension is narrated exactly once");
+    assert.ok(loggedAt(h.lines(), "info", "[Zone 1]"), "the line names the zone the operator sees on the controller");
+
+    // A repeat of the same facts is not a transition, so it says nothing further.
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "an unchanged suspension narrates nothing further");
+
+    // Clearing it is its own transition, narrated once and in its own words.
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts() ]] }), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.equal(countLogged(h.lines(), "info", "Suspension lifted."), 1, "lifting the suspension is narrated exactly once");
+  });
+
+  test("a zone first sighted while already suspended narrates no transition it never made", async (t) => {
+
+    /* The seeding pin, mirroring the rain-sensor seed. The ledger seeds a zone's suspension state from the live reading on first sighting, so a plugin restarting
+     * while a zone is suspended does not announce a suspension that has been standing for days.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // The facts land before any poll has completed, so the very first poll's walk seeds the zone already reading as suspended.
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 0, "a zone sighted already suspended announces nothing");
+  });
+
+  test("the suspension status sentence names the suspension rather than the unscheduled wording", async (t) => {
+
+    // The threading pin for the first-sighting status line: a credentialed suspended zone must not log the "no runs scheduled" sentence while the webUI says
+    // Suspended, which is exactly what an unthreaded classifier call at that site would produce.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "info", "Watering is suspended until"), "the zone's status sentence names its suspension");
+    assert.ok(!loggedAt(h.lines(), "info", "No runs are currently scheduled"), "and never falls back to the unscheduled wording");
+  });
+
+  test("an install with no credentials narrates no suspension at all", async (t) => {
+
+    // The parity restatement: nothing above is reachable without the account credentials, so the sentinel shape reads and reads out exactly as it always has.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "info", "No runs are currently scheduled"), "the key-based sentence is what an unenriched zone reports");
+    assert.equal(countLogged(h.lines(), "info", "suspended"), 0, "and no suspension is claimed anywhere");
+  });
+});
+
+describe("HydrawiseController suspension instant rendering", () => {
+
+  // One zone under the ambiguous sentinel shape, so the narrated sentence rests entirely on the account facts.
+  function sentinelZone(): HydrawiseZoneConfig {
+
+    return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
+  }
+
+  // Drive a controller to narrate a suspension ending at the given instant, and hand back its captured lines.
+  async function narrate(until: number): Promise<string[]> {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts({ suspendedUntil: until }) ]] }),
+      fetchedAt: Math.floor(Date.now() / 1000) });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    h.abort();
+
+    return h.lines().map(line => util.format(line.message, ...line.args));
+  }
+
+  test("renders a suspension ending today as the clock alone, and one later in the week with its weekday", async () => {
+
+    /* The runtime formatter's three tiers, driven through the sentence a user actually reads. Every expected string is computed through the identical Intl call
+     * the formatter itself makes, so a host in another locale or timezone moves both sides together rather than reddening a correct implementation.
+     */
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    const soonWhen = new Date(soon * 1000);
+    const soonClock = soonWhen.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+    // An hour out can legitimately fall on tomorrow's calendar day near midnight, so the expectation is derived the same way the formatter decides it.
+    const sameDay = soonWhen.toDateString() === new Date().toDateString();
+    const expectedSoon = sameDay ? soonClock : (soonWhen.toLocaleDateString(undefined, { weekday: "short" }) + " " + soonClock);
+
+    assert.ok((await narrate(soon)).some(line => line.includes("Watering is suspended until " + expectedSoon + ".")),
+      "a near-term suspension renders through the clock tier");
+
+    const later = Math.floor(Date.now() / 1000) + (3 * 24 * 3600);
+    const laterWhen = new Date(later * 1000);
+    const expectedLater = laterWhen.toLocaleDateString(undefined, { weekday: "short" }) + " " +
+      laterWhen.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+    assert.ok((await narrate(later)).some(line => line.includes("Watering is suspended until " + expectedLater + ".")),
+      "one a few days out carries its weekday");
+
+    const distant = Math.floor(Date.now() / 1000) + (400 * 24 * 3600);
+
+    assert.ok((await narrate(distant)).some(line => line.includes("Watering is suspended until " + new Date(distant * 1000).toLocaleDateString() + ".")),
+      "and one beyond the week renders as a locale date, where a weekday alone would be ambiguous");
+  });
+});
+
+describe("HydrawiseController rain transitions speak for the sensor", () => {
+
+  // The suspension instant the live account capture recorded, kept verbatim so these pins run against a real far-future value.
+  const SUSPENDED_UNTIL = 1903928399;
+
+  function now(): number {
+
+    return Math.floor(Date.now() / 1000);
+  }
+
+  // The facts one refresh reports for the single covered zone: what the sensor says, and whether a suspension stands.
+  function facts(sensorStopped: boolean, suspendedUntil: number | null): HydrawiseControllerV2Facts {
+
+    return makeV2Facts({ zones: [[ 700001, { sensorStopped, suspendedUntil } ]] });
+  }
+
+  /* Drive a controller whose single zone is covered by a rain sensor and carries the sentinel, hand it a first facts snapshot, let a poll settle, then hand it a
+   * second and let another poll settle. The rain hint is refreshed in the poll walk, so a transition can only be observed after a poll that followed the facts.
+   */
+  async function driveFacts(first: HydrawiseControllerV2Facts, second: HydrawiseControllerV2Facts): Promise<string[]> {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([rainZone()], rainSensors), kind: "response" }),
+      signalAborted: false });
+
+    h.controller.applyFacts({ facts: first, fetchedAt: now() });
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+
+    const settled = h.retrieve.callsTo("statusschedule.php").length;
+
+    h.controller.applyFacts({ facts: second, fetchedAt: now() });
+
+    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > (settled + 1)) ? true : undefined);
+    h.abort();
+
+    return h.lines().map(line => util.format(line.message, ...line.args));
+  }
+
+  test("a suspension landing while the sensor is STILL tripped narrates no rain transition", async () => {
+
+    /* The soak's exact case, and the defect this fix exists for. The sensor does not change across the two snapshots - it reports itself tripped throughout - and
+     * only the suspension arrives. A hint derived from the classified state would see the zone flip from sensor-stopped to suspended and narrate that
+     * reclassification as the sensor allowing irrigation again, one minute after a suspension, while rain was still falling.
+     */
+    const lines = await driveFacts(facts(true, null), facts(true, SUSPENDED_UNTIL));
+
+    assert.equal(lines.filter(line => line.includes("Rain sensor is allowing irrigation")).length, 0,
+      "the sensor never changed, so no rain transition may be narrated");
+  });
+
+  test("a sensor that genuinely quiets narrates the transition even on a zone that is suspended", async () => {
+
+    /* The other direction, and the reason the fix reads the sensor rather than simply ignoring suspended zones. A suspension does not make a zone deaf to its
+     * sensor: when the rain actually stops, that is a real transition and the operator is told, whatever else is true of the zone.
+     */
+    const lines = await driveFacts(facts(true, SUSPENDED_UNTIL), facts(false, SUSPENDED_UNTIL));
+
+    assert.equal(lines.filter(line => line.includes("Rain sensor is allowing irrigation")).length, 1,
+      "a sensor that stops tripping is narrated even while the zone stays suspended");
+  });
+
+  test("a sensor that starts tripping narrates the stop on a zone that is already suspended", async () => {
+
+    // The same claim in the opposite direction, so neither edge of the transition is silently tied to the classification.
+    const lines = await driveFacts(facts(false, SUSPENDED_UNTIL), facts(true, SUSPENDED_UNTIL));
+
+    assert.equal(lines.filter(line => line.includes("Rain sensor is stopping irrigation")).length, 1,
+      "a sensor that begins tripping is narrated even while the zone stays suspended");
   });
 });

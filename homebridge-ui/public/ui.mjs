@@ -183,6 +183,10 @@ const isZoneScheduleStatus = (value) => {
 
       return (typeof value.durationSeconds === "number") && (typeof value.nextRunAt === "number");
 
+    case "suspended":
+
+      return typeof value.until === "number";
+
     case "sensor-stopped":
     case "unscheduled":
 
@@ -196,9 +200,11 @@ const isZoneScheduleStatus = (value) => {
 };
 
 // Validate a controller's persisted schedule projection. Like the identity checks, a malformed value counts as absent, so a corrupt cache renders an identity-only
-// panel rather than a panel that lies.
+// panel rather than a panel that lies. The controller's availability is optional - only an account-credentialed runtime records it - so absent and boolean both
+// pass and anything else fails.
 const isScheduleStatus = (value) => (typeof value === "object") && (value !== null) && (typeof value.activeWindowSeconds === "number") &&
-  (typeof value.asOf === "number") && Array.isArray(value.zones) && value.zones.every(isZoneScheduleStatus);
+  (typeof value.asOf === "number") && ((value.online === undefined) || (typeof value.online === "boolean")) && Array.isArray(value.zones) &&
+  value.zones.every(isZoneScheduleStatus);
 
 // Find the cached accessory that carries a controller's own identity, matched on the folded serial. The zone listing and the schedule ticker both have to locate
 // the same accessory, so the match lives here once rather than being re-derived at each read site.
@@ -452,23 +458,53 @@ const isController = (device) => device.kind === "controller";
  * synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name HomeKit shows the user and
  * so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
  */
-const cachedValveName = (accessory, relayId) => {
-
-  const service = accessory?.services?.find((entry) => (entry?.constructorName === "Valve") && (entry?.subtype === relayId.toString()));
+/* One non-empty string characteristic value off a serialized cached service, located by the constructor name Homebridge serializes alongside it. Every reader of
+ * the accessory cache below goes through here, so what counts as a usable value - present, a string, and not empty - is decided once rather than at each site.
+ */
+const cachedCharacteristic = (service, constructorName) => {
 
   if(!Array.isArray(service?.characteristics)) {
 
     return undefined;
   }
 
-  const nameValue = (constructorName) => {
+  const value = service.characteristics.find((characteristic) => characteristic?.constructorName === constructorName)?.value;
 
-    const value = service.characteristics.find((characteristic) => characteristic?.constructorName === constructorName)?.value;
+  return ((typeof value === "string") && value.length) ? value : undefined;
+};
 
-    return ((typeof value === "string") && value.length) ? value : undefined;
-  };
+const cachedValveName = (accessory, relayId) => {
 
-  return nameValue("ConfiguredName") ?? nameValue("Name");
+  const service = accessory?.services?.find((entry) => (entry?.constructorName === "Valve") && (entry?.subtype === relayId.toString()));
+
+  return cachedCharacteristic(service, "ConfiguredName") ?? cachedCharacteristic(service, "Name");
+};
+
+/* The firmware value Homebridge stamps on an accessory whose real version nothing has ever written. The runtime writes this same marker back whenever the account
+ * credentials are absent, which is what makes it the honest signal that no hardware facts have landed - mirrored here as a literal because this browser module
+ * cannot import the runtime's constants.
+ */
+const UNKNOWN_FIRMWARE = "0";
+
+/* The controller hardware HomeKit last showed, read from the cached AccessoryInformation service, or undefined when no real facts have landed.
+ *
+ * The pair is all-or-nothing on purpose. An unenriched controller still carries a model - the runtime stamps a product-line placeholder so the Home app never
+ * shows a library-internal string - so the model alone cannot say whether anything was learned. The firmware can: it holds the unknown marker until a real
+ * account answer replaces it. So the firmware decides, and the two render together or not at all, which is what keeps the strip from pairing a real model with an
+ * empty firmware cell.
+ */
+const cachedControllerHardware = (accessory) => {
+
+  const service = accessory?.services?.find((entry) => entry?.constructorName === "AccessoryInformation");
+  const firmware = cachedCharacteristic(service, "FirmwareRevision");
+  const model = cachedCharacteristic(service, "Model");
+
+  if(!firmware || (firmware === UNKNOWN_FIRMWARE) || !model) {
+
+    return undefined;
+  }
+
+  return { firmware, model };
 };
 
 /* Return the account's irrigation controllers for the two-level sidebar, with zero automatic cloud calls. We merge three sources into the session roster and return
@@ -733,7 +769,11 @@ const getDevices = async (controller, { config } = {}) => {
     ownerSerial: controller.serialNumber, relay: zone.relay, relayId: zone.relayId,
     scheduleMeta: schedule ? { activeWindowSeconds: schedule.activeWindowSeconds, asOf: schedule.asOf } : undefined,
     serialNumber: zone.relayId.toString(), zoneSchedule: schedule?.zones.find((entry) => entry.relayId === zone.relayId) }));
-  const controllerEntry = { kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
+  // The hardware HomeKit last showed for this controller, resolved from the same matched accessory everything else here reads. It is absent on an install that has
+  // never enriched, and the panel renders those cells only when it is present.
+  const hardware = cachedControllerHardware(matched);
+
+  const controllerEntry = { hardware, kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
     schedule: schedule ?? undefined, serialNumber: controller.serialNumber, sidebarGroup: "hidden", zoneCount: zoneRows.length,
     zoneNames: Object.fromEntries(zones.map((zone) => [ zone.relayId.toString(), displayNames.get(zone.relayId) ])) };
 
@@ -853,14 +893,49 @@ const renderDeviceDetails = ({ device, panel }) => {
 
   if(isController(device)) {
 
+    /* A controller renders as two lines inside one bordered box: an identity-and-state strip across the top, then whatever detail the schedule has to add. The
+     * framework's own status-grid modifier already expresses exactly that - it wraps the cells and sizes each to its own content - so the layout is composed from
+     * the shared classes rather than from new local CSS, and a full-width break element forces the split between the two lines.
+     *
+     * The hardware cells lead when real facts have landed and are absent otherwise, so an install running on the API key alone shows a shorter strip rather than
+     * placeholder cells that would claim knowledge the plugin does not have.
+     */
+    const controllerDisplay = deriveControllerDisplay(device.schedule, device.zoneNames, nowSeconds);
+
+    grid.classList.add("fo-status-grid");
+
+    if(device.hardware) {
+
+      grid.append(buildStatRow("Model", device.hardware.model, "stat-value"));
+    }
+
     grid.append(buildStatRow("Serial Number", device.serialNumber, "stat-value font-monospace"));
+
+    if(device.hardware) {
+
+      grid.append(buildStatRow("Firmware", device.hardware.firmware, "stat-value font-monospace"));
+    }
 
     if(device.zoneCount !== undefined) {
 
       grid.append(buildStatRow("Zones", device.zoneCount.toString(), "stat-value"));
     }
 
-    derived = deriveControllerDisplay(device.schedule, device.zoneNames, nowSeconds);
+    if(controllerDisplay.status !== null) {
+
+      grid.append(buildStatRow("Status", controllerDisplay.status, "stat-value"));
+    }
+
+    // The break closes the strip so the detail below starts its own line, even when the strip has room left over.
+    if(controllerDisplay.detail.length) {
+
+      const rowBreak = document.createElement("div");
+
+      rowBreak.className = "fo-row-break";
+      grid.append(rowBreak);
+    }
+
+    derived = { rows: controllerDisplay.detail, stale: controllerDisplay.stale };
   } else {
 
     grid.append(buildStatRow("Zone", (device.relay ?? "").toString(), "stat-value"),

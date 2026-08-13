@@ -2,8 +2,9 @@
  *
  * v2.test.ts: The Hydrawise v2 client, driven through an injected dispatcher so the token grant, the query, and every failure classification run the real
  * production code against recorded wire traffic and never touch the live account API. Covers token acquisition, lazy renewal, the reset a failed grant performs,
- * the single-flight guarantee two concurrent callers rest on, the hardware selection rules, the rate-budget draws, and the failure classifications - including the
- * one that matters most for a GraphQL endpoint, an HTTP 200 whose body carries an errors array.
+ * the single-flight guarantee two concurrent callers rest on, the selection the account query asks for, the facts composition rules - hardware, availability,
+ * per-zone suspension, and the sensor derivation - the rate-budget draws, and the failure classifications, including the one that matters most for a GraphQL
+ * endpoint, an HTTP 200 whose body carries an errors array.
  *
  * Every fixture body below is taken from the live probe captures under the arc's own capture set, so a wrong field mapping fails here rather than in the field.
  */
@@ -50,8 +51,28 @@ const CAPTURED_CONTROLLER = {
   name: "Home"
 };
 
-// The whole-account hardware answer, carrying the captured controller.
-const HARDWARE_BODY = { data: { me: { controllers: [CAPTURED_CONTROLLER] } } };
+/* The zone ids the live captures record, used verbatim so a correlation test is running against the real id space. The suspended one is the zone the 2026-08-09
+ * capture caught carrying a suspension while its siblings carried none.
+ */
+const SUSPENDED_ZONE_ID = 6940619;
+const QUIET_ZONE_ID = 6940181;
+
+// The far-future suspension instant the live capture recorded on that zone, kept exactly so the beyond-a-week rendering tiers are exercised against a real value.
+const SUSPENDED_UNTIL = 1903928399;
+
+// The zone block as the account query returns it: one zone under a suspension, one under none. The unsuspended zone answers a NULL suspendedUntil rather than
+// omitting the field, which is the shape the live capture records and the one that has to read as "not suspended" rather than as "unknown".
+const CAPTURED_ZONES = [ { id: QUIET_ZONE_ID, status: { suspendedUntil: null } },
+  { id: SUSPENDED_ZONE_ID, status: { suspendedUntil: { timestamp: SUSPENDED_UNTIL, value: "Wed, 01 May 30 23:59:59 -0500" } } } ];
+
+/* The sensor block as the live sensors capture records it, including the unread fields. The sensorType value is the live one - the owner's rain and freeze sensor
+ * reports LEVEL_CLOSED - so a filter that matched some other spelling would compose nothing here rather than passing against a fixture trimmed to the right answer.
+ */
+const CAPTURED_SENSORS = [{ id: 394649, model: { active: true, id: 3318, name: "Rain Sensor (normally closed wire)", sensorType: "LEVEL_CLOSED" },
+  name: "Hunter Rain Freeze Sensor", status: { active: true, waterFlow: null }, zones: [{ id: QUIET_ZONE_ID }] }];
+
+// The whole-account answer, carrying the captured controller with its zones, its sensors, and its reachability.
+const ACCOUNT_BODY = { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: CAPTURED_SENSORS, status: { online: true }, zones: CAPTURED_ZONES }] } } };
 
 /* An HTTP 200 carrying a GraphQL errors array, taken from the live status-query capture. This is the failure shape a status-code check alone cannot see: the
  * transport succeeded, and the query did not.
@@ -282,24 +303,163 @@ describe("HydrawiseV2Client grant body", () => {
   });
 });
 
-describe("HydrawiseV2Client hardware", () => {
+describe("HydrawiseV2Client account facts", () => {
 
-  test("parses the captured whole-account hardware into the persisted shape", async () => {
+  test("asks for every field the enrichment reads, and for none of the fields that answer with a server error", async () => {
+
+    let asked = "";
 
     const harness = makeV2Harness((agent, record) => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
-      programReply(agent, record, GRAPH_PATH, HARDWARE_BODY);
+
+      agent.get(V2_ORIGIN).intercept({ body: (body) => {
+
+        asked = (JSON.parse(body) as { query: string }).query;
+
+        return true;
+      }, method: "POST", path: GRAPH_PATH }).reply(200, (): object => {
+
+        record(GRAPH_PATH);
+
+        return ACCOUNT_BODY;
+      }).persist();
     });
 
-    const hardware = await harness.client.fetchHardware();
+    await harness.client.fetchAccountFacts();
 
-    assert.ok(hardware, "a successful query should answer a map");
-    assert.deepEqual([...hardware.keys()], [1058515], "the map is keyed on the id that matches the v1 controller, never on the sibling device id");
+    // Every selection the enrichment actually consumes, named individually so dropping one is a failure here rather than a field that silently reads as absent.
+    for(const selection of [ "id", "status { online }", "model { description }", "firmware { type version }", "suspendedUntil { timestamp }",
+      "model { sensorType }", "status { active }" ]) {
+
+      assert.ok(asked.includes(selection), "the account query asks for " + selection);
+    }
+
+    /* The two deliberate omissions, asserted as omissions. The sensor model's mode answers a 500 that nullifies the whole sensor entry, and a GraphQL error
+     * anywhere is reported against the entire response, so selecting it would cost the enrichment every fact rather than just that one.
+     *
+     * The mode check matches a whole FIELD rather than a substring, because "mode" sits inside "model" - which the selection legitimately asks for twice - and a
+     * substring test would fail against a perfectly correct query.
+     */
+    assert.ok(!(/\bmode\b/).test(asked), "the sensor mode that answers a server error is never selected");
+    assert.ok(!asked.includes("lastRun") && !asked.includes("nextRun"), "the unproven run fields are never selected");
+  });
+
+  test("parses the captured whole-account answer into the facts shape", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    const facts = await harness.client.fetchAccountFacts();
+
+    assert.ok(facts, "a successful query should answer a map");
+    assert.deepEqual([...facts.keys()], [1058515], "the map is keyed on the id that matches the v1 controller, never on the sibling device id");
+
+    const entry = facts.get(1058515);
 
     // The model is pinned to the DESCRIPTION, which is the full name a user recognizes. The capture carries the shorter name field beside it, so a mapping that
     // reached for that instead would answer "38 Zones" here.
-    assert.deepEqual(hardware.get(1058515), { firmware: "4.76", model: "HCC 38 Zones" }, "the captured controller composes its captured model and firmware");
+    assert.deepEqual(entry?.hardware, { firmware: "4.76", model: "HCC 38 Zones" }, "the captured controller composes its captured model and firmware");
+    assert.equal(entry?.online, true, "the captured controller reports itself reachable");
+
+    /* The per-zone facts land on their OWN ids, which is the correlation claim. The suspended zone carries its captured instant and the quiet one carries null,
+     * so a composer that keyed zones positionally, or that joined on the display number instead of the id, would swap these two.
+     */
+    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "the suspended zone carries its own suspension instant");
+    assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.suspendedUntil, null, "a zone answering a null suspension is not suspended");
+
+    // The covered zone is the one the sensor names, and the sensor reads tripped, so exactly that zone is sensor-stopped while its uncovered sibling is not.
+    assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "the zone the tripped sensor covers reads as stopped");
+    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.sensorStopped, false, "a zone no tripped sensor covers reads as not stopped, rather than as unknown");
+  });
+
+  test("a sensor reporting itself quiet composes a definite NOT-stopped rather than an unknown", async () => {
+
+    // The distinction this pin exists for: a live sensor that is not tripped is real evidence the zones it covers are not rain-stopped, and it has to reach the
+    // classifier as false so that the key-based group inference is retired rather than consulted.
+    const quiet = [{ ...CAPTURED_SENSORS[0], status: { active: false } }];
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH,
+        { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: quiet, status: { online: true }, zones: CAPTURED_ZONES }] } } });
+    });
+
+    const facts = await harness.client.fetchAccountFacts();
+
+    assert.equal(facts?.get(1058515)?.zones.get(QUIET_ZONE_ID)?.sensorStopped, false, "a quiet sensor answers false, not null");
+  });
+
+  test("two sensors covering one zone read as stopped when ANY of them is tripped", async () => {
+
+    /* The some-versus-every pin an all-single-sensor suite cannot see. One tripped sensor stops the zones it covers whatever its siblings report, so a composer
+     * written with `every` would answer false here and silently suppress a real rain stop on a controller with more than one sensor.
+     */
+    const mixed = [ { ...CAPTURED_SENSORS[0], status: { active: false } },
+      { ...CAPTURED_SENSORS[0], id: 394650, status: { active: true }, zones: [{ id: QUIET_ZONE_ID }] } ];
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH,
+        { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: mixed, status: { online: true }, zones: CAPTURED_ZONES }] } } });
+    });
+
+    const facts = await harness.client.fetchAccountFacts();
+
+    assert.equal(facts?.get(1058515)?.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "one tripped sensor is enough to stop the zone it covers");
+  });
+
+  test("an answer carrying no usable sensor leaves every zone's sensor state UNKNOWN", async () => {
+
+    /* Both ways an answer can carry no usable sensor, asserted together because they have to degrade identically: a controller reporting no sensors at all, and
+     * one reporting a sensor of a kind outside the level family. Either way the zones answer null, which is what routes them back to the key-based group
+     * inference rather than inventing a stop or denying one.
+     */
+    const unknownKind = [{ ...CAPTURED_SENSORS[0], model: { sensorType: "FLOW_METER" }, status: { active: true } }];
+
+    for(const sensors of [ [], unknownKind ]) {
+
+      const harness = makeV2Harness((agent, record) => {
+
+        programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+        programReply(agent, record, GRAPH_PATH,
+          { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors, status: { online: true }, zones: CAPTURED_ZONES }] } } });
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const facts = await harness.client.fetchAccountFacts();
+
+      assert.equal(facts?.get(1058515)?.zones.get(QUIET_ZONE_ID)?.sensorStopped, null, "a sensor answer this plugin cannot read composes an unknown");
+    }
+  });
+
+  test("an unreachable controller composes a FALSE availability, not an absent one", async () => {
+
+    // Both polarities are fixtured, because a one-value fixture cannot catch a read that inverted the field or that hardcoded the answer.
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH,
+        { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: CAPTURED_SENSORS, status: { online: false }, zones: CAPTURED_ZONES }] } } });
+    });
+
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.online, false, "an offline controller reports itself offline");
+  });
+
+  test("a controller answering no status block at all reports an unknown availability", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, zones: CAPTURED_ZONES }] } } });
+    });
+
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.online, null, "an absent availability is unknown rather than reachable");
   });
 
   test("selects the controller's own firmware entry rather than the first one in the list", async () => {
@@ -316,12 +476,14 @@ describe("HydrawiseV2Client hardware", () => {
       programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [multiEntry] } } });
     });
 
-    assert.equal((await harness.client.fetchHardware())?.get(1058515)?.firmware, "4.76", "the entry whose type names the controller is the one selected");
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.hardware?.firmware, "4.76",
+      "the entry whose type names the controller is the one selected");
   });
 
-  test("a controller with no controller-firmware entry is left unenriched", async () => {
+  test("a controller with no controller-firmware entry composes no hardware, while its other facts still land", async () => {
 
-    const noController = { ...CAPTURED_CONTROLLER, hardware: { ...CAPTURED_CONTROLLER.hardware, firmware: [{ type: "adapter", version: "1.40" }] } };
+    const noController = { ...CAPTURED_CONTROLLER, hardware: { ...CAPTURED_CONTROLLER.hardware, firmware: [{ type: "adapter", version: "1.40" }] },
+      status: { online: true }, zones: CAPTURED_ZONES };
 
     const harness = makeV2Harness((agent, record) => {
 
@@ -329,13 +491,17 @@ describe("HydrawiseV2Client hardware", () => {
       programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [noController] } } });
     });
 
-    const hardware = await harness.client.fetchHardware();
+    const entry = (await harness.client.fetchAccountFacts())?.get(1058515);
 
-    // A successful query that composed nothing is an EMPTY map rather than a null, so the caller can still tell it apart from a query that failed.
-    assert.deepEqual(hardware && [...hardware.keys()], [], "a partial hardware block composes nothing rather than half a shape");
+    /* Each fact carries its own absence rather than one incomplete field withholding the entry. A half-populated hardware shape would put a real model beside an
+     * empty firmware in HomeKit, so it composes nothing at all - but the suspension and availability facts on the same controller are unaffected.
+     */
+    assert.equal(entry?.hardware, null, "a partial hardware block composes nothing rather than half a shape");
+    assert.equal(entry?.online, true, "the controller's other facts are untouched by its incomplete hardware");
+    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "and so are its zones");
   });
 
-  test("a controller with no model description is left unenriched", async () => {
+  test("a controller with no model description composes no hardware", async () => {
 
     const noModel = { ...CAPTURED_CONTROLLER, hardware: { ...CAPTURED_CONTROLLER.hardware, model: { name: "38 Zones" } } };
 
@@ -345,9 +511,37 @@ describe("HydrawiseV2Client hardware", () => {
       programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [noModel] } } });
     });
 
-    const hardware = await harness.client.fetchHardware();
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.hardware, null, "a hardware block carrying no description composes nothing");
+  });
 
-    assert.deepEqual(hardware && [...hardware.keys()], [], "a hardware block carrying no description composes nothing");
+  test("a controller the answer cannot correlate is skipped entirely", async () => {
+
+    // Without an id there is no way to say which v1 controller these facts belong to, and guessing would enrich the wrong accessory.
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [{ hardware: CAPTURED_CONTROLLER.hardware, status: { online: true } }] } } });
+    });
+
+    const facts = await harness.client.fetchAccountFacts();
+
+    // A successful query that composed nothing is an EMPTY map rather than a null, so the caller can still tell it apart from a query that failed.
+    assert.deepEqual(facts && [...facts.keys()], [], "a controller carrying no correlation id contributes no entry");
+  });
+
+  test("a zone the answer cannot correlate is skipped, leaving its siblings intact", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER,
+        zones: [ { status: { suspendedUntil: null } }, ...CAPTURED_ZONES ] }] } } });
+    });
+
+    const entry = (await harness.client.fetchAccountFacts())?.get(1058515);
+
+    assert.equal(entry?.zones.size, 2, "the zone with no id contributes no entry");
+    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "its correlatable siblings compose exactly as they would have");
   });
 
   test("a query draws the rate budget BEFORE it reaches the wire, on top of the grant's own draw", async () => {
@@ -355,10 +549,10 @@ describe("HydrawiseV2Client hardware", () => {
     const harness = makeV2Harness((agent, record) => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
-      programReply(agent, record, GRAPH_PATH, HARDWARE_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
     });
 
-    await harness.client.fetchHardware();
+    await harness.client.fetchAccountFacts();
 
     /* Two calls, two slots, and the ORDER is what the paths record: the query draws its slot first, then the token grant it triggers draws a second, and only then
      * does the grant reach the wire. Reading the slot count at each dispatch is what catches a draw that was dispatched instead of awaited.
@@ -383,7 +577,7 @@ describe("HydrawiseV2Client failure classification", () => {
 
     // The transport succeeded and the query did not. A classification that read the status alone would hand the caller the body's empty controller list as though
     // it were an answer, and every controller would be quietly left unenriched with nothing reported.
-    assert.equal(await harness.client.fetchHardware(), null, "a body-level errors array classifies as a failed query");
+    assert.equal(await harness.client.fetchAccountFacts(), null, "a body-level errors array classifies as a failed query");
     assert.ok(harness.lines().some(line => (line.level === "error") && String(line.args[0]).includes("Internal server error")),
       "the reported failure names what the API said was wrong");
   });
@@ -396,7 +590,7 @@ describe("HydrawiseV2Client failure classification", () => {
       programReply(agent, record, GRAPH_PATH, { message: "Too Many Requests" }, 429);
     });
 
-    assert.equal(await harness.client.fetchHardware(), null, "a throttled query answers null rather than a partial result");
+    assert.equal(await harness.client.fetchAccountFacts(), null, "a throttled query answers null rather than a partial result");
   });
 
   test("a failed grant leaves the query unattempted", async () => {
@@ -404,10 +598,10 @@ describe("HydrawiseV2Client failure classification", () => {
     const harness = makeV2Harness((agent, record) => {
 
       programReply(agent, record, TOKEN_PATH, { error: "invalid_grant" }, 401);
-      programReply(agent, record, GRAPH_PATH, HARDWARE_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
     });
 
-    assert.equal(await harness.client.fetchHardware(), null, "a query with no token to present answers null");
+    assert.equal(await harness.client.fetchAccountFacts(), null, "a query with no token to present answers null");
     assert.deepEqual(harness.calls.map(call => call.path), [TOKEN_PATH], "the query never reached the wire without a token");
   });
 
@@ -423,7 +617,7 @@ describe("HydrawiseV2Client failure classification", () => {
       agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH }).replyWithError(new Error("socket hang up"));
     });
 
-    assert.equal(await harness.client.fetchHardware(), null, "a thrown transport failure answers the same null every recoverable failure does");
+    assert.equal(await harness.client.fetchAccountFacts(), null, "a thrown transport failure answers the same null every recoverable failure does");
 
     const reported = harness.lines().filter(line => line.level === "error");
 
@@ -446,11 +640,11 @@ describe("HydrawiseV2Client failure classification", () => {
         return TOKEN_BODY;
       }).persist();
 
-      programReply(agent, record, GRAPH_PATH, HARDWARE_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
     }, { signal: controller.signal });
 
     // Aborting mid-flight is orderly teardown rather than a fault, so it answers the same quiet null every other recoverable failure does and logs nothing at all.
-    const result = await harness.client.fetchHardware();
+    const result = await harness.client.fetchAccountFacts();
 
     assert.equal(result, null, "a shutdown reached mid-request answers null");
     assert.equal(harness.lines().filter(line => line.level === "error").length, 0, "a shutdown is not an error and reports nothing");

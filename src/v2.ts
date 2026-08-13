@@ -5,21 +5,28 @@
 import { HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT,
   HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseControllerHardware, HydrawiseV2AccountHardware, HydrawiseV2GraphResponse, HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2GraphResponse, HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
 import { Pool, request } from "undici";
 import type { Dispatcher } from "undici";
 import { composeSignals } from "homebridge-plugin-utils";
-import { controllerHardware } from "./types.ts";
+import { controllerV2Facts } from "./types.ts";
 import util from "node:util";
 
-/* The whole-account hardware query, stated once. It asks for every controller on the account in ONE request, which is what lets the platform fetch a single time
- * and hand each controller its own facts: the v2 ceiling is measured in single digits per half hour, so a query per controller would spend an account's whole
- * budget on a multi-controller install before it enriched anything.
+/* The whole-account query, stated once. It asks for every controller on the account in ONE request, which is what lets the platform fetch a single time and hand
+ * each controller its own facts: the v2 ceiling is measured in single digits per half hour, so a query per controller would spend an account's whole budget on a
+ * multi-controller install before it enriched anything. It feeds the recurring refresh, with the hardware fields riding along on the same call rather than
+ * spending one of their own.
  *
- * The selection is deliberately narrow - the correlation id, the model description, and the firmware list - because every field asked for is a field that can fail.
- * Neighboring fields on this same type answer with a server-side error, and a GraphQL error anywhere in a selection is reported against the whole response.
+ * The selection is deliberately narrow, because every field asked for is a field that can fail: neighboring fields on these same types answer with a server-side
+ * error, and a GraphQL error anywhere in a selection is reported against the whole response. Two omissions rest on probe evidence rather than caution - the
+ * sensor model's `mode`, which answers a 500 and nullifies the sensor entry carrying it, and the zone status's `lastRun` and `nextRun`, which went unproven
+ * against the live endpoint and which the key-based wire already answers.
+ *
+ * suspendedUntil is a DateTime object rather than a scalar, so it takes a subselection; its timestamp is the absolute instant a suspension lifts. Availability
+ * is read from the controller's nested status block, leaving the flat sibling field of the same name unread.
  */
-const HARDWARE_QUERY = "query { me { controllers { id hardware { model { description } firmware { type version } } } } }";
+const ACCOUNT_QUERY = "query { me { controllers { id status { online } hardware { model { description } firmware { type version } } " +
+  "zones { id status { suspendedUntil { timestamp } } } sensors { model { sensorType } status { active } zones { id } } } } }";
 
 /* Construction options for the v2 client.
  *
@@ -118,36 +125,35 @@ export class HydrawiseV2Client {
     return pending;
   }
 
-  /* Fetch every controller's hardware for the whole account in one query, keyed by the id that correlates a v2 controller to the v1 controller this plugin
-   * discovered. A controller whose wire hardware is incomplete is simply absent from the map rather than present carrying half its facts.
+  /* Fetch the whole account's facts in one query, keyed by the id that correlates a v2 controller to the v1 controller this plugin discovered. A controller the
+   * answer names without an id cannot be correlated to anything, so it is skipped; every other controller gets an entry, with each individual fact carrying its
+   * own absence rather than the whole entry being withheld for one missing field.
    *
    * A null answer is a failed query. An empty map is a successful query that found nothing to enrich, and the two are deliberately tellable apart: the caller
-   * leaves every placeholder standing either way, but only one of them is worth reporting.
+   * leaves every display standing either way, but only one of them is worth reporting.
    */
-  public async fetchHardware(): Promise<Nullable<Map<number, HydrawiseControllerHardware>>> {
+  public async fetchAccountFacts(): Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>> {
 
-    const account = await this.graph<HydrawiseV2AccountHardware>(HARDWARE_QUERY);
+    const account = await this.graph<HydrawiseV2Account>(ACCOUNT_QUERY);
 
     if(!account) {
 
       return null;
     }
 
-    const hardware = new Map<number, HydrawiseControllerHardware>();
+    const facts = new Map<number, HydrawiseControllerV2Facts>();
 
     for(const controller of account.me?.controllers ?? []) {
 
-      const composed = controllerHardware(controller.hardware);
-
-      if((controller.id === undefined) || !composed) {
+      if(controller.id === undefined) {
 
         continue;
       }
 
-      hardware.set(controller.id, composed);
+      facts.set(controller.id, controllerV2Facts(controller));
     }
 
-    return hardware;
+    return facts;
   }
 
   /* Execute one GraphQL query and answer its data, or null on any failure. The ordering here is the contract: the rate budget is drawn FIRST, ahead of the token

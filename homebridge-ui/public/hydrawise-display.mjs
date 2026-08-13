@@ -12,11 +12,13 @@
 /* The word each zone schedule state is shown as, in one place. The sidebar dot's tooltip, the zone panel's Status row, and the controller fold's own status all read
  * from here, so no two of those surfaces can describe the same state with different words.
  *
- * The unscheduled word claims exactly what the wire supports - no upcoming run - because a zone between schedule computations and a zone the owner suspended carry
- * identical bodies, and labeling either one "Suspended" would routinely misreport a healthy zone.
+ * The suspended word is shown only where the runtime actually claimed suspension, which it does only on an account-credentialed install: the key-based wire gives a
+ * suspended zone and a zone merely between runs identical bodies, so the runtime never guesses at the difference.
+ *
+ * The unscheduled word therefore claims exactly what remains - no upcoming run - and goes on covering a suspended zone wherever nothing could tell the two apart.
  */
 export const ZONE_STATE_LABELS = { running: "Running", scheduled: "Scheduled", "sensor-stopped": "Rain delay", "starting-soon": "Starting soon",
-  unscheduled: "Not scheduled" };
+  suspended: "Suspended", unscheduled: "Not scheduled" };
 
 /* How far in seconds a schedule instant may sit in the past before the display says so. A live runtime would have transitioned a zone whose next run or whose end
  * instant has passed, so an instant still standing well after it is evidence that nothing is polling. Ten nominal poll intervals is generous enough that a
@@ -36,10 +38,13 @@ export const formatMinutes = (seconds) => {
   return minutes.toString() + " minute" + ((minutes !== 1) ? "s" : "");
 };
 
-/* Render an absolute instant for a reader in THIS BROWSER's timezone: the clock time alone when it falls on the same calendar day as the render, and a short
- * weekday ahead of it otherwise, so a run later in the week reads unambiguously without spelling out a full date. The runtime's own log line renders the wire's
- * controller-local start string instead, so the two surfaces can legitimately differ for a user viewing from another timezone - the epoch is the truth and each
- * surface renders it honestly for its own reader.
+/* Render an absolute instant for a reader in THIS BROWSER's timezone, in three tiers: the clock time alone when it falls on the same calendar day as the render, a
+ * short weekday ahead of it within the coming week, and a locale date beyond that, where a weekday alone would name a day months away as though it were this one.
+ * The runtime's own log line renders the wire's controller-local start string instead, so the two surfaces can legitimately differ for a user viewing from another
+ * timezone - the epoch is the truth and each surface renders it honestly for its own reader.
+ *
+ * The third tier serves the suspension instant, which routinely sits years out, and it is an extension of this formatter rather than a sibling beside it: the
+ * first two tiers are already exactly what a suspension needs, and a second formatter restating them would split the display tier's one date policy in two.
  */
 export const formatRunTime = (epochSeconds, nowSeconds) => {
 
@@ -51,7 +56,12 @@ export const formatRunTime = (epochSeconds, nowSeconds) => {
     return clock;
   }
 
-  return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + clock;
+  if(Math.abs(epochSeconds - nowSeconds) < (7 * 24 * 60 * 60)) {
+
+    return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + clock;
+  }
+
+  return when.toLocaleDateString();
 };
 
 /* Classify one zone's persisted schedule entry into the display state it reads as - the one answer the sidebar dot and the zone panel both branch on, so a dot and
@@ -81,6 +91,10 @@ export const zoneScheduleState = (entry, meta, nowSeconds) => {
     case "sensor-stopped":
 
       return "sensor-stopped";
+
+    case "suspended":
+
+      return "suspended";
 
     default:
 
@@ -120,6 +134,12 @@ export const deriveZoneDisplay = (entry, meta, nowSeconds) => {
       return { rows: [ status, [ "Next Run", formatRunTime(entry.nextRunAt, nowSeconds) ], [ "Duration", formatMinutes(entry.durationSeconds) ] ],
         stale: (nowSeconds - entry.nextRunAt) > STALE_GRACE };
 
+    case "suspended":
+
+      // A suspension carries the instant it lifts, which routinely sits years out and so exercises the formatter's date tier. There is no staleness verdict here,
+      // mirroring the rain-delay arm: a suspension still standing is the state itself, not evidence that nothing is polling.
+      return { rows: [ status, [ "Until", formatRunTime(entry.until, nowSeconds) ] ], stale: false };
+
     default:
 
       // Rain delay and the unscheduled state carry no facts beyond the word itself, so the status row is the whole display and there is no instant to age against.
@@ -127,18 +147,22 @@ export const deriveZoneDisplay = (entry, meta, nowSeconds) => {
   }
 };
 
-/* Fold a controller's whole projection into its account-level rows: one word for what the controller is doing, the zones actually watering, and the next zone due.
- * This is a pure read of the same persisted entries the zone panels read, at the same shared instant, so the controller panel and its zones can never tell
- * different stories.
+/* Fold a controller's whole projection into two separate facts: ONE WORD for what the controller is doing, and the detail rows beneath it - the zones actually
+ * watering, and the next zone due. This is a pure read of the same persisted entries the zone panels read, at the same shared instant, so the controller panel and
+ * its zones can never tell different stories.
  *
- * A projection that is absent OR names no zone at all renders no schedule rows, deliberately: an account with no zones is not an account with nothing scheduled,
- * and folding an empty set to "Not scheduled" would say exactly that.
+ * The status word is handed back apart from the rows rather than as the first of them, because the two are presented differently: the word belongs in the panel's
+ * stat strip alongside the controller's identity, and the rows belong in the detail beneath it. Composing that layout is the renderer's job, so this tier answers
+ * with the facts and takes no view on where either one is drawn.
+ *
+ * A projection that is absent OR names no zone at all has no status to report and no rows to draw, deliberately: an account with no zones is not an account with
+ * nothing scheduled, and folding an empty set to "Not scheduled" would say exactly that.
  */
 export const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
 
   if(!schedule?.zones.length) {
 
-    return { rows: [], stale: false };
+    return { detail: [], stale: false, status: null };
   }
 
   const running = schedule.zones.filter((zone) => zone.state === "running").toSorted((a, b) => a.relayId - b.relayId);
@@ -146,40 +170,55 @@ export const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
   const soon = scheduled.filter((zone) => (zone.nextRunAt - nowSeconds) <= schedule.activeWindowSeconds);
   const nextUp = scheduled.reduce((earliest, zone) => (!earliest || (zone.nextRunAt < earliest.nextRunAt)) ? zone : earliest, null);
   const nameOf = (zone) => zoneNames?.[zone.relayId.toString()] ?? zone.relayId.toString();
-  const rows = [];
+  const detail = [];
 
-  /* The fold's own status word. Every arm but the first names a zone state and reads its word from the shared vocabulary, so a controller and the zones beneath it
-   * always use the same words; "Watering" is the fold's own summary of an account with water flowing, which no single zone state means, so it stays a word of its
-   * own.
+  /* The fold's own status word. Every arm that names a zone state reads its word from the shared vocabulary, so a controller and the zones beneath it always use
+   * the same words; "Offline" and "Watering" are the fold's own summaries - one of a controller Hydrawise cannot currently reach, the other of an account with
+   * water flowing - and neither is any single zone's state, so both stay words of their own.
+   *
+   * Reachability leads because it reframes everything under it: a schedule read off a controller that is not answering describes what WOULD happen, and saying so
+   * first is more honest than leading with a plan nothing is currently carrying out. It appears only where the projection carries the fact at all, which is only
+   * on an account-credentialed install.
+   *
+   * The suspended arm sits below the rain delay deliberately. Both are reasons irrigation is being held back, and an account with any zone rain-stopped has the
+   * more immediate one to report; an account that is simply suspended has no sensor-stopped zone at all, so it reaches its own word.
    */
-  if(running.length) {
+  let status;
 
-    rows.push([ "Status", "Watering" ]);
+  if(schedule.online === false) {
+
+    status = "Offline";
+  } else if(running.length) {
+
+    status = "Watering";
   } else if(soon.length) {
 
-    rows.push([ "Status", ZONE_STATE_LABELS["starting-soon"] ]);
+    status = ZONE_STATE_LABELS["starting-soon"];
   } else if(scheduled.length) {
 
-    rows.push([ "Status", ZONE_STATE_LABELS.scheduled ]);
+    status = ZONE_STATE_LABELS.scheduled;
   } else if(schedule.zones.some((zone) => zone.state === "sensor-stopped")) {
 
-    rows.push([ "Status", ZONE_STATE_LABELS["sensor-stopped"] ]);
+    status = ZONE_STATE_LABELS["sensor-stopped"];
+  } else if(schedule.zones.some((zone) => zone.state === "suspended")) {
+
+    status = ZONE_STATE_LABELS.suspended;
   } else {
 
-    rows.push([ "Status", ZONE_STATE_LABELS.unscheduled ]);
+    status = ZONE_STATE_LABELS.unscheduled;
   }
 
   // Every running zone is named, not just the first: the runtime genuinely runs zones concurrently, so a single-zone row would hide water that is flowing.
   if(running.length) {
 
-    rows.push([ "Now Running", running.map((zone) => nameOf(zone) + " (" + formatMinutes(zone.endsAt - nowSeconds) + ")").join(", ") ]);
+    detail.push([ "Now Running", running.map((zone) => nameOf(zone) + " (" + formatMinutes(zone.endsAt - nowSeconds) + ")").join(", ") ]);
   }
 
   if(nextUp) {
 
-    rows.push([ "Next Zone", nameOf(nextUp) + " at " + formatRunTime(nextUp.nextRunAt, nowSeconds) ]);
+    detail.push([ "Next Zone", nameOf(nextUp) + " at " + formatRunTime(nextUp.nextRunAt, nowSeconds) ]);
   }
 
-  return { rows, stale: schedule.zones.some((zone) => ((zone.state === "running") && ((nowSeconds - zone.endsAt) > STALE_GRACE)) ||
-    ((zone.state === "scheduled") && ((nowSeconds - zone.nextRunAt) > STALE_GRACE))) };
+  return { detail, stale: schedule.zones.some((zone) => ((zone.state === "running") && ((nowSeconds - zone.endsAt) > STALE_GRACE)) ||
+    ((zone.state === "scheduled") && ((nowSeconds - zone.nextRunAt) > STALE_GRACE))), status };
 };

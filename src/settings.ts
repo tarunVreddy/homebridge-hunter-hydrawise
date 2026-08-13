@@ -74,6 +74,19 @@ export const HYDRAWISE_V2_TIMEOUT = 15;
  */
 export const HYDRAWISE_V2_REFRESH_THRESHOLD = 300;
 
+/* How often, in seconds, the whole-account read that feeds the enhanced features runs. The arithmetic against the envelope above is what fixes the value: a
+ * fifteen-minute cadence spends two reads inside each thirty-minute budget window, which leaves the remaining slots of the five-call ceiling for the token grants
+ * those reads carry. A brisker cadence would buy fresher facts at the cost of the headroom that keeps this optional enrichment from ever crowding out the
+ * irrigation the account actually depends on.
+ */
+export const HYDRAWISE_V2_REFRESH_INTERVAL = 900;
+
+/* How long, in seconds, a snapshot of the account-credentialed facts stays trustworthy. It is derived from the cadence rather than restated as a literal of its
+ * own, so the two can never drift apart. Twice the cadence is the deliberate ratio: a single missed refresh never flips a consumer to its fallback, while a
+ * refresh loop that has genuinely stopped does, and every consumer returns to the answers an install without account credentials gives.
+ */
+export const HYDRAWISE_V2_FACTS_TTL = HYDRAWISE_V2_REFRESH_INTERVAL * 2;
+
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 

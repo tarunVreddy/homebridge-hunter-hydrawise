@@ -156,22 +156,62 @@ export interface HydrawiseV2HardwareBlock {
   model?: HydrawiseV2ModelBlock;
 }
 
-/* Hydrawise v2 API: one controller as the whole-account hardware query returns it. The id is the correlation key that matches a v2 controller to the v1 controller
- * this plugin discovered - the live capture shows it carrying the same number as v1's controller_id, while the sibling deviceId is a different number entirely, so
- * keying on deviceId would silently match nothing.
+/* Hydrawise v2 API: one zone as the account query returns it. The id is the correlation key that matches a v2 zone to the v1 zone this plugin polls - the live
+ * captures show the two carrying the same numbers one for one, the same agreement the controller id enjoys.
+ *
+ * suspendedUntil is a nullable DateTime OBJECT rather than a scalar, which is why the selection asks for its timestamp: a zone under no suspension answers null
+ * here, and a suspended zone answers the absolute instant its suspension lifts.
  */
-export interface HydrawiseV2ControllerHardware {
+export interface HydrawiseV2Zone {
+
+  id?: number;
+  status?: { suspendedUntil?: Nullable<{ timestamp?: number }> };
+}
+
+/* Hydrawise v2 API: one sensor as the account query returns it, typed to the three facts a rain-class stop is read from - what kind of sensor it is, whether it
+ * is tripped right now, and which zones it covers.
+ *
+ * The activity flag is what v1 cannot report at all. A v1 status body carries a sensor block naming the zones a sensor covers but nothing about whether that
+ * sensor is currently stopping them, which is the whole reason the v1 path has to infer a stop from the shape of the group it covers.
+ */
+export interface HydrawiseV2Sensor {
+
+  model?: { sensorType?: string };
+  status?: { active?: boolean };
+  zones?: { id?: number }[];
+}
+
+/* Hydrawise v2 API: one controller as the account query returns it. The id is the correlation key that matches a v2 controller to the v1 controller this plugin
+ * discovered - the live capture shows it carrying the same number as v1's controller_id, while the sibling deviceId is a different number entirely, so keying on
+ * deviceId would silently match nothing.
+ *
+ * The availability flag is read from the nested status block rather than the flat sibling field of the same name: both read true in every capture, and the
+ * nested one is the field the selection asks for.
+ */
+export interface HydrawiseV2Controller {
 
   hardware?: HydrawiseV2HardwareBlock;
   id?: number;
+  sensors?: HydrawiseV2Sensor[];
+  status?: { online?: boolean };
+  zones?: HydrawiseV2Zone[];
 }
 
-// Hydrawise v2 API: the data half of the whole-account hardware query. One query answers for every controller on the account, which is what lets the platform fetch
-// once and distribute rather than spending a call per controller against a budget measured in single digits.
-export interface HydrawiseV2AccountHardware {
+// Hydrawise v2 API: the data half of the whole-account query. One query answers for every controller on the account, which is what lets the platform fetch once
+// and distribute rather than spending a call per controller against a budget measured in single digits.
+export interface HydrawiseV2Account {
 
-  me?: { controllers?: HydrawiseV2ControllerHardware[] };
+  me?: { controllers?: HydrawiseV2Controller[] };
 }
+
+/* Hydrawise v2 API: the prefix marking the sensor kinds that report a level - the family a rain or freeze sensor belongs to, and the only family whose activity
+ * can stop a zone's irrigation. The live capture records the owner's rain and freeze sensor answering LEVEL_CLOSED, and the schema declares the field as an
+ * enumeration whose values it does not publish, so matching the family by its prefix is what keeps a sibling spelling from reading as an unknown kind.
+ *
+ * A sensor of any other kind, or one naming no kind at all, contributes no answer rather than a negative one. That is the deliberate degradation: an unknown
+ * sensor routes every zone it covers back to the v1 group inference, which is exactly the behavior an install without account credentials gets.
+ */
+export const HYDRAWISE_V2_LEVEL_SENSOR_PREFIX = "LEVEL_";
 
 // Hydrawise v2 API: the firmware list's `type` value naming the controller's own firmware, as opposed to the per-module versions the same hardware block reports
 // separately. The selection rule reads this constant, so the entry that counts as the controller's firmware is named in exactly one place.
@@ -212,6 +252,66 @@ export function controllerHardware(hardware: HydrawiseV2HardwareBlock | undefine
   }
 
   return { firmware, model };
+}
+
+/* What the account-credentialed API knows about a single zone that the key-based API cannot express: whether a rain-class sensor is stopping it right now, and
+ * the instant any suspension on it lifts.
+ *
+ * Both fields distinguish three answers rather than two, and the null arm is the one that carries the weight. A null sensorStopped means the account read
+ * carried no usable sensor answer for this zone, which routes the zone back to the v1 group inference; a false means the sensors are live and quiet, which
+ * retires that inference outright. Reading either as a plain boolean would turn "we do not know" into "it is not stopped" and silently suppress a real rain
+ * delay. suspendedUntil is an absolute epoch instant so it holds still between polls, and null simply means no suspension stands.
+ */
+export interface HydrawiseZoneV2Facts {
+
+  sensorStopped: Nullable<boolean>;
+  suspendedUntil: Nullable<number>;
+}
+
+/* What the account-credentialed API knows about a whole controller: its hardware, whether Hydrawise can currently reach it, and the per-zone facts above keyed
+ * by the zone id v1 and v2 agree about.
+ *
+ * This shape is IN MEMORY only, on the same terms and for the same reason as the hardware shape above. What gets persisted is the CLASSIFIED projection these
+ * facts feed, never the facts themselves - one store for a zone's state rather than two that eventually disagree about it.
+ */
+export interface HydrawiseControllerV2Facts {
+
+  hardware: Nullable<HydrawiseControllerHardware>;
+  online: Nullable<boolean>;
+  zones: Map<number, HydrawiseZoneV2Facts>;
+}
+
+/* Project one controller's wire answer onto the facts shape above. This is the one home for every selection rule the account query's richer body needs, so what
+ * "suspended", "sensor-stopped", and "reachable" mean is decided once rather than at each read site.
+ *
+ * The sensor derivation is the substantial half. Only level-class sensors are weighed, and only those actually reporting their activity as a boolean: a sensor
+ * of an unrecognized kind, or one whose activity the response did not carry, contributes nothing at all. With no such sensor in the answer every zone's
+ * sensorStopped is null, which hands the whole question back to the v1 group inference. With at least one, a zone reads true when SOME sensor covering it is
+ * tripped and false otherwise - some rather than every, because one tripped sensor stops the zones it covers whatever its siblings report, and an uncovered
+ * zone is honestly not stopped rather than unknown.
+ */
+export function controllerV2Facts(controller: HydrawiseV2Controller): HydrawiseControllerV2Facts {
+
+  const sensors = (controller.sensors ?? []).filter(sensor => sensor.model?.sensorType?.startsWith(HYDRAWISE_V2_LEVEL_SENSOR_PREFIX) &&
+    (typeof sensor.status?.active === "boolean"));
+  const zones = new Map<number, HydrawiseZoneV2Facts>();
+
+  for(const zone of controller.zones ?? []) {
+
+    if(zone.id === undefined) {
+
+      continue;
+    }
+
+    // A zone whose entry cannot be completed is deliberately omitted rather than entered as a blank: an absent entry reads as "unknown" everywhere downstream,
+    // where a present one is a real answer that clears or reasserts a zone's state.
+    const covering = sensors.filter(sensor => (sensor.zones ?? []).some(covered => covered.id === zone.id));
+
+    zones.set(zone.id, { sensorStopped: sensors.length ? covering.some(sensor => sensor.status?.active === true) : null,
+      suspendedUntil: zone.status?.suspendedUntil?.timestamp ?? null });
+  }
+
+  return { hardware: controllerHardware(controller.hardware), online: controller.status?.online ?? null, zones };
 }
 
 /* The v2 client's OAuth token state, as a discriminated union so the access token, its expiry, and any refresh in flight can never disagree with one another. One
@@ -311,13 +411,18 @@ export function sameZoneIdentity(a: HydrawiseZoneIdentity, b: HydrawiseZoneIdent
  * projection on every poll and defeat the change gate the flush discipline rests on. The stable fact is the instant the run ends; the remaining time is derived
  * from it at render.
  *
- * The unscheduled arm claims exactly what the wire supports: Hydrawise reports no upcoming run. A zone between schedule computations, a zone the owner suspended,
- * and a rain-stopped zone whose sensor evidence falls short all present that same shape, so the arm never claims suspension - only the absence of a scheduled run.
+ * The suspended arm is claimed only on account-credentialed evidence. The key-based wire gives a suspended zone, a zone between schedule computations, and a
+ * rain-stopped zone whose sensor evidence falls short one identical body, so nothing in it can support the claim; the account API answers per-zone suspension
+ * first-class, and this arm carries the instant that suspension lifts as an ABSOLUTE epoch second so it holds still poll after poll.
+ *
+ * The unscheduled arm therefore claims exactly what remains: Hydrawise reports no upcoming run, and no stronger reading of that silence is available. Without
+ * account credentials it goes on covering a suspended zone too, which is the honest answer when nothing can tell the two apart.
  */
 export type HydrawiseZoneScheduleStatus =
   { endsAt: number; relayId: number; state: "running" } |
   { durationSeconds: number; nextRunAt: number; relayId: number; state: "scheduled" } |
   { relayId: number; state: "sensor-stopped" } |
+  { relayId: number; state: "suspended"; until: number } |
   { relayId: number; state: "unscheduled" };
 
 // The schedule-state vocabulary, derived from the union's own arms rather than written out a second time, so the two can never disagree about which states exist.
@@ -332,6 +437,7 @@ export interface HydrawiseScheduleStatus {
 
   activeWindowSeconds: number;
   asOf: number;
+  online?: boolean;
   zones: HydrawiseZoneScheduleStatus[];
 }
 
@@ -371,20 +477,64 @@ export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, status: StatusS
       .every(member => carriesUnscheduledSentinel(member)));
 }
 
-/* Project a wire zone onto its persisted schedule state. The precedence is what makes the classification total and unambiguous: a rain-sensor stop is tested first,
- * because it and the plain unscheduled shape carry the same sentinel and the sensor block read against its own group's evident state is what tells them apart; then
- * a running zone, whose `time` of 1 is the wire's running marker and whose end instant is the root time plus the seconds of run remaining; then the unscheduled
- * shape; and everything else is scheduled, its next run being the root time plus the seconds the wire reports until it.
+/* Project a wire zone onto its persisted schedule state, through exactly four ordered exits.
  *
- * Both time-bearing arms store ABSOLUTE epoch seconds, and that is what makes the projection stable across polls: the wire's countdowns fall as the poll clock
+ * The FIRST exit owns the ambiguous shape and is the only one the account-credentialed facts reach. A zone carrying the unscheduled sentinel with no run and no
+ * schedule string is the one body the key-based wire cannot read further, so this is where a suspension, a rain stop, and a plain absence of scheduling are told
+ * apart. A suspension the facts report wins outright, then a suspension carried forward from the prior projection, then a sensor stop - the facts' own live
+ * reading where they carry one, the group inference where they do not - and an unscheduled zone is what remains. A positive "the sensors are quiet" answer is
+ * deliberately NOT followed by the group inference: the account API has looked at the sensor itself, which is better evidence than reading the shape of a group.
+ *
+ * Suspension outranks the sensor claim because it is the longer-lived, user-created fact; the sensor's claim returns on its own the moment the suspension clears.
+ *
+ * The remaining exits are the wire's own unambiguous readings: a `time` of 1 is the running marker, whose end instant is the root time plus the seconds of run
+ * remaining; the sentinel reached HERE still carries a run or a schedule string, so it is simply unscheduled; and everything else is scheduled, its next run
+ * being the root time plus the seconds the wire reports until it. Hoisting the sentinel shape above the running test changes no classification, because a
+ * running zone always carries a run and so never presents that shape.
+ *
+ * Every time-bearing arm stores ABSOLUTE epoch seconds, and that is what makes the projection stable across polls: the wire's countdowns fall as the poll clock
  * rises, so each sum holds still until the schedule genuinely moves. Storing the countdowns themselves would move every field on every poll and turn each poll into
  * a cache write.
+ *
+ * With neither facts nor a carried suspension the whole path collapses to the key-based classification, which is what keeps an install without account
+ * credentials reading exactly as it always has.
  */
-export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse): HydrawiseZoneScheduleStatus {
+export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse, facts?: HydrawiseZoneV2Facts, priorSuspendedUntil?: number):
+HydrawiseZoneScheduleStatus {
 
-  if(isZoneStoppedBySensor(zone, status)) {
+  if(carriesUnscheduledSentinel(zone)) {
 
-    return { relayId: zone.relay_id, state: "sensor-stopped" };
+    const suspendedUntil = facts?.suspendedUntil;
+
+    // Both absences are excluded explicitly: an undefined means no facts entry reached this zone at all, and a null means the entry reached it and reported no
+    // suspension. Only a real instant claims the arm, so a zone suspended until epoch zero still classifies as suspended.
+    if((suspendedUntil !== undefined) && (suspendedUntil !== null)) {
+
+      return { relayId: zone.relay_id, state: "suspended", until: suspendedUntil };
+    }
+
+    /* A suspension the caller carried forward stands while nothing contradicts it. The comparison is against the WIRE clock rather than a local read, which keeps
+     * this classification pure and lets an elapsed suspension expire out of the carry on its own. The carried instant is passed through verbatim, never
+     * recomputed, so a carried arm stays byte-identical poll after poll and never provokes a cache write.
+     */
+    if((priorSuspendedUntil !== undefined) && (priorSuspendedUntil > status.time)) {
+
+      return { relayId: zone.relay_id, state: "suspended", until: priorSuspendedUntil };
+    }
+
+    /* The sensor question, asked of the better witness first. A live reading that the sensors are TRIPPED settles it; a live reading that they are QUIET retires
+     * the group inference outright, because looking at the sensor itself beats reading the shape of the group it covers; and only the absence of any reading -
+     * no facts entry, or an entry whose sensors could not be interpreted - falls back to that inference.
+     */
+    const sensorStopped = facts?.sensorStopped;
+    const sensorUnknown = (sensorStopped === undefined) || (sensorStopped === null);
+
+    if((sensorStopped === true) || (sensorUnknown && isZoneStoppedBySensor(zone, status))) {
+
+      return { relayId: zone.relay_id, state: "sensor-stopped" };
+    }
+
+    return { relayId: zone.relay_id, state: "unscheduled" };
   }
 
   if(zone.time === 1) {
@@ -400,12 +550,49 @@ export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusSche
   return { durationSeconds: zone.run, nextRunAt: status.time + zone.time, relayId: zone.relay_id, state: "scheduled" };
 }
 
-// Project a whole status body onto the persisted schedule shape, ordering the zones by relay exactly as the identity roster orders its own, so a field-wise
-// comparison never reports a difference that the wire's own ordering alone produced. The active window is passed in rather than read here, keeping this module free
-// of any dependency inside the repo, and it rides along in the result so every consumer classifies against the same threshold the runtime used.
-export function scheduleStatus(status: StatusScheduleResponse, activeWindowSeconds: number): HydrawiseScheduleStatus {
+/* The account-credentialed inputs a whole-controller projection can be composed with: the facts one refresh reported, and the suspension instants carried
+ * forward from the prior projection for the zones this refresh has nothing to say about.
+ *
+ * They travel as one options argument because they are one decision - how much the account API contributes to this pass - and because a caller that has neither
+ * omits the argument entirely, which is precisely the shape an install without credentials takes.
+ */
+export interface HydrawiseScheduleStatusOptions {
 
-  return { activeWindowSeconds, asOf: status.time, zones: status.relays.toSorted((a, b) => a.relay - b.relay).map(zone => zoneScheduleStatus(zone, status)) };
+  facts?: HydrawiseControllerV2Facts;
+  priorSuspended?: Map<number, number>;
+}
+
+/* Project a whole status body onto the persisted schedule shape, ordering the zones by relay exactly as the identity roster orders its own, so a field-wise
+ * comparison never reports a difference that the wire's own ordering alone produced. The active window is passed in rather than read here, keeping this module free
+ * of any dependency inside the repo, and it rides along in the result so every consumer classifies against the same threshold the runtime used.
+ *
+ * The carry is decided PER ZONE, and the rule is that only a PRESENT facts entry speaks for a zone. An entry that reached this zone reasserts or clears its
+ * suspension - a null suspendedUntil being a real answer, not an absence - while a zone the facts simply do not name keeps whatever the prior projection said.
+ * Judging the carry account-wide instead would let one zone's fresh answer silently clear a sibling the same answer never covered.
+ *
+ * The controller's availability is stamped only when fresh facts actually carried one, so the persisted shape of an install without account credentials is
+ * byte-identical to what it has always been.
+ */
+export function scheduleStatus(status: StatusScheduleResponse, activeWindowSeconds: number, options: HydrawiseScheduleStatusOptions = {}):
+HydrawiseScheduleStatus {
+
+  const { facts, priorSuspended } = options;
+
+  const projection: HydrawiseScheduleStatus = { activeWindowSeconds, asOf: status.time,
+
+    zones: status.relays.toSorted((a, b) => a.relay - b.relay).map(zone => {
+
+      const zoneFacts = facts?.zones.get(zone.relay_id);
+
+      return zoneScheduleStatus(zone, status, zoneFacts, zoneFacts ? undefined : priorSuspended?.get(zone.relay_id));
+    }) };
+
+  if(facts && (facts.online !== null)) {
+
+    projection.online = facts.online;
+  }
+
+  return projection;
 }
 
 // Validate a persisted zone schedule status read back from the accessory cache, with the identity guards' rigor: the state must be one of the states the union
@@ -418,7 +605,7 @@ export function isZoneScheduleStatus(value: unknown): value is HydrawiseZoneSche
     return false;
   }
 
-  const candidate = value as { durationSeconds?: unknown; endsAt?: unknown; nextRunAt?: unknown; state?: unknown };
+  const candidate = value as { durationSeconds?: unknown; endsAt?: unknown; nextRunAt?: unknown; state?: unknown; until?: unknown };
 
   switch(candidate.state) {
 
@@ -429,6 +616,10 @@ export function isZoneScheduleStatus(value: unknown): value is HydrawiseZoneSche
     case "scheduled":
 
       return (typeof candidate.durationSeconds === "number") && (typeof candidate.nextRunAt === "number");
+
+    case "suspended":
+
+      return typeof candidate.until === "number";
 
     case "sensor-stopped":
     case "unscheduled":
@@ -443,12 +634,15 @@ export function isZoneScheduleStatus(value: unknown): value is HydrawiseZoneSche
 }
 
 // Validate a persisted controller schedule projection, for the same reason and with the same rigor as the identity guards: a malformed value counts as absent, so a
-// corrupt cache entry is classified rather than trusted. Every zone entry is checked, because one bad entry is enough to make a rendered panel lie.
+// corrupt cache entry is classified rather than trusted. Every zone entry is checked, because one bad entry is enough to make a rendered panel lie. Availability is
+// optional, so absent and boolean both pass and anything else fails - a projection written without account credentials simply never carries it.
 export function isScheduleStatus(value: unknown): value is HydrawiseScheduleStatus {
 
+  const online = (value as HydrawiseScheduleStatus | null)?.online;
+
   return (typeof value === "object") && (value !== null) && (typeof (value as HydrawiseScheduleStatus).activeWindowSeconds === "number") &&
-    (typeof (value as HydrawiseScheduleStatus).asOf === "number") && Array.isArray((value as HydrawiseScheduleStatus).zones) &&
-    (value as HydrawiseScheduleStatus).zones.every(entry => isZoneScheduleStatus(entry));
+    (typeof (value as HydrawiseScheduleStatus).asOf === "number") && ((online === undefined) || (typeof online === "boolean")) &&
+    Array.isArray((value as HydrawiseScheduleStatus).zones) && (value as HydrawiseScheduleStatus).zones.every(entry => isZoneScheduleStatus(entry));
 }
 
 // Compare two arrays entry by entry, delegating each pair to a caller-supplied field-wise comparison. Both persisted projections are relay-ordered arrays compared
@@ -481,8 +675,12 @@ export function sameEntries<T>(a: T[], b: T[], same: (x: T, y: T) => boolean): b
 // cache on every poll - the exact cost this projection's absolute-time shape exists to avoid.
 type ComparedScheduleFields = Omit<HydrawiseScheduleStatus, "asOf">;
 
-// Compare two zone schedule statuses: the state first, since two entries in different states never match, and then the facts that state's arm carries. The switch
-// narrows each arm, so each comparison names exactly the fields that exist in it.
+/* Compare two zone schedule statuses: the state first, since two entries in different states never match, and then the facts that state's arm carries. The switch
+ * narrows each arm, so each comparison names exactly the fields that exist in it.
+ *
+ * Every state is named and there is no default arm, deliberately. A state added to the union then surfaces here as a compile error rather than falling into a
+ * state-only comparison that would silently ignore whatever facts the new arm carries - and an ignored fact is a change the flush gate never sees.
+ */
 export function sameZoneScheduleStatus(a: HydrawiseZoneScheduleStatus, b: HydrawiseZoneScheduleStatus): boolean {
 
   if(a.relayId !== b.relayId) {
@@ -500,19 +698,25 @@ export function sameZoneScheduleStatus(a: HydrawiseZoneScheduleStatus, b: Hydraw
 
       return (b.state === "scheduled") && (a.durationSeconds === b.durationSeconds) && (a.nextRunAt === b.nextRunAt);
 
-    default:
+    case "suspended":
 
-      // The remaining states carry no facts of their own, so agreeing on the state is the whole comparison.
+      return (b.state === "suspended") && (a.until === b.until);
+
+    case "sensor-stopped":
+    case "unscheduled":
+
+      // These states carry no facts of their own, so agreeing on the state is the whole comparison.
       return a.state === b.state;
   }
 }
 
-// Compare two schedule projections over the compared surface named above: the self-describing window, and the zone entries through the shared walk. Never by
-// reference, for the same reason the identity comparisons are field-wise - the projection is rebuilt fresh every poll, so a reference check would report every poll
-// as a change.
+// Compare two schedule projections over the compared surface named above: the self-describing window, the controller's availability, and the zone entries through
+// the shared walk. Never by reference, for the same reason the identity comparisons are field-wise - the projection is rebuilt fresh every poll, so a reference
+// check would report every poll as a change. Availability is compared rather than excluded because a controller falling off the network and coming back is a real
+// transition the persisted facts should record, not incidental churn.
 export function sameScheduleStatus(a: ComparedScheduleFields, b: ComparedScheduleFields): boolean {
 
-  return (a.activeWindowSeconds === b.activeWindowSeconds) && sameEntries(a.zones, b.zones, sameZoneScheduleStatus);
+  return (a.activeWindowSeconds === b.activeWindowSeconds) && (a.online === b.online) && sameEntries(a.zones, b.zones, sameZoneScheduleStatus);
 }
 
 /* The typed HomeKit accessory context this plugin persists on every accessory it owns. Homebridge round-trips this object verbatim through its on-disk cache, so it

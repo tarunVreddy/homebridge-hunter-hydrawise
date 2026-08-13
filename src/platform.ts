@@ -3,13 +3,13 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, guardedDispatch, loopFaultReporter, retry, sanitizeName,
+import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName,
   superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_ZONE_ACCESSORY_CATEGORY,
-  HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL,
+  HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
@@ -19,6 +19,7 @@ import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
+import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
@@ -51,11 +52,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    */
   private readonly teardown = new DisposableStack();
 
-  /* Whether the one-shot whole-account hardware enrichment has been dispatched. Discovery is re-enterable - a second DID_FINISH_LAUNCHING runs it again, and the
-   * supervisor can re-enter it - while the hardware a controller reports is static, so the query is worth spending exactly once for the life of the plugin. The
-   * flag is raised before the dispatch rather than after it, so a re-entry while the first fetch is still in flight cannot fire a second.
+  /* Whether the recurring account-credentialed refresh loop has been started. Discovery is re-enterable - a second DID_FINISH_LAUNCHING runs it again, and the
+   * supervisor can re-enter it - while the loop it starts runs for the life of the plugin, so exactly one is ever wanted. The flag is raised before the loop is
+   * dispatched rather than after it, so a re-entry arriving while the first tick is still in flight cannot start a second.
    */
-  private hardwareEnriched = false;
+  private v2RefreshStarted = false;
+
+  /* Whether the account-credentialed API has answered successfully at least once this session. It gates a single connection line, which is the account tier's
+   * counterpart to the key-based one discovery logs: the constructor's line says the credentials were CONFIGURED, and this one says they actually work. Reporting
+   * it on the first successful answer rather than at construction is what makes it a connection report instead of a restatement of the configuration.
+   */
+  private v2Connected = false;
 
   /* The wire-absence grace state behind reconcileZoneAccessories, keyed by zone-accessory UUID and holding that accessory's count of consecutive polls whose report
    * omitted its zone. It lives in memory only and is deliberately not persisted: a restart clears it, which errs toward RETAINING a HomeKit identity the user
@@ -215,7 +222,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       }
     }, { attempts: Infinity, backoff: (): number => HYDRAWISE_API_RETRY_INTERVAL * 1000, signal: this.signal });
 
-    this.log.info("Successfully connected to the Hydrawise API.");
+    this.log.info("Successfully connected to the Hydrawise API using your API key.");
 
     this.log.debug(util.inspect(this.account, { colors: true, depth: null, sorted: true }));
 
@@ -233,9 +240,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.configureController(controller, roster);
     }
 
-    // Enrich what HomeKit shows for each controller, if the user has configured the account credentials that make it possible. Every controller is already built by
-    // this point, so the enrichment is dispatched rather than awaited: discovery finishes on the v1 timings it always has, and the detail lands when it lands.
-    this.enrichControllerHardware();
+    // Start the recurring account-credentialed refresh, if the user has configured the credentials that make it possible. Every controller is already built by this
+    // point, so the loop's first tick has somewhere to deliver every controller's facts.
+    this.startV2Refresh();
 
     // Find all the orphaned accessories this account does not claim and remove them, clearing any grace state a removed accessory carried. We walk a filtered
     // SNAPSHOT of the tracked array so the removal splice never races the walk that drives it.
@@ -246,47 +253,84 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     }
   }
 
-  /* Populate every configured controller's HomeKit model and firmware from ONE whole-account query, once for the life of the plugin.
+  /* Start the endless loop that refreshes every controller's account-credentialed facts, once, and only for an install that configured the credentials making it
+   * possible. Without a client no loop starts, no call is spent, and nothing is logged - an install carrying only an API key behaves exactly as it always has.
    *
    * One query for the whole account rather than one per controller is what the v2 ceiling demands - it admits a handful of calls per half hour, so a per-controller
    * query would spend the whole allowance on a multi-controller install - and it is also the shape v1 discovery already uses: fetch the account once, then hand
    * each controller its own share.
    *
-   * The work is detached rather than awaited. Hardware is presentational, the credentials are optional, and the call carries an authentication round trip, so
-   * nothing about discovery should wait on it; guardedDispatch is what keeps a rejection out of the unhandled-rejection path. A failed or empty answer enriches
-   * nothing and leaves every placeholder standing, which is exactly the display a user without credentials sees.
+   * The loop is SEQUENTIAL - refresh, then sleep - which is what makes overlap unrepresentable rather than guarded against: the next tick cannot begin until the
+   * current one has finished, however long the account takes to answer. It is supervised on the same terms as every other endless loop this plugin runs, so a
+   * shutdown abort unwinds it silently through the sleep while a genuine fault is reported once. The narrowed client is captured in a local before dispatch so the
+   * loop body needs no assertion about a field it cannot see reassigned.
    */
-  private enrichControllerHardware(): void {
+  private startV2Refresh(): void {
 
-    if(!this.v2Client || this.hardwareEnriched) {
+    if(!this.v2Client || this.v2RefreshStarted) {
 
       return;
     }
 
-    this.hardwareEnriched = true;
+    this.v2RefreshStarted = true;
 
-    guardedDispatch({ handler: async (): Promise<void> => {
+    const client = this.v2Client;
 
-      const hardware = await this.v2Client?.fetchHardware();
+    void superviseLoop({ loop: async (): Promise<void> => {
 
-      if(!hardware) {
+      for(;;) {
 
-        return;
+        // eslint-disable-next-line no-await-in-loop
+        await this.refreshV2Facts(client);
+
+        // eslint-disable-next-line no-await-in-loop
+        await setTimeoutAsync(HYDRAWISE_V2_REFRESH_INTERVAL * 1000, undefined, { signal: this.signal });
       }
+    }, onError: loopFaultReporter(this.log, "enhanced features refresh"), signal: this.signal });
+  }
 
-      /* Hand each controller its own hardware, matched on the id v2 and v1 agree about. The walk is over the CONFIGURED controllers rather than over the fetched
-       * map, so a controller the user disabled, or one the account reports that this plugin never built, is simply skipped rather than looked up and dropped.
-       */
-      for(const controller of this.account.controllers) {
+  /* Run one refresh tick: fetch the whole account's facts and hand each controller its own.
+   *
+   * This is its own method rather than the loop's inline body, and the boundary is what makes an early return safe. A return here ends this TICK, control falls
+   * through to the loop's sleep, and the next tick retries; the same return written inline in the loop would leave the loop function entirely and end the refresh
+   * for the life of the plugin on the first transient failure.
+   *
+   * The snapshot is stamped BEFORE the fetch dispatches, so it is "as of" the instant the request was made rather than the instant it landed. That is what keeps a
+   * fetch already in flight when a user commands a suspend-all from reading as newer than the command it cannot possibly know about.
+   *
+   * A failed fetch leaves every current display standing and simply returns - the client has already reported it, and the next tick is the retry.
+   */
+  private async refreshV2Facts(client: HydrawiseV2Client): Promise<void> {
 
-        const facts = hardware.get(controller.controller_id);
+    const fetchedAt = Math.floor(Date.now() / 1000);
+    const facts = await client.fetchAccountFacts();
 
-        if(facts) {
+    if(!facts) {
 
-          this.configuredDevices[this.hap.uuid.generate(controller.controller_id.toString())]?.applyHardware(facts);
-        }
+      return;
+    }
+
+    // Report the account tier reachable, once for the life of the process. A failed tick says nothing here - the client has already reported the failure in its
+    // own words - so this line means the credentials were accepted and the account answered, which is exactly what a user checking their setup wants to see.
+    if(!this.v2Connected) {
+
+      this.v2Connected = true;
+
+      this.log.info("Successfully connected to the Hydrawise account API for enhanced features.");
+    }
+
+    /* Hand each controller its own facts, matched on the id v2 and v1 agree about. The walk is over the CONFIGURED controllers rather than over the fetched map,
+     * so a controller the user disabled, or one the account reports that this plugin never built, is simply skipped rather than looked up and dropped.
+     */
+    for(const controller of this.account.controllers) {
+
+      const entry = facts.get(controller.controller_id);
+
+      if(entry) {
+
+        this.configuredDevices[this.hap.uuid.generate(controller.controller_id.toString())]?.applyFacts({ facts: entry, fetchedAt });
       }
-    }, label: "controller hardware enrichment", log: this.log });
+    }
   }
 
   /* Whether discovery should sweep an accessory away, dispatched by accessory KIND. Each kind answers to a different authority, which is the whole reason this is

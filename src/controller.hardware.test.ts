@@ -12,9 +12,9 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
-import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE } from "./settings.ts";
+import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
-import { buildController, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, makeV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { CharacteristicType } from "./testing/hap.helpers.ts";
@@ -40,6 +40,13 @@ const CACHED: HydrawiseControllerHardware = { firmware: "4.70", model: "HCC 24 Z
 function informationValue(accessory: TestAccessory, characteristic: CharacteristicType): unknown {
 
   return accessory.getService(Service.AccessoryInformation)?.getCharacteristic(characteristic).value;
+}
+
+// The instant a facts snapshot is stamped with. Tests that care only about adoption stamp it now, which is comfortably inside the freshness window every consumer
+// gates on; the tests that care about that window stamp their own age instead.
+function now(): number {
+
+  return Math.floor(Date.now() / 1000);
 }
 
 // Seed an accessory the way HAP restores a cached one: real model and firmware values already sitting in the characteristics before anything configures it.
@@ -130,47 +137,91 @@ describe("HydrawiseController hardware display with credentials", () => {
   });
 });
 
-describe("HydrawiseController hardware adoption", () => {
+describe("HydrawiseController facts adoption", () => {
 
   test("adopting hardware writes both characteristics and flushes exactly once", () => {
 
     const h = buildController({ hasV2Client: true });
     const before = h.flushes.length;
 
-    h.controller.applyHardware(FETCHED);
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
     assert.equal(informationValue(h.accessory, Characteristic.Model), FETCHED.model, "the real model replaces the placeholder");
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "the real firmware replaces HAP's default");
 
     /* The flush count is the pin, and it is exact in both directions. The characteristics are the only store these facts have, so zero flushes would lose them at
      * the next restart and spend a cloud call relearning something that never changes; more than one would be churn on a write that moved a single accessory.
+     *
+     * This is also the case that distinguishes a hardware comparison made against the PRIOR snapshot from one made after the new snapshot was stored. Nothing
+     * else moved on this tick - no projection, no availability - so the only thing that can justify the write is hardware arriving against a null baseline, and a
+     * comparison written after the overwrite would read the new value on both sides, find no difference, and flush zero times.
      */
-    assert.equal(h.flushes.length - before, 1, "adoption flushes the accessory cache exactly once");
+    assert.equal(h.flushes.length - before, 1, "the first arrival carrying hardware flushes the accessory cache exactly once");
     assert.deepEqual(h.flushes[h.flushes.length - 1], [h.accessory], "the flush names the accessory that changed and nothing else");
   });
 
-  test("adoption writes unconditionally, with no compare-before-write of its own", () => {
+  test("a tick that moves nothing flushes ZERO times", () => {
 
-    /* HAP already drops a write whose value matches what the characteristic holds, so a compare here would duplicate the library's own work and add a second place
-     * for the two answers to disagree. The pin is that a re-applied identical value still goes THROUGH the write path and still flushes, which is what a
-     * plugin-side change gate would break.
+    /* The whole point of the change gate. On a recurring cadence an unconditional flush would write the accessory cache to disk every quarter hour for facts that
+     * had not moved, for the life of the plugin.
+     */
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+
+    const settled = h.flushes.length;
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
+
+    assert.equal(h.flushes.length - settled, 0, "an identical second answer is not worth a disk write");
+  });
+
+  test("hardware still writes unconditionally, with no compare-before-write of its own", () => {
+
+    /* HAP already drops a write whose value matches what the characteristic holds, so a compare there would duplicate the library's own work and add a second
+     * place for the two answers to disagree. The change gate governs the durable FLUSH alone; the characteristic write itself stays unconditional, which is what
+     * this separates.
      */
     const h = buildController({ hasV2Client: true });
     const information = h.accessory.getService(Service.AccessoryInformation);
 
-    h.controller.applyHardware(FETCHED);
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
     // The window opens on an accessory that already holds exactly these values, so whatever is recorded below is a write the plugin chose to perform against an
     // unchanged fact.
     information?.clearWrites();
 
-    const flushesBeforeRepeat = h.flushes.length;
-
-    h.controller.applyHardware(FETCHED);
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
 
     assert.equal(information?.writesFor(Characteristic.Model, Characteristic.FirmwareRevision).length, 2,
       "an identical second answer still reaches both characteristics rather than being gated in the plugin");
-    assert.equal(h.flushes.length - flushesBeforeRepeat, 1, "and it still flushes, because the flush follows the write rather than a change decision");
+  });
+
+  test("a changed firmware version is adopted and flushed", () => {
+
+    // Hardware self-heals on every tick rather than being learned once, so a firmware upgrade the user performs in the Hydrawise app reaches HomeKit on its own.
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+
+    const settled = h.flushes.length;
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: now() + 1 });
+
+    assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), "4.99", "the upgraded firmware replaces the version already on display");
+    assert.equal(h.flushes.length - settled, 1, "a genuine hardware change is worth exactly one write");
+  });
+
+  test("a tick carrying no hardware leaves the values a prior tick established", () => {
+
+    // A controller whose hardware block comes back incomplete composes no hardware at all, and that absence must not blank a correct display.
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() + 1 });
+
+    assert.equal(informationValue(h.accessory, Characteristic.Model), FETCHED.model, "the established model stands");
+    assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "and the established firmware with it");
   });
 
   test("adopted values survive into the next session untouched", () => {
@@ -178,7 +229,7 @@ describe("HydrawiseController hardware adoption", () => {
     // The end of the cache-resident story: what adoption wrote is what a restart reads back, and the credentialed synchronous path leaves it exactly as it found it.
     const first = buildController({ hasV2Client: true });
 
-    first.controller.applyHardware(FETCHED);
+    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
     const second = buildController({ hasV2Client: true, seedContext: (seed) => {
 
@@ -190,6 +241,21 @@ describe("HydrawiseController hardware adoption", () => {
 
     assert.equal(informationValue(second.accessory, Characteristic.Model), FETCHED.model, "the next session reads back the adopted model");
     assert.equal(informationValue(second.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "and the adopted firmware with it");
+  });
+
+  test("each controller's facts land on its own accessory", () => {
+
+    /* The correlation claim at the receiving end. Two controllers are built with distinguishable facts and each is handed only its own, so an implementation that
+     * distributed by position, or that let one controller's snapshot leak into another, shows up as the sibling's model here.
+     */
+    const first = buildController({ hasV2Client: true });
+    const second = buildController({ controller: { controller_id: 500002, serial_number: "SN9Z8Y7X6W5" }, hasV2Client: true });
+
+    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    second.controller.applyFacts({ facts: makeV2Facts({ hardware: CACHED }), fetchedAt: now() });
+
+    assert.equal(informationValue(first.accessory, Characteristic.Model), FETCHED.model, "the first controller shows its own model");
+    assert.equal(informationValue(second.accessory, Characteristic.Model), CACHED.model, "and the second shows its own, not its sibling's");
   });
 });
 
@@ -205,7 +271,7 @@ describe("HydrawiseController standalone zone hardware", () => {
 
     t.after(() => h.abort());
 
-    h.controller.applyHardware(FETCHED);
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
     await waitFor(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) ? true : undefined);
 
@@ -248,5 +314,116 @@ describe("HydrawiseController standalone zone hardware", () => {
 
     assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the stale zone firmware is reset");
     assert.equal(informationValue(restored, Characteristic.Model), PLACEHOLDER_MODEL, "and the stale zone model with it");
+  });
+});
+
+describe("HydrawiseController controller availability", () => {
+
+  // The fault characteristic on the irrigation system service, which is where HomeKit shows a controller Hydrawise cannot reach.
+  function faultValue(h: { accessory: TestAccessory }): unknown {
+
+    return h.accessory.getService(Service.IrrigationSystem)?.getCharacteristic(Characteristic.StatusFault).value;
+  }
+
+  // Whether that characteristic exists at all, which is the presence claim rather than the value claim.
+  function hasFault(h: { accessory: TestAccessory }): boolean {
+
+    return h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault) ?? false;
+  }
+
+  test("an install with no credentials carries no fault characteristic at all", () => {
+
+    // The plugin cannot learn reachability without the account credentials, so it publishes no characteristic claiming to know it.
+    assert.equal(hasFault(buildController()), false, "the characteristic is absent where the fact cannot be learned");
+  });
+
+  test("a credentialed install starts with an explicit no-fault, before any refresh has answered", () => {
+
+    /* Construction runs synchronously, long before a fetch can resolve, so the characteristic needs a stated starting value rather than whatever HAP would
+     * default it to.
+     */
+    const h = buildController({ hasV2Client: true });
+
+    assert.equal(hasFault(h), true, "the characteristic exists on a credentialed install");
+    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "and it starts stating no fault");
+  });
+
+  test("an accessory restored from a credentialed past has the characteristic REMOVED once the credentials are gone", () => {
+
+    /* The same clean revert the firmware reset performs, and for the same reason: HAP round-trips characteristics through the accessory cache, so an accessory
+     * that once had credentials would otherwise keep displaying a reachability nothing is left to update.
+     */
+    const h = buildController({ seedContext: (seed) => {
+
+      seed.getService(Service.IrrigationSystem)?.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+    } });
+
+    assert.equal(hasFault(h), false, "a stale fault reading is removed rather than left standing");
+  });
+
+  test("the three readings are distinguished, and the unknown one is proven against a NON-default prior", () => {
+
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
+    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "a reachable controller clears the fault");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
+    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "an unreachable one raises it");
+
+    /* The unknown branch is asserted from the FAULTED state deliberately. Applied to the no-fault default it would pass trivially against an implementation that
+     * always wrote no-fault, which is exactly the bug this branch exists to avoid.
+     */
+    h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now() });
+    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "a refresh that could not tell leaves the real reading standing");
+  });
+
+  test("a snapshot aged past its lifetime clears the fault rather than freezing it on display forever", () => {
+
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
+    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "the controller is displayed as unreachable");
+
+    // A snapshot this old is untrustworthy, and an unknown state is not a fault - leaving the fault up would be a claim the user could never clear.
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - (HYDRAWISE_V2_FACTS_TTL + 1) });
+    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "a stale snapshot returns the display to no-fault");
+  });
+
+  test("the freshness boundary is inclusive, so a snapshot exactly at its lifetime still counts as fresh", () => {
+
+    // The off-by-one pin on the comparison operator itself.
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - HYDRAWISE_V2_FACTS_TTL });
+    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "a snapshot aged exactly its lifetime is still trusted");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - (HYDRAWISE_V2_FACTS_TTL + 1) });
+    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "one second older is not");
+  });
+
+  test("the first reading seeds silently, and only a genuine flip is narrated", () => {
+
+    /* The characteristic cannot be the seed for this: it is constructed carrying no-fault, which is indistinguishable from a real first report of "reachable", so
+     * a controller that is offline the very first time it is heard from would narrate an offline transition it never made.
+     */
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
+
+    assert.equal(h.lines().filter(line => line.message.includes("controller is")).length, 0, "a first reading of OFFLINE narrates nothing");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
+
+    const back = h.lines().filter(line => (line.level === "info") && line.message.includes("back online"));
+
+    assert.equal(back.length, 1, "the flip back is narrated exactly once");
+
+    // A repeat of the same reading is not a transition, so it says nothing further.
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
+    assert.equal(h.lines().filter(line => line.message.includes("back online")).length, 1, "an unchanged reading narrates nothing further");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now() });
+    assert.equal(h.lines().filter(line => line.message.includes("controller is")).length, 1, "and neither does a refresh that could not tell");
   });
 });

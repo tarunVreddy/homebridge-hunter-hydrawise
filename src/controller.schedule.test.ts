@@ -8,12 +8,12 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
+import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus, sameScheduleStatus,
   scheduleStatus } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
-import { buildController, buildPlatform, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
@@ -31,6 +31,9 @@ const POLL_STEP = 60;
 // reads as this account's.
 const ALPHA_RELAY_ID = 700001;
 const BETA_RELAY_ID = 700002;
+
+// The suspension instant the live 2026-08-09 account capture recorded, kept verbatim so these pins run against a real far-future value rather than a round number.
+const SUSPENDED_UNTIL = 1903928399;
 
 // Compose a fast-cadence schedule around a zone list and a sensor block, so a live-loop test cycles in roughly 250ms rather than the wire-realistic minute.
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors, time = ROOT_TIME): StatusScheduleResponse {
@@ -538,5 +541,226 @@ describe("HydrawiseController schedule exclusivity", () => {
     // distinguishing what the code does now.
     assert.deepEqual(Object.keys(firstOf(registered, "accessory").context).toSorted(), [ "ownerController", "zone" ],
       "no schedule projection reaches a standalone zone accessory's context");
+  });
+});
+
+describe("HydrawiseController schedule classification with account facts", () => {
+
+  test("a suspended zone classifies as suspended, carrying the instant its suspension lifts", () => {
+
+    const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] }) });
+
+    assert.deepEqual(projection.zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }],
+      "the account API resolves the one shape the key-based wire cannot read");
+  });
+
+  test("an absent suspension is told apart from an unknown one, and epoch zero is a real instant", () => {
+
+    /* The three cells a bare truthiness test collapses. Undefined means no facts entry reached this zone at all, null means the entry reached it and reported no
+     * suspension, and zero is a real - if implausible - instant that a truthiness test would silently discard.
+     */
+    const cells = [ { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: undefined }), label: "an undefined suspension" },
+      { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: null }), label: "a null suspension" },
+      { expected: "suspended", facts: { sensorStopped: null, suspendedUntil: 0 }, label: "a suspension at epoch zero" } ];
+
+    for(const { expected, facts, label } of cells) {
+
+      const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+        { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, facts ]] }) });
+
+      assert.equal(projection.zones[0]?.state, expected, label + " classifies as " + expected);
+    }
+  });
+
+  test("a live sensor reporting itself quiet RETIRES the group inference that would have called the zone stopped", () => {
+
+    /* The fixture is the all-covered rain shape, which the key-based group inference classifies as sensor-stopped on its own - that is what lets this pin tell the
+     * two readings apart, where a fixture the inference already agreed with could not. With the account API reporting the sensor quiet, it is not consulted.
+     */
+    const stopped = scheduleStatus(rainStopped(), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+
+    assert.ok(stopped.zones.every(zone => zone.state === "sensor-stopped"), "without facts the group inference reads this shape as a rain stop");
+
+    const quiet = scheduleStatus(rainStopped(), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ sensorStopped: false }) ]) }) });
+
+    assert.ok(quiet.zones.every(zone => zone.state === "unscheduled"), "a live sensor that is not tripped outranks the inference drawn from the group's shape");
+  });
+
+  test("an unknown sensor answer falls back to the group inference rather than denying a stop", () => {
+
+    const unknown = scheduleStatus(rainStopped(), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ sensorStopped: null }) ]) }) });
+
+    assert.ok(unknown.zones.every(zone => zone.state === "sensor-stopped"), "a sensor answer this plugin cannot read degrades to exactly today's behavior");
+  });
+
+  test("a zone both suspended and covered by a tripped sensor classifies as suspended", () => {
+
+    // The precedence pin. Suspension is the longer-lived, user-created fact, and the sensor's claim returns on its own the moment the suspension clears.
+    const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, { sensorStopped: true, suspendedUntil: SUSPENDED_UNTIL } ]] }) });
+
+    assert.equal(projection.zones[0]?.state, "suspended", "suspension outranks the sensor claim when both apply to one zone");
+  });
+
+  test("the availability stamp is present only when fresh facts carried one, and a flip compares as a change", () => {
+
+    const bare = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
+    const online = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: makeV2Facts({ online: true }) });
+    const offline = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: makeV2Facts({ online: false }) });
+    const unknown = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: makeV2Facts({ online: null }) });
+
+    assert.ok(!("online" in bare), "a projection composed without facts carries no availability key at all");
+    assert.ok(!("online" in unknown), "and neither does one whose facts could not tell");
+    assert.equal(online.online, true, "a reachable controller stamps its availability");
+    assert.equal(offline.online, false, "and an unreachable one stamps its own");
+
+    // Availability is compared rather than excluded, because a controller falling off the network and coming back is a real transition rather than churn.
+    assert.ok(!sameScheduleStatus(online, offline), "two projections differing only in availability compare as changed");
+    assert.ok(sameScheduleStatus(online, scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: makeV2Facts({ online: true }) })),
+      "and two carrying the same availability compare as unchanged");
+  });
+
+  test("a suspended zone's projection is byte-stable across polls, so it costs no repeated write", () => {
+
+    /* The flush-storm pin. The suspension instant is ABSOLUTE, so it holds still while the wire's root clock advances; storing a countdown instead would move the
+     * field every poll and turn every poll into a cache write.
+     */
+    const facts = makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] });
+    const first = scheduleStatus(schedule([sentinelZone()], bareSensors, ROOT_TIME), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts });
+    const later = scheduleStatus(schedule([sentinelZone()], bareSensors, ROOT_TIME + POLL_STEP), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts });
+
+    assert.ok(sameScheduleStatus(first, later), "a poll that moved nothing but the clock compares as unchanged");
+  });
+
+  test("the guard accepts a suspended entry only when it carries a numeric instant", () => {
+
+    assert.ok(isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }), "a well-formed suspended entry passes");
+    assert.ok(!isZoneScheduleStatus({ relayId: ALPHA_RELAY_ID, state: "suspended" }),
+      "a truncated suspended entry counts as absent rather than rendering a blank instant");
+    assert.ok(isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME, online: true, zones: [] }),
+      "a projection carrying a boolean availability passes");
+    assert.ok(!isScheduleStatus({ activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME, online: "yes", zones: [] }),
+      "one carrying a non-boolean availability does not");
+  });
+});
+
+describe("HydrawiseController sticky suspension", () => {
+
+  // The prior projection a carry is drawn from: one zone recorded as suspended until the captured instant.
+  function priorSuspended(): Map<number, number> {
+
+    return new Map([[ ALPHA_RELAY_ID, SUSPENDED_UNTIL ]]);
+  }
+
+  test("a suspended zone carries forward across a pass that has no fresh facts about it", () => {
+
+    /* The restart-and-gap pin. Without the carry a suspended zone flaps to "not scheduled" and back every time a refresh is missed or the plugin restarts, which
+     * is both a wrong display and a cache write each way.
+     */
+    const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { priorSuspended: priorSuspended() });
+
+    assert.deepEqual(projection.zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }],
+      "the prior suspension stands while nothing contradicts it");
+
+    // The carried instant is the PERSISTED value verbatim rather than a recomputed one, which is what keeps the carried arm byte-stable poll after poll.
+    const later = scheduleStatus(schedule([sentinelZone()], bareSensors, ROOT_TIME + POLL_STEP), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { priorSuspended: priorSuspended() });
+
+    assert.ok(sameScheduleStatus(projection, later), "a carried suspension does not move as the wire clock advances");
+  });
+
+  test("a fresh facts entry for the zone ENDS the carry, null suspension included", () => {
+
+    // A present entry is a real answer either way, so it reasserts or clears the state; only an absent one lets the carry apply.
+    const cleared = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: null }) ]] }), priorSuspended: priorSuspended() });
+
+    assert.equal(cleared.zones[0]?.state, "unscheduled", "an entry reporting no suspension clears the carried one");
+  });
+
+  test("a fresh snapshot that simply does not name the zone leaves its carry standing", () => {
+
+    /* The per-zone half of the rule. The composer omits an entry it cannot complete, and an omitted entry is an unknown rather than an implicit "not suspended",
+     * so judging the carry account-wide would let one zone's fresh answer silently clear a sibling it never covered.
+     */
+    const projection = scheduleStatus(schedule([ sentinelZone(), scheduledZone() ]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { facts: makeV2Facts({ zones: [[ BETA_RELAY_ID, makeZoneV2Facts() ]] }), priorSuspended: priorSuspended() });
+
+    assert.equal(projection.zones[0]?.state, "suspended", "a zone the snapshot does not name keeps what the prior projection said");
+  });
+
+  test("a wire contradiction ends the carry", () => {
+
+    // The zone presents a real schedule rather than the ambiguous shape, so there is nothing left to disambiguate and the wire's own reading wins outright.
+    const projection = scheduleStatus(schedule([scheduledZone({ relay: 1, relay_id: ALPHA_RELAY_ID })]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { priorSuspended: priorSuspended() });
+
+    assert.equal(projection.zones[0]?.state, "scheduled", "a zone that reports a real schedule is not suspended, whatever was carried");
+  });
+
+  test("a suspension whose instant has passed on the WIRE clock expires out of the carry", () => {
+
+    // The comparison is against the wire's own root time rather than a local read, which keeps the classifier pure and lets an elapsed suspension lapse on its own.
+    const expired = scheduleStatus(schedule([sentinelZone()], bareSensors, SUSPENDED_UNTIL), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { priorSuspended: priorSuspended() });
+
+    assert.equal(expired.zones[0]?.state, "unscheduled", "an instant the wire clock has reached no longer carries");
+
+    const standing = scheduleStatus(schedule([sentinelZone()], bareSensors, SUSPENDED_UNTIL - 1), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { priorSuspended: priorSuspended() });
+
+    assert.equal(standing.zones[0]?.state, "suspended", "and one second short of it still does");
+  });
+});
+
+describe("HydrawiseController sticky suspension across a restart", () => {
+
+  // A prior projection recording one zone as suspended, exactly as a credentialed session would have persisted it before the plugin stopped.
+  function priorProjection(): HydrawiseScheduleStatus {
+
+    return { activeWindowSeconds: HYDRAWISE_ACTIVE_ZONE_INDICATOR, asOf: ROOT_TIME - 3600,
+      zones: [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }] };
+  }
+
+  test("a credentialed restart carries the suspension through the window before the first refresh answers", async (t) => {
+
+    /* The restart-churn case. The plugin comes back with the cached projection but no facts yet, and the zone still presents the ambiguous sentinel shape, so
+     * without the carry it would flap to "not scheduled" and back the moment the first refresh landed - a wrong display and a pair of cache writes.
+     */
+    // The zone roster is seeded alongside the projection so the roster half of the flush chokepoint matches too, isolating the schedule half this pin is about.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }),
+      seedContext: (seed) => { seed.context = { schedule: priorProjection(), zones: zoneRoster([sentinelZone()]) }; }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }],
+      "the suspension stands until something can actually confirm or clear it");
+
+    // The carried instant is the persisted value verbatim, so the restored projection matches and no poll writes anything at all.
+    assert.equal(h.flushes.length, 0, "a carried suspension costs no cache write");
+  });
+
+  test("an install whose credentials are GONE re-classifies a restored suspension cleanly", async (t) => {
+
+    /* The gate that keeps the parity promise. Without the credentials nothing can ever confirm or clear a carried suspension, so honoring one would strand a claim
+     * on screen forever with no way to correct it. The zone returns to what the key-based wire alone supports.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }),
+      seedContext: (seed) => { seed.context = { schedule: priorProjection(), zones: zoneRoster([sentinelZone()]) }; }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "unscheduled" }],
+      "a cache restored from a credentialed past re-classifies rather than carrying a claim nothing can update");
   });
 });

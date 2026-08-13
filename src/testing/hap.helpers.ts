@@ -114,6 +114,16 @@ class ServiceLabelIndexCharacteristicType {
   public readonly hapKind = "ServiceLabelIndex" as const;
 }
 
+// The fault characteristic HAP permits on an irrigation system, carrying the two values the specification defines. It is optional on that service, which is what
+// lets the runtime publish it only where it has something to say and withdraw it wherever it does not.
+class StatusFaultCharacteristicType {
+
+  public static readonly GENERAL_FAULT = 1;
+  public static readonly NO_FAULT = 0;
+  public static readonly UUID = "StatusFault";
+  public readonly hapKind = "StatusFault" as const;
+}
+
 class ServiceLabelNamespaceCharacteristicType {
 
   public static readonly ARABIC_NUMERALS = 1;
@@ -156,6 +166,7 @@ export const Characteristic = {
   ServiceLabelIndex: ServiceLabelIndexCharacteristicType,
   ServiceLabelNamespace: ServiceLabelNamespaceCharacteristicType,
   SetDuration: SetDurationCharacteristicType,
+  StatusFault: StatusFaultCharacteristicType,
   ValveType: ValveTypeCharacteristicType
 } as const;
 
@@ -389,6 +400,26 @@ export class TestService {
   public testCharacteristic(charType: CharacteristicType): boolean {
 
     return this.characteristicsByType.has(charType);
+  }
+
+  /* Drop a materialized characteristic, mirroring HAP's Service.removeCharacteristic. It takes the INSTANCE rather than the kind, exactly as HAP does, so
+   * production's remove call reads here as it does against the real library - the caller looks the characteristic up and hands it over.
+   *
+   * An instance this service does not hold is a no-op, which is what a removal racing another removal looks like. The write log is deliberately left intact: it
+   * records what production DID, and a removal does not unmake the writes that preceded it.
+   */
+  public removeCharacteristic(characteristic: TestCharacteristic): void {
+
+    for(const [ type, candidate ] of this.characteristicsByType) {
+
+      if(candidate === characteristic) {
+
+        this.characteristicsByType.delete(type);
+        this.optionalTypes.delete(type);
+
+        return;
+      }
+    }
   }
 
   // The recorded writes for the given kinds, which is how a test asks whether a specific characteristic was written across a window.

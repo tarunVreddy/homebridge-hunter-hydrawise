@@ -52,7 +52,7 @@ function projection(zones: HydrawiseZoneScheduleEntry[], activeWindowSeconds: nu
 // The status word a projection folds to, which is always the first row of the controller rendering.
 function statusOf(zones: HydrawiseZoneScheduleEntry[]): string | undefined {
 
-  return deriveControllerDisplay(projection(zones), {}, NOW).rows[0]?.[1];
+  return deriveControllerDisplay(projection(zones), {}, NOW).status ?? undefined;
 }
 
 // The clock form of an instant, computed through the same Intl call formatRunTime makes.
@@ -147,8 +147,9 @@ describe("hydrawise webUI schedule display derivations", () => {
 
   test("deriveControllerDisplay renders no rows without a projection or without zones", () => {
 
-    assert.deepEqual(deriveControllerDisplay(undefined, {}, NOW), { rows: [], stale: false }, "a controller with no projection renders nothing");
-    assert.deepEqual(deriveControllerDisplay(projection([]), {}, NOW), { rows: [], stale: false }, "an account naming no zone is not an account with nothing scheduled");
+    assert.deepEqual(deriveControllerDisplay(undefined, {}, NOW), { detail: [], stale: false, status: null }, "a controller with no projection renders nothing");
+    assert.deepEqual(deriveControllerDisplay(projection([]), {}, NOW), { detail: [], stale: false, status: null },
+      "an account naming no zone is not an account with nothing scheduled");
   });
 
   test("deriveControllerDisplay walks the status precedence from water flowing down to nothing scheduled", () => {
@@ -171,7 +172,8 @@ describe("hydrawise webUI schedule display derivations", () => {
     const zones = [ runningEntry(3, NOW + 300), runningEntry(1, NOW + 600) ];
     const derived = deriveControllerDisplay(projection(zones), { "1": "Front Lawn", "3": "Back Beds" }, NOW);
 
-    assert.deepEqual(derived.rows, [ [ "Status", "Watering" ], [ "Now Running", "Front Lawn (10 minutes), Back Beds (5 minutes)" ] ],
+    assert.equal(derived.status, "Watering", "the status word travels apart from the detail rows");
+    assert.deepEqual(derived.detail, [[ "Now Running", "Front Lawn (10 minutes), Back Beds (5 minutes)" ]],
       "both running zones are named in relay order, each with its own countdown");
   });
 
@@ -180,14 +182,14 @@ describe("hydrawise webUI schedule display derivations", () => {
     const zones = [ scheduledEntry(1, NEXT_DAY), scheduledEntry(2, SAME_DAY) ];
     const derived = deriveControllerDisplay(projection(zones), { "1": "Front Lawn", "2": "Side Strip" }, NOW);
 
-    assert.deepEqual(derived.rows[1], [ "Next Zone", "Side Strip at " + clockOf(SAME_DAY) ], "the earliest next run wins, whatever order the zones arrive in");
+    assert.deepEqual(derived.detail[0], [ "Next Zone", "Side Strip at " + clockOf(SAME_DAY) ], "the earliest next run wins, whatever order the zones arrive in");
   });
 
   test("deriveControllerDisplay falls back to the relay id for a zone the names do not carry", () => {
 
-    assert.deepEqual(deriveControllerDisplay(projection([runningEntry(7, NOW + 60)]), {}, NOW).rows[1], [ "Now Running", "7 (1 minute)" ],
+    assert.deepEqual(deriveControllerDisplay(projection([runningEntry(7, NOW + 60)]), {}, NOW).detail[0], [ "Now Running", "7 (1 minute)" ],
       "a zone the names object has no entry for renders as its relay id");
-    assert.deepEqual(deriveControllerDisplay(projection([runningEntry(7, NOW + 60)]), undefined, NOW).rows[1], [ "Now Running", "7 (1 minute)" ],
+    assert.deepEqual(deriveControllerDisplay(projection([runningEntry(7, NOW + 60)]), undefined, NOW).detail[0], [ "Now Running", "7 (1 minute)" ],
       "a controller carrying no names at all renders the same way");
   });
 
@@ -228,5 +230,120 @@ describe("hydrawise webUI schedule display derivations", () => {
 
     assert.equal(formatRunTime(NEXT_DAY, NOW), weekdayOf(NEXT_DAY) + " " + clockOf(NEXT_DAY), "an instant on another calendar day names its day");
     assert.notEqual(formatRunTime(NEXT_DAY, NOW), clockOf(NEXT_DAY), "the cross-day form is never the bare clock time");
+  });
+});
+
+describe("hydrawise webUI suspension and availability display", () => {
+
+  // Well beyond a week from the anchor, which is what a real suspension instant looks like and what the formatter's date tier serves.
+  const FAR_FUTURE = NOW + (400 * 24 * 3600);
+
+  function suspendedEntry(relayId: number, until: number): HydrawiseZoneScheduleEntry {
+
+    return { relayId, state: "suspended", until };
+  }
+
+  // The locale date form of an instant, computed through the same Intl call formatRunTime makes for its third tier.
+  function dateOf(epochSeconds: number): string {
+
+    return new Date(epochSeconds * 1000).toLocaleDateString();
+  }
+
+  test("a suspended entry classifies as suspended and reads through the shared vocabulary", () => {
+
+    assert.equal(zoneScheduleState(suspendedEntry(1, FAR_FUTURE), meta(), NOW), "suspended", "the suspended arm has a display state of its own");
+    assert.equal(ZONE_STATE_LABELS.suspended, "Suspended", "and a word of its own in the shared vocabulary");
+  });
+
+  test("a suspended zone renders its status word and the instant its suspension lifts", () => {
+
+    const rendering = deriveZoneDisplay(suspendedEntry(1, FAR_FUTURE), meta(), NOW);
+
+    /* The status word is read from the shared vocabulary rather than compared against a literal, so a change to the wording moves this pin with it rather than
+     * reddening it - which is the whole reason the vocabulary is shared in the first place.
+     */
+    assert.deepEqual(rendering.rows, [ [ "Status", ZONE_STATE_LABELS.suspended ], [ "Until", dateOf(FAR_FUTURE) ] ],
+      "a suspended zone shows its state and when it ends");
+
+    // No staleness verdict, mirroring the rain-delay arm: a suspension still standing is the state itself, not evidence that nothing is polling.
+    assert.equal(rendering.stale, false, "a standing suspension is never reported as stale facts");
+  });
+
+  test("the formatter's third tier renders an instant beyond a week as a locale date", () => {
+
+    /* The tier a near-term fixture can never reach. Every instant the display handled before a suspension existed sits inside the schedule horizon, so without a
+     * far-future fixture the new branch would go unexecuted and a weekday alone would name a day four hundred days out as though it were this week.
+     */
+    assert.equal(formatRunTime(FAR_FUTURE, NOW), dateOf(FAR_FUTURE), "a far-future instant renders as a date");
+
+    // The first two tiers are unchanged, which is what makes this an extension rather than a replacement.
+    assert.equal(formatRunTime(SAME_DAY, NOW), clockOf(SAME_DAY), "an instant today still renders as the clock alone");
+    assert.equal(formatRunTime(NEXT_DAY, NOW), weekdayOf(NEXT_DAY) + " " + clockOf(NEXT_DAY), "and one within the week still carries its weekday");
+  });
+
+  test("a controller whose zones are all suspended folds to the suspended word", () => {
+
+    assert.equal(statusOf([ suspendedEntry(1, FAR_FUTURE), suspendedEntry(2, FAR_FUTURE) ]), ZONE_STATE_LABELS.suspended,
+      "an account with nothing but suspended zones says so rather than reading as merely unscheduled");
+  });
+
+  test("a rain delay outranks a suspension in the controller fold", () => {
+
+    // Both are reasons irrigation is held back, and an account with any zone rain-stopped has the more immediate one to report.
+    assert.equal(statusOf([ suspendedEntry(1, FAR_FUTURE), { relayId: 2, state: "sensor-stopped" } ]), ZONE_STATE_LABELS["sensor-stopped"],
+      "the rain delay is the word a mixed account leads with");
+  });
+
+  test("an unreachable controller leads with Offline, whatever its zones are scheduled to do", () => {
+
+    /* Reachability reframes everything under it: a schedule read off a controller that is not answering describes what WOULD happen, so saying so first is more
+     * honest than leading with a plan nothing is currently carrying out.
+     */
+    const offline: HydrawiseScheduleProjection = { activeWindowSeconds: WINDOW, asOf: NOW, online: false,
+      zones: [ runningEntry(1, SAME_DAY), scheduledEntry(2, NEXT_DAY) ] };
+
+    assert.equal(deriveControllerDisplay(offline, {}, NOW).status, "Offline", "an unreachable controller says so first");
+  });
+
+  test("a reachable controller, and one whose availability is unknown, both fold exactly as they always have", () => {
+
+    // The parity half: the availability arm must not disturb the fold for the two cases every existing install presents.
+    const reachable: HydrawiseScheduleProjection = { activeWindowSeconds: WINDOW, asOf: NOW, online: true, zones: [runningEntry(1, SAME_DAY)] };
+
+    assert.equal(deriveControllerDisplay(reachable, {}, NOW).status, "Watering", "a reachable controller folds on its zones alone");
+    assert.equal(statusOf([runningEntry(1, SAME_DAY)]), "Watering", "and so does one that carries no availability at all");
+  });
+});
+
+describe("hydrawise webUI controller strip composition", () => {
+
+  test("the fold hands back the status word and the detail rows as separate facts", () => {
+
+    /* The shape the panel's two-line strip rests on. The word belongs in the stat strip beside the controller's identity and the rows belong in the detail below
+     * it, so a renderer must be able to place each without unpacking the other - which is exactly what returning them as one rows array prevented.
+     */
+    const derived = deriveControllerDisplay(projection([ runningEntry(1, NOW + 600), scheduledEntry(2, SAME_DAY) ]), { "1": "Front Lawn", "2": "Side Strip" }, NOW);
+
+    assert.equal(derived.status, "Watering", "the status word is its own fact");
+    assert.deepEqual(derived.detail.map(([label]) => label), [ "Now Running", "Next Zone" ], "and the detail carries only the rows beneath it");
+
+    // The word never leaks back into the rows, which is what a renderer drawing both would otherwise duplicate.
+    assert.ok(!derived.detail.some(([label]) => label === "Status"), "no Status row remains among the detail");
+  });
+
+  test("a controller with detail but no schedule facts still reports its status word alone", () => {
+
+    // An account whose zones are all idle has a word to show and nothing to detail, so the strip renders and the second line does not.
+    const derived = deriveControllerDisplay(projection([{ relayId: 1, state: "unscheduled" }]), {}, NOW);
+
+    assert.equal(derived.status, ZONE_STATE_LABELS.unscheduled, "the word still reports");
+    assert.deepEqual(derived.detail, [], "and there is nothing to draw beneath it");
+  });
+
+  test("the staleness verdict travels with the fold, unchanged by the split", () => {
+
+    // The verdict is the third fact and answers to the zones' own instants, so separating the word from the rows must not have moved it.
+    assert.equal(deriveControllerDisplay(projection([runningEntry(1, (NOW - STALE_GRACE) - 1)]), {}, NOW).stale, true, "a long-passed instant still reads stale");
+    assert.equal(deriveControllerDisplay(projection([runningEntry(1, NOW + 600)]), {}, NOW).stale, false, "and a live one still does not");
   });
 });

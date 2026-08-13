@@ -5,13 +5,15 @@
 
 /**
  * One zone's persisted schedule state, as the display tier consumes it. The arms mirror exactly what the runtime writes into the accessory cache: a running zone
- * carries the instant its run ends, a scheduled zone carries the instant its next run starts and how long that run lasts, and the two fact-free states carry
- * nothing beyond their own word. A zone the projection does not name has no entry at all, which is why every consuming position below accepts `undefined`.
+ * carries the instant its run ends, a scheduled zone carries the instant its next run starts and how long that run lasts, a suspended zone carries the instant its
+ * suspension lifts, and the two fact-free states carry nothing beyond their own word. A zone the projection does not name has no entry at all, which is why every
+ * consuming position below accepts `undefined`.
  */
 export type HydrawiseZoneScheduleEntry =
   { endsAt: number; relayId: number; state: "running" } |
   { durationSeconds: number; nextRunAt: number; relayId: number; state: "scheduled" } |
   { relayId: number; state: "sensor-stopped" } |
+  { relayId: number; state: "suspended"; until: number } |
   { relayId: number; state: "unscheduled" };
 
 /**
@@ -31,10 +33,17 @@ export interface HydrawiseScheduleMeta {
 }
 
 /**
- * A whole controller's persisted schedule projection: those same scalar facts alongside every reported zone's entry.
+ * Whether Hydrawise could reach the controller when the facts were last refreshed. It is present only on an account-credentialed install, because that is the only
+ * place the fact can be learned at all, so every reader treats its absence as "unknown" rather than as "reachable".
+ */
+export type HydrawiseControllerAvailability = boolean | undefined;
+
+/**
+ * A whole controller's persisted schedule projection: those same scalar facts, the controller's availability where it is known, and every reported zone's entry.
  */
 export interface HydrawiseScheduleProjection extends HydrawiseScheduleMeta {
 
+  online?: HydrawiseControllerAvailability;
   zones: HydrawiseZoneScheduleEntry[];
 }
 
@@ -50,6 +59,20 @@ export interface HydrawiseDisplayRendering {
 
   rows: HydrawiseDisplayRow[];
   stale: boolean;
+}
+
+/**
+ * What a controller's fold renders: its one status word, the detail rows beneath it, and whether the facts behind them are old enough that the display says so.
+ *
+ * The word travels apart from the rows because the two are drawn in different places - the word in the panel's stat strip beside the controller's identity, the
+ * rows in the detail below it - and composing that layout is the renderer's job. A controller with no projection, or one naming no zone at all, has no status to
+ * report and answers `null`.
+ */
+export interface HydrawiseControllerRendering {
+
+  detail: HydrawiseDisplayRow[];
+  stale: boolean;
+  status: string | null;
 }
 
 /** The word each schedule state is shown as, shared by every surface that describes a zone. */
@@ -68,10 +91,11 @@ export declare const STALE_GRACE: number;
 export declare const formatMinutes: (seconds: number) => string;
 
 /**
- * Render an absolute instant for a reader in this browser's timezone.
+ * Render an absolute instant for a reader in this browser's timezone, as a clock time today, a weekday and clock within the coming week, and a locale date beyond
+ * that.
  *
  * @param epochSeconds - The instant to render.
- * @param nowSeconds   - The instant the render answers to, which decides whether a weekday is needed.
+ * @param nowSeconds   - The instant the render answers to, which decides which of the three tiers applies.
  *
  * @returns The rendered instant.
  */
@@ -102,7 +126,7 @@ export declare const deriveZoneDisplay: (entry: HydrawiseZoneScheduleEntry | und
   HydrawiseDisplayRendering;
 
 /**
- * Fold a controller's whole projection into its account-level rows.
+ * Fold a controller's whole projection into its status word and its account-level detail rows.
  *
  * @param schedule   - The controller's persisted projection, or `undefined` when it has none.
  * @param zoneNames  - The display name of each zone, keyed by relay id, for the zones that have one.
@@ -111,4 +135,4 @@ export declare const deriveZoneDisplay: (entry: HydrawiseZoneScheduleEntry | und
  * @returns The controller's rendering.
  */
 export declare const deriveControllerDisplay: (schedule: HydrawiseScheduleProjection | undefined, zoneNames: Record<string, string> | undefined,
-  nowSeconds: number) => HydrawiseDisplayRendering;
+  nowSeconds: number) => HydrawiseControllerRendering;
