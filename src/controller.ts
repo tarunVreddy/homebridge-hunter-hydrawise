@@ -207,11 +207,14 @@ export class HydrawiseController {
    */
   private lastKnownOnline: Nullable<boolean> = null;
 
-  /* When this controller last successfully commanded a suspend-all or a resume, in epoch seconds. A facts snapshot older than the user's own command cannot know
-   * about it, so the suspend switch ignores such a snapshot and answers from the wire heuristic until a refresh that postdates the command arrives. Zero means no
-   * command has been issued this session, which every real snapshot postdates.
+  /* The account-wide suspension command this controller last issued and no fresher truth has superseded, or undefined where none stands. It is the account-grain
+   * twin of the per-zone map below, carrying the same shape for the same reason: a bare timestamp would say that the user commanded something without saying
+   * WHICH WAY, which is enough to know a stale snapshot is uninformed but not enough to know what to show instead.
+   *
+   * Undefined rather than null for "none", so the one standing judgment both grains ask can take them on identical terms - a map read answers undefined for a
+   * zone with no command, and this answers undefined for an account with none.
    */
-  private lastSuspendCommandAt = 0;
+  private suspendAllCommand: HydrawiseZoneSuspendCommand | undefined;
 
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
@@ -422,23 +425,43 @@ export class HydrawiseController {
 
     this.reportAvailability(facts.online);
 
-    const projectionChanged = this.applyProjection(this.currentFacts);
-    const hardwareChanged = !this.sameHardware(prior?.hardware ?? null, facts.hardware);
+    this.rederiveProjection(!this.sameHardware(prior?.hardware ?? null, facts.hardware));
 
-    if(projectionChanged || hardwareChanged) {
+    this.log.debug("Enhanced details updated: model %s, firmware %s, reachable %s, zones %s.", facts.hardware?.model ?? "unknown",
+      facts.hardware?.firmware ?? "unknown", facts.online ?? "unknown", facts.zones.size.toString());
+  }
+
+  /* Re-derive the projection from whatever this controller currently knows, then make what moved durable and published. Every cadence that can change a zone's
+   * classification outside a poll runs this: a refresh tick, which brings fresh account facts, and a successful suspension command, whose acceptance is itself a
+   * fact about the zones it named.
+   *
+   * Both writes are CHANGE-GATED, which is what lets a recurring cadence run this freely. A tick or a command that moved no classification writes nothing to the
+   * accessory cache and publishes nothing on MQTT, where an unconditional pair would write the cache to disk every quarter hour and republish an unchanged
+   * payload with it. The poll cadence keeps its own unconditional publish, which is a contract of its own and deliberately not shared here.
+   *
+   * The facts are resolved ONCE and threaded through both the classification and the payload, on the same terms every other pass in this class resolves them, so
+   * a lifetime boundary crossed midway cannot leave the two describing different worlds.
+   *
+   * Before the first completed poll this is structurally a no-op: the projection step returns early with nothing to classify, so neither gate opens.
+   *
+   * @param mustFlush - Whether something outside the projection also has to reach the accessory cache this pass, which the projection's own change gate cannot
+   *                    see. The hardware facts are the case: HAP's characteristics are their only store, so a hardware change has to be flushed to survive.
+   */
+  private rederiveProjection(mustFlush = false): void {
+
+    const facts = this.currentFacts;
+    const projectionChanged = this.applyProjection(facts);
+
+    if(projectionChanged || mustFlush) {
 
       this.api.updatePlatformAccessories([this.accessory]);
     }
 
-    // A refresh tick that moved nothing stays silent on MQTT too, unlike the poll cadence, which publishes unconditionally.
     if(projectionChanged) {
 
-      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(this.currentFacts)); },
+      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
         label: "MQTT publish (controller)", log: this.log });
     }
-
-    this.log.debug("Enhanced details updated: model %s, firmware %s, reachable %s, zones %s.", facts.hardware?.model ?? "unknown",
-      facts.hardware?.firmware ?? "unknown", facts.online ?? "unknown", facts.zones.size.toString());
   }
 
   /* Adopt the denormalized account roster the platform recomposed, and make it durable when it actually moved.
@@ -511,12 +534,13 @@ export class HydrawiseController {
     return ((Math.floor(Date.now() / 1000) - this.v2Facts.fetchedAt) <= HYDRAWISE_V2_FACTS_TTL) ? this.v2Facts : null;
   }
 
-  /* Re-derive everything that follows from the classified projection, and report whether that projection moved. Both cadences that can change a zone's
-   * classification run this - the poll, which brings fresh wire truth, and a refresh tick, which brings fresh account facts - so a suspension arriving on a
-   * refresh reaches HomeKit, the log, and the accessory cache with that refresh rather than waiting up to a poll for the next one.
+  /* Re-derive everything that follows from the classified projection, and report whether that projection moved. Every cadence that can change a zone's
+   * classification runs this - the poll, which brings fresh wire truth, a refresh tick, which brings fresh account facts, and a successful suspension command,
+   * whose acceptance is a fact about the zones it named - so a suspension reaches HomeKit, the log, and the accessory cache with whatever learned of it rather
+   * than waiting for the next poll.
    *
-   * The flush is deliberately NOT performed here. Each caller owns its own write policy - the poll folds this into the single cache write it already makes, and a
-   * refresh gates its write on the boolean returned here - so this method persists and reports, and never decides.
+   * The flush is deliberately NOT performed here. Each caller owns its own write policy - the poll folds this into the single cache write it already makes, while
+   * the refresh and command cadences gate theirs on the boolean returned here - so this method persists and reports, and never decides.
    *
    * This is deliberately not a whole applyStatus re-run. That method also drives the standalone-accessory reconcile, whose wire-absence grace COUNTS POLLS, so
    * re-entering it outside a poll would double-count that grace and could demote an accessory the wire never actually dropped.
@@ -532,6 +556,11 @@ export class HydrawiseController {
       return false;
     }
 
+    /* Decide which commands still stand ONCE, before anything classifies. Everything downstream in this pass - the composition, both switch readers, the
+     * narration - then reads the same surviving set, so a command cannot be standing for one of them and retired for another.
+     */
+    this.retireSupersededCommands(facts);
+
     const changed = this.persistScheduleStatus(facts);
 
     this.refreshSuspensionStates();
@@ -546,16 +575,15 @@ export class HydrawiseController {
     return changed;
   }
 
-  /* Retire the per-zone suspension commands this pass supersedes, then show every companion switch what its zone now reads as.
+  /* Drop every per-zone suspension command this pass supersedes, so that what remains is exactly the set that still speaks for its zone.
    *
-   * Both cadences that can move a zone's suspension arrive here - the poll, which brings fresh wire truth, and the refresh tick, which brings the account facts a
-   * suspension is actually reported on - so a suspension made in the Hydrawise app reaches its switch with the refresh that learned of it rather than waiting for a
-   * poll that cannot see it.
+   * A command retires on either of the two things that can make it moot: facts that postdate it, which is the freshness rule's other face, and its zone leaving
+   * the wire report, which leaves nothing for the command to speak for.
    *
-   * A command retires on either of the two things that can make it moot: facts that postdate it, which is the freshness rule's other face, and its zone leaving the
-   * wire report, which leaves nothing for the command to speak for.
+   * This runs at the head of a pass rather than beside any one consumer, because the surviving set is what the classifier is handed: a stale entry reaching
+   * composition would resurrect a command the account has already answered, and it would do so in the persisted projection where every surface would read it.
    */
-  private refreshZoneSuspendSwitches(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
+  private retireSupersededCommands(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
     const reported = new Set(this.status.relays.map(zone => zone.relay_id));
 
@@ -566,6 +594,15 @@ export class HydrawiseController {
         this.zoneSuspendCommands.delete(relayId);
       }
     }
+  }
+
+  /* Show every companion switch what its zone now reads as.
+   *
+   * Both cadences that can move a zone's suspension arrive here - the poll, which brings fresh wire truth, and the refresh tick, which brings the account facts a
+   * suspension is actually reported on - so a suspension made in the Hydrawise app reaches its switch with the refresh that learned of it rather than waiting for a
+   * poll that cannot see it.
+   */
+  private refreshZoneSuspendSwitches(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
     for(const entry of this.accessory.context.schedule?.zones ?? []) {
 
@@ -717,8 +754,9 @@ export class HydrawiseController {
     return renamed;
   }
 
-  /* Whether a per-zone suspension command still speaks for its zone, which it does exactly while no fresher truth has arrived to supersede it. This is the one
-   * comparison home for the guard - the render and the sweep that clears it both ask here - so what "still standing" means cannot be answered two ways.
+  /* Whether a suspension command still speaks for what it was issued against, which it does exactly while no fresher truth has arrived to supersede it. This is
+   * the one comparison home for the guard at BOTH grains - the two readers, the sweep that clears retired entries, and through that sweep the composition itself
+   * all ask here - so what "still standing" means cannot be answered two ways, and the switches and the projection cannot disagree about it.
    *
    * Only a STRICTLY newer snapshot retires a command, which is the account-wide guard's own rule at the zone grain. Both instants are whole seconds, so a fetch
    * stamped in the same second as the command could have been dispatched either side of it, and the tie goes to the user: holding their command costs at most one
@@ -733,9 +771,13 @@ export class HydrawiseController {
     return (command !== undefined) && (!facts || (facts.fetchedAt <= command.at));
   }
 
-  /* Whether a zone reads as suspended right now. A standing command answers first, which is what stops a fetch already in flight when the user pressed the switch
-   * from flipping it straight back, and the classified projection answers otherwise - so the switch and the zone list are one reading rather than two derivations
-   * that can drift.
+  /* Whether a zone reads as suspended right now. A standing command answers first and the classified projection answers otherwise, so the switch and the zone
+   * list are one reading rather than two derivations that can drift.
+   *
+   * The command arm is asked DIRECTLY rather than read off the composition, and the running window is why it cannot be collapsed into it. A zone suspended while
+   * it is watering keeps its switch on - the user's command was accepted - while the projection honestly reads running until the water stops, because flowing
+   * water is the one thing no command overrules. Those are two different questions, and both are answered from the one standing judgment above rather than from
+   * two sources that could drift.
    */
   private isZoneSuspended(relayId: number, state: HydrawiseZoneScheduleStatus | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
@@ -984,13 +1026,13 @@ export class HydrawiseController {
         return;
       }
 
-      /* Stamp the instant this command succeeded. A facts snapshot fetched before it cannot know about it, so the switch ignores any snapshot older than this and
-       * answers from the wire heuristic until a refresh that postdates the command lands - which is what stops a fetch already in flight when the user pressed
-       * the switch from flipping it straight back. A resume stamps too, for the same reason in the other direction.
+      /* Record this command with the instant it succeeded and the direction it went. A facts snapshot fetched before it cannot know about it, so every reader
+       * ignores such a snapshot in this command's favor until a refresh that postdates it lands - which is what stops a fetch already in flight when the user
+       * pressed the switch from flipping it straight back. A resume records too, for the same reason in the other direction.
        */
       const at = Math.floor(Date.now() / 1000);
 
-      this.lastSuspendCommandAt = at;
+      this.suspendAllCommand = { at, commandedUntil: value ? timestamp : null };
 
       /* An account-wide command is also a fact about every zone beneath it, so it stamps each one's own guard with the direction it went. The population is every
        * zone the WIRE has reported rather than the enabled projection, which is empty until the first poll completes and which silently omits any zone a feature
@@ -1003,6 +1045,10 @@ export class HydrawiseController {
       }
 
       this.log.info("%s scheduled watering for all zones.", value ? "Suspending" : "Resuming");
+
+      // Re-derive on the account-wide command's own terms, exactly as a per-zone command does. It runs after the sentence above so the account-wide statement
+      // reads ahead of the per-zone transitions the re-derive narrates beneath it.
+      this.rederiveProjection();
     });
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
@@ -1526,6 +1572,12 @@ export class HydrawiseController {
        */
       this.zoneSuspendCommands.set(zone.relay_id, { at: Math.floor(Date.now() / 1000), commandedUntil: until });
 
+      /* Re-derive right here, so the projection every other surface reads carries this command at once rather than waiting on the next account refresh. The
+       * webUI, the MQTT payload, and the log sentence all answer to that projection, and a quarter of an hour of them contradicting the switch the user just
+       * pressed is the whole reason this call is here rather than at the next tick.
+       */
+      this.rederiveProjection();
+
       return;
     }
 
@@ -1800,12 +1852,18 @@ export class HydrawiseController {
    * to the volatile half of what this accessory persists. The projection stores absolute instants, so an unchanged schedule projects byte-identically poll after
    * poll and the comparison takes the no-change return; a projection compared before any has been persisted is a change by definition and seeds the context.
    *
+   * This is where the witnesses meet. The commands map is composed from the per-zone records this pass has already swept, so every entry in it is standing
+   * by construction and the classifier is handed direction alone - one place decides what still stands, and one classification weighs it against the wire and the
+   * account's own facts. Composing here rather than overlaying at each consumer is what keeps the webUI, MQTT, the log, and the switches reading one answer.
+   *
    * Like the roster it never flushes, and the applyStatus chokepoint is the single consumer of the signal it returns.
    */
   private persistScheduleStatus(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
     const previous = this.accessory.context.schedule;
-    const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts: facts ?? undefined, priorSuspended: this.priorSuspended(previous) });
+    const commands = new Map<number, Nullable<number>>([...this.zoneSuspendCommands].map(([ relayId, command ]) => [ relayId, command.commandedUntil ]));
+    const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR, { commands, facts: facts ?? undefined,
+      priorSuspended: this.priorSuspended(previous) });
 
     if(previous && sameScheduleStatus(previous, schedule)) {
 
@@ -1919,14 +1977,17 @@ export class HydrawiseController {
     return ((valve?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
   }
 
-  /* Whether the account reads as fully suspended, which is what drives the suspend-all switch's state. There are two answers, and which one applies depends on
-   * what this controller can actually know.
+  /* Whether the account reads as fully suspended, which is what drives the suspend-all switch's state. Answers in precedence, the account-grain twin of the
+   * per-zone reader above and deliberately the same shape: one reader pattern at both grains, both consulting the one standing judgment.
    *
-   * With trustworthy account facts that POSTDATE the last suspend-all command, the answer comes from the classified states: the account is suspended when every
-   * reported zone classifies suspended. Reading the classification rather than the raw suspension facts keeps this the projection's single truth, and it is also
-   * the behaviorally right answer where a raw read would be wrong - a zone the user forced into a manual run classifies as running, so the switch reads off while
-   * water flows, exactly as the wire heuristic reads today. The command-recency condition closes the other half: a snapshot fetched before the user's own command
-   * cannot know about it, and letting one answer here would flip the switch straight back.
+   * A STANDING COMMAND answers first, and its direction is the answer. This is the arm that cannot be replaced by reading composed state, for the same reason the
+   * zone reader's cannot: the projection is re-derived inside the command's own handler, from a poll snapshot taken before the account accepted anything, so a
+   * reader that consulted only that composition would flip the switch straight back off under the user's finger.
+   *
+   * With trustworthy facts and no command standing, the answer comes from the classified states: the account is suspended when every reported zone classifies
+   * suspended. Reading the classification rather than the raw suspension facts keeps this the projection's single truth, and it is also the behaviorally right
+   * answer where a raw read would be wrong - a zone the user forced into a manual run classifies as running, so the switch reads off while water flows, exactly
+   * as the wire heuristic reads. Nothing about the command's age is asked here, because the one standing judgment above has already asked it.
    *
    * Otherwise the wire heuristic stands. Every zone carrying the unscheduled sentinel with no sensor stop is the strongest evidence the key-based wire offers for
    * a suspend-all, and it is what the API itself normalizes a suspend-all command to. It carries two documented ambiguities: it cannot tell a suspend-all from an
@@ -1936,7 +1997,14 @@ export class HydrawiseController {
    */
   private isAllSuspended(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
-    if(facts && (facts.fetchedAt > this.lastSuspendCommandAt)) {
+    const command = this.suspendAllCommand;
+
+    if(this.commandStands(command, facts)) {
+
+      return command.commandedUntil !== null;
+    }
+
+    if(facts) {
 
       const zones = this.accessory.context.schedule?.zones ?? [];
 

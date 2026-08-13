@@ -348,9 +348,13 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
   test("a snapshot older than the user's own command never flips the switch back", async (t) => {
 
-    /* The race the command guard closes, constructed so a guarded and an unguarded implementation visibly disagree. The wire is the all-suspended shape, which the
-     * key-based heuristic answers ON; the stale snapshot reports every zone unsuspended, which an unguarded facts path would answer OFF. The switch reads ON only
-     * through the guard, so a missing or inverted comparison reds here.
+    /* The race the command guard closes, constructed so a guarded and an unguarded implementation visibly disagree. The stale snapshot reports every zone
+     * unsuspended, which an ungated facts path would answer OFF; the user's own command is newer than that snapshot, so the guard holds the switch ON. A missing
+     * or inverted comparison reds here.
+     *
+     * The wire under it is the all-suspended shape, so the key-based heuristic would answer ON as well. That agreement is deliberate - it keeps this pin about
+     * the guard's OUTCOME rather than about which arm produced it - and the account-grain pin that does tell those arms apart runs against a non-sentinel wire
+     * in the suspension suite, where the heuristic answers the other way.
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
@@ -373,7 +377,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
     h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts() ]) }),
       fetchedAt: Math.floor(Date.now() / 1000) - 100 });
 
-    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "a snapshot older than the command is ignored in favor of the wire heuristic");
+    assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "a snapshot older than the command is ignored and the switch stays on");
   });
 
   test("the two key-based topology pins are untouched by an install without credentials", async (t) => {

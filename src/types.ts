@@ -558,38 +558,65 @@ export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, status: StatusS
       .every(member => carriesUnscheduledSentinel(member)));
 }
 
-/* Project a wire zone onto its persisted schedule state, through exactly four ordered exits.
+/* Project a wire zone onto its persisted schedule state, through ordered exits that weigh the wire, the account's facts, and a suspension command the account
+ * has accepted against one another.
  *
- * The FIRST exit owns the ambiguous shape and is the only one the account-credentialed facts reach. A zone carrying the unscheduled sentinel with no run and no
- * schedule string is the one body the key-based wire cannot read further, so this is where a suspension, a rain stop, and a plain absence of scheduling are told
- * apart. A suspension the facts report wins outright, then a suspension carried forward from the prior projection, then a sensor stop - the facts' own live
- * reading where they carry one, the group inference where they do not - and an unscheduled zone is what remains. A positive "the sensors are quiet" answer is
- * deliberately NOT followed by the group inference: the account API has looked at the sensor itself, which is better evidence than reading the shape of a group.
+ * RUNNING is asked first, and it is the only reading no other witness can overturn. Water demonstrably flowing is the strongest fact anyone here holds, and a
+ * running zone never presents the unscheduled shape - it always carries a run - so asking it first moves no classification that the shapes below would have
+ * claimed.
  *
- * Suspension outranks the sensor claim because it is the longer-lived, user-created fact; the sensor's claim returns on its own the moment the suspension clears.
+ * A STANDING SUSPEND COMMAND answers next, for ANY wire shape rather than only the ambiguous one. The account has just accepted the command, and the poll
+ * snapshot in hand was taken before it: a zone still reporting a live schedule is exactly the case this arm exists for, because the wire cannot yet know what
+ * the account has agreed to. Every command reaching here is already known to be STANDING - the caller decides that, which is what keeps this module clock-free.
  *
- * The remaining exits are the wire's own unambiguous readings: a `time` of 1 is the running marker, whose end instant is the root time plus the seconds of run
- * remaining; the sentinel reached HERE still carries a run or a schedule string, so it is simply unscheduled; and everything else is scheduled, its next run
- * being the root time plus the seconds the wire reports until it. Hoisting the sentinel shape above the running test changes no classification, because a
- * running zone always carries a run and so never presents that shape.
+ * The SENTINEL branch then owns the ambiguous shape, the one body the key-based wire cannot read further, where a suspension, a rain stop, and a plain absence
+ * of scheduling look identical. A suspension the facts report wins outright, then a suspension carried forward from the prior projection, then a sensor stop -
+ * the facts' own live reading where they carry one, the group inference where they do not - and an unscheduled zone is what remains. A positive "the sensors are
+ * quiet" answer is deliberately NOT followed by the group inference: the account API has looked at the sensor itself, which is better evidence than reading the
+ * shape of a group. Suspension outranks the sensor claim because it is the longer-lived, user-created fact; the sensor's claim returns on its own the moment the
+ * suspension clears.
+ *
+ * A standing RESUME travels the other direction and acts as SUPPRESSION rather than as a claim of its own: it silences both suspension arms inside that branch
+ * and lets the zone fall through to the sensor test, because resuming a zone does not call off a rain delay. On any other shape a resume is naturally silent,
+ * since no suspension arm would have fired there anyway.
+ *
+ * The remaining exits are the wire's own unambiguous readings: the sentinel reached HERE still carries a run or a schedule string, so it is simply unscheduled;
+ * and everything else is scheduled, its next run being the root time plus the seconds the wire reports until it.
  *
  * Every time-bearing arm stores ABSOLUTE epoch seconds, and that is what makes the projection stable across polls: the wire's countdowns fall as the poll clock
  * rises, so each sum holds still until the schedule genuinely moves. Storing the countdowns themselves would move every field on every poll and turn each poll into
  * a cache write.
  *
- * With neither facts nor a carried suspension the whole path collapses to the key-based classification, which is what keeps an install without account
+ * With no facts, no carried suspension, and no command the whole path collapses to the key-based classification, which is what keeps an install without account
  * credentials reading exactly as it always has.
  */
-export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse, facts?: HydrawiseZoneV2Facts, priorSuspendedUntil?: number):
-HydrawiseZoneScheduleStatus {
+export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse, facts?: HydrawiseZoneV2Facts, priorSuspendedUntil?: number,
+  commanded?: Nullable<number>): HydrawiseZoneScheduleStatus {
+
+  if(zone.time === 1) {
+
+    return { endsAt: status.time + zone.run, relayId: zone.relay_id, state: "running" };
+  }
+
+  /* The absences are excluded explicitly rather than by truthiness, exactly as the facts arm below excludes its own: an undefined means no command speaks for
+   * this zone, a null means one does and it commanded a RESUME. Only a real instant claims this arm, so a zone suspended until epoch zero still classifies as
+   * suspended.
+   */
+  if((commanded !== undefined) && (commanded !== null)) {
+
+    return { relayId: zone.relay_id, state: "suspended", until: commanded };
+  }
 
   if(carriesUnscheduledSentinel(zone)) {
 
     const suspendedUntil = facts?.suspendedUntil;
 
+    // A standing resume silences the two suspension arms below. Reaching here at all means the command was not a suspend, so this is true exactly when one stands.
+    const resumed = commanded === null;
+
     // Both absences are excluded explicitly: an undefined means no facts entry reached this zone at all, and a null means the entry reached it and reported no
     // suspension. Only a real instant claims the arm, so a zone suspended until epoch zero still classifies as suspended.
-    if((suspendedUntil !== undefined) && (suspendedUntil !== null)) {
+    if(!resumed && (suspendedUntil !== undefined) && (suspendedUntil !== null)) {
 
       return { relayId: zone.relay_id, state: "suspended", until: suspendedUntil };
     }
@@ -598,7 +625,7 @@ HydrawiseZoneScheduleStatus {
      * this classification pure and lets an elapsed suspension expire out of the carry on its own. The carried instant is passed through verbatim, never
      * recomputed, so a carried arm stays byte-identical poll after poll and never provokes a cache write.
      */
-    if((priorSuspendedUntil !== undefined) && (priorSuspendedUntil > status.time)) {
+    if(!resumed && (priorSuspendedUntil !== undefined) && (priorSuspendedUntil > status.time)) {
 
       return { relayId: zone.relay_id, state: "suspended", until: priorSuspendedUntil };
     }
@@ -618,11 +645,6 @@ HydrawiseZoneScheduleStatus {
     return { relayId: zone.relay_id, state: "unscheduled" };
   }
 
-  if(zone.time === 1) {
-
-    return { endsAt: status.time + zone.run, relayId: zone.relay_id, state: "running" };
-  }
-
   if(zone.time === HYDRAWISE_UNSCHEDULED_SENTINEL) {
 
     return { relayId: zone.relay_id, state: "unscheduled" };
@@ -631,14 +653,19 @@ HydrawiseZoneScheduleStatus {
   return { durationSeconds: zone.run, nextRunAt: status.time + zone.time, relayId: zone.relay_id, state: "scheduled" };
 }
 
-/* The account-credentialed inputs a whole-controller projection can be composed with: the facts one refresh reported, and the suspension instants carried
- * forward from the prior projection for the zones this refresh has nothing to say about.
+/* The account-credentialed inputs a whole-controller projection can be composed with: the suspension commands the account has accepted, the facts one refresh
+ * reported, and the suspension instants carried forward from the prior projection for the zones this refresh has nothing to say about.
  *
- * They travel as one options argument because they are one decision - how much the account API contributes to this pass - and because a caller that has neither
- * omits the argument entirely, which is precisely the shape an install without credentials takes.
+ * They travel as one options argument because they are one decision - how much the account API contributes to this pass - and because a caller that has none of
+ * them omits the argument entirely, which is precisely the shape an install without credentials takes.
+ *
+ * The commands map is keyed by relay id and carries DIRECTION alone: an instant for a suspension, null for a resume. Every entry in it is PRE-FILTERED to the
+ * commands that still stand, which the caller alone can judge, since deciding it means comparing a command's age against the facts in hand. Keeping that
+ * judgment out of here is what leaves this module clock-free and its classification reproducible from its arguments.
  */
 export interface HydrawiseScheduleStatusOptions {
 
+  commands?: Map<number, Nullable<number>>;
   facts?: HydrawiseControllerV2Facts;
   priorSuspended?: Map<number, number>;
 }
@@ -651,13 +678,16 @@ export interface HydrawiseScheduleStatusOptions {
  * suspension - a null suspendedUntil being a real answer, not an absence - while a zone the facts simply do not name keeps whatever the prior projection said.
  * Judging the carry account-wide instead would let one zone's fresh answer silently clear a sibling the same answer never covered.
  *
+ * A zone's command is resolved from the map exactly as its facts entry is, and travels alongside rather than in place of either: the classifier weighs all three
+ * witnesses in one precedence, which is what keeps every consumer of this projection reading one answer instead of overlaying a command on top of it themselves.
+ *
  * The controller's availability is stamped only when fresh facts actually carried one, so the persisted shape of an install without account credentials is
  * byte-identical to what it has always been.
  */
 export function scheduleStatus(status: StatusScheduleResponse, activeWindowSeconds: number, options: HydrawiseScheduleStatusOptions = {}):
 HydrawiseScheduleStatus {
 
-  const { facts, priorSuspended } = options;
+  const { commands, facts, priorSuspended } = options;
 
   const projection: HydrawiseScheduleStatus = { activeWindowSeconds, asOf: status.time,
 
@@ -665,7 +695,7 @@ HydrawiseScheduleStatus {
 
       const zoneFacts = facts?.zones.get(zone.relay_id);
 
-      return zoneScheduleStatus(zone, status, zoneFacts, zoneFacts ? undefined : priorSuspended?.get(zone.relay_id));
+      return zoneScheduleStatus(zone, status, zoneFacts, zoneFacts ? undefined : priorSuspended?.get(zone.relay_id), commands?.get(zone.relay_id));
     }) };
 
   if(facts && (facts.online !== null)) {

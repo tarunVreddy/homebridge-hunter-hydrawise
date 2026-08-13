@@ -1241,6 +1241,15 @@ const showDeviceDetails = ({ device, panel, signal }) => {
     scheduleMountSignal = signal;
     ui.liveness.onResume(() => void scheduleTick(), { signal });
   }
+
+  /* One tick immediately, rather than leaving the panel to wait out the first interval. The paint above renders from the device row the SIDEBAR LISTING carried,
+   * whose schedule snapshot dates from the moment the panel session mounted, so a panel opened some way into a session can show state up to a tick behind the very
+   * dots beside it - which the ticker has been refreshing all along. This heals it within one local cache read.
+   *
+   * It costs nothing to run alongside the interval: the read is getCachedAccessories, a local call that leaves the zero-automatic-cloud-call property intact, and
+   * the tick's own sequence guards make an overlap with an interval tick harmless - the later read wins and the earlier one is dropped unpainted.
+   */
+  void scheduleTick();
 };
 
 // Parameters for our feature options webUI.

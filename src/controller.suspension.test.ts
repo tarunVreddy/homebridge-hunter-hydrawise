@@ -12,20 +12,23 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import { HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
   HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
-import type { HydrawiseZoneConfig, HydrawiseZoneV2Facts, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneScheduleStatus, HydrawiseZoneV2Facts,
+  StatusScheduleResponse } from "./types.ts";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
 import { buildController, countLogged, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_RAIN_SENSOR_TYPE } from "./types.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
 import { RateBudget } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { getServiceName } from "homebridge-plugin-utils";
+import { scheduleStatus } from "./types.ts";
 import { suspendZoneSubtype } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
@@ -69,8 +72,12 @@ const TOKEN_PATH = new URL(HYDRAWISE_V2_TOKEN_ENDPOINT).pathname;
 // A successful token grant, shaped as the live capture recorded it, so the command under test gets past the token chokepoint and reaches the transport.
 const TOKEN_BODY = { access_token: "access-one", expires_in: 3600, refresh_token: "refresh-one" };
 
-/* The zone under test, carrying the unscheduled sentinel shape. That shape is what a suspended zone presents on the key-based wire, so it is the only shape the
- * account API's suspension facts can actually classify - a running or scheduled zone answers from the wire alone whatever the facts say.
+/* The zone under test, carrying the unscheduled sentinel shape. That shape is the one body the key-based wire cannot read further, so it is the only shape the
+ * account API's suspension FACTS can classify - the facts arm sits inside the branch that owns it, and a running or scheduled zone answers from the wire there.
+ *
+ * A standing COMMAND is a different matter and reaches every shape below, which is the whole point of it: the account has just accepted the command and the poll
+ * snapshot in hand predates it, so a zone still reporting a live schedule is exactly the case that needs answering. The scheduled and running fixtures below are
+ * what put that under test, since a scenario built only on this shape would pass without ever exercising it.
  */
 function alphaZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
 
@@ -83,11 +90,57 @@ function betaZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneCo
   return makeZone({ name: "Bravo", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "", ...overrides });
 }
 
+// The same zone carrying a LIVE SCHEDULE - a real countdown and a real duration - which is the shape a command has to reach past the wire to classify. It runs
+// well beyond the active-zone window so a poll settles it without also driving a start transition.
+function scheduledZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00", ...overrides });
+}
+
+// The same zone RUNNING, which is the one reading no command overrules: water demonstrably flowing outranks an account's acceptance of anything.
+function runningZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 600, time: 1, timestr: "", ...overrides });
+}
+
+// A second zone carrying a live schedule, so an account-wide scenario can act on a population the sentinel shape does not cover.
+function scheduledBeta(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Bravo", relay: 2, relay_id: BETA_RELAY_ID, run: 300, time: 69000, timestr: "16:08", ...overrides });
+}
+
 // A fast-cadence status body carrying the given zones and a sensor block covering nothing, so no zone classifies as sensor-stopped and the suspension arm is the
 // only thing that can move a switch.
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
   return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+}
+
+/* The same body at the WIRE-REALISTIC cadence, which puts the next poll a minute away. Every claim about what a COMMAND alone costs needs that: the poll cadence
+ * publishes unconditionally and re-derives on its own account, so a poll landing between the command and the assertion would inflate every count being read for
+ * reasons that have nothing to do with the command.
+ */
+function pacedSchedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
+
+  return makeStatusSchedule({ relays: zones, sensors });
+}
+
+// A rain-class sensor block covering the named zones, so a scenario can put a standing resume up against a sensor that is evidently stopping its whole group.
+function sensorsCovering(...ids: number[]): StatusScheduleResponse["sensors"] {
+
+  return [{ input: 0, mode: 1, relays: ids.map(id => ({ id })), type: HYDRAWISE_RAIN_SENSOR_TYPE }];
+}
+
+// The persisted schedule projection, which is the store the webUI reads and the one every claim about immediate reflection is made against.
+function projectionOf(h: BuildControllerResult): HydrawiseZoneScheduleStatus[] {
+
+  return (h.accessory.context as HydrawiseAccessoryContext).schedule?.zones ?? [];
+}
+
+// One zone's entry in that projection.
+function entryOf(h: BuildControllerResult, relayId = ALPHA_RELAY_ID): HydrawiseZoneScheduleStatus | undefined {
+
+  return projectionOf(h).find(entry => entry.relayId === relayId);
 }
 
 // The current whole second, which is the unit every command stamp and every facts snapshot speaks.
@@ -621,6 +674,254 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     // Both directions, because a stamp that only ever recorded suspensions would leave a resume-all fighting the same stale facts it was meant to outrank.
     assert.equal(readsSuspended(h.accessory), false, "an account-wide resume renders every zone unsuspended against an older snapshot");
+  });
+});
+
+describe("HydrawiseController suspension commands composed into the projection", () => {
+
+  test("a suspend of a SCHEDULED zone reflects in the projection, MQTT, and the log at once", async (t) => {
+
+    /* The case the whole composition exists for. The zone is carrying a live schedule, so the wire says nothing about suspension and the account's facts cannot
+     * speak for it either - the classifier's facts arm only reaches the ambiguous sentinel shape. What answers is the command the account just accepted, and it
+     * has to answer everywhere at once rather than on the switch alone with the rest of the surfaces a refresh interval behind.
+     *
+     * No refresh tick and no second poll are involved: the assertions run against what the command's own handler produced.
+     */
+    const h = buildController({ hasV2Client: true, mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: pacedSchedule([scheduledZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [ SUSPEND_ZONE_ON, "Enable.Log.Zone" ] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+
+    /* A refresh lands BEFORE the command, which is the ordinary state of an install that has these switches at all - they exist only where the credentials do,
+     * and the refresh cadence brings facts every quarter hour. It matters to the MQTT half specifically: the payload's classified fields are gated on having a
+     * trustworthy snapshot, which is the promise that keeps a key-only install's payload byte-identical to what it has always been.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
+
+    const publishesBefore = h.mqtt?.publishes.length ?? 0;
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    const entry = entryOf(h);
+
+    assert.equal(entry?.state, "suspended", "the persisted projection reads the zone as suspended without waiting for a refresh");
+    assert.equal((entry?.state === "suspended") ? entry.until : undefined, Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION,
+      "and carries the instant the command actually asked for");
+
+    const payload = JSON.parse(h.mqtt?.publishes.at(-1)?.payload ?? "[]") as { state?: string; suspendedUntil?: number }[];
+
+    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "the command's own handler publishes exactly once");
+    assert.equal(payload[0]?.state, "suspended", "and the payload it published carries the composed state");
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "the transition narrates once, in the command's own handler");
+  });
+
+  test("a suspend of a RUNNING zone holds the switch on while the projection honestly reads running", async (t) => {
+
+    /* The one documented window. Water demonstrably flowing is wire truth that no command record overwrites, so the projection keeps saying running - while the
+     * switch still shows the user that their command was accepted, because those are different questions answered from one standing judgment.
+     *
+     * The poll after it is what closes the window: the wire reports the zone stopped and carrying the sentinel shape, and the same standing command then
+     * composes the suspension the user asked for.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
+    }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await waitFor(() => (entryOf(h)?.state === "running") ? true : undefined);
+
+    service.clearWrites();
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    /* The claim is about what the re-derive INSIDE this handler wrote, which the cached value cannot answer: a set caches the value it was handed once the
+     * handler resolves, so reading it back would report the user's own tap whatever the reader beneath it decided. The write log is what distinguishes them - a
+     * reader collapsed onto composed state would have written the switch off here, because the projection honestly reads running.
+     */
+    assert.ok(!service.writesFor(Characteristic.On).some(write => write.value === false), "nothing in the command's handler turns the switch back off");
+    assert.equal(entryOf(h)?.state, "running", "while the projection keeps reporting the water that is demonstrably flowing");
+
+    // The next poll finds the run finished, and the standing command classifies the zone it was issued against.
+    await waitFor(() => (entryOf(h)?.state === "suspended") ? true : undefined);
+
+    assert.equal(entryOf(h)?.state, "suspended", "the poll that ends the run closes the window");
+  });
+
+  test("a resume clears a composed suspension at once, and does not call off a rain delay", async (t) => {
+
+    /* The other direction, which is suppression rather than a claim: a standing resume silences the suspension arms and lets the zone fall through to the sensor
+     * test. Resuming a zone tells the account to stop withholding it, which says nothing at all about whether a rain sensor is stopping it right now.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php",
+        { body: pacedSchedule([alphaZone()], sensorsCovering(ALPHA_RELAY_ID)), kind: "response" }), signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(entryOf(h)?.state, "suspended", "the suspension composes first, outranking the sensor as the longer-lived fact");
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(false);
+
+    assert.equal(entryOf(h)?.state, "sensor-stopped", "the resume clears the suspension and the sensor's own claim returns rather than a clean schedule");
+  });
+
+  test("an account-wide command reflects across a NON-SENTINEL snapshot, its own switch included", async (t) => {
+
+    /* The account grain, driven against zones carrying live schedules so nothing here could pass on the sentinel shape alone. The switch assertion is the one
+     * that matters most: the re-derive fires inside the command's own handler and refreshes that switch from the composed state, so a reader that consulted only
+     * the composition - built from a poll snapshot taken before the account accepted anything - would flip the switch straight back off under the user's finger.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: pacedSchedule([ scheduledZone(), scheduledBeta() ]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+
+    t.after(() => h.abort());
+
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+
+    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+
+    await all.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(entryOf(h)?.state, "suspended", "every reported zone composes as suspended at once");
+    assert.equal(entryOf(h, BETA_RELAY_ID)?.state, "suspended", "the sibling included");
+
+    /* What the switch READS is what its own handler answers, which is the question HomeKit actually asks and the one the reader has to get right. Reading the
+     * cached value instead would prove nothing here: a set caches the value it was given once the handler resolves, so it reports the user's own tap back
+     * whatever the reader beneath it thinks.
+     *
+     * The re-derive runs inside this command's handler and refreshes this switch from composed state built on a poll snapshot taken BEFORE the account accepted
+     * anything, so a reader that consulted only that composition answers off here and the switch drops back under the user's finger.
+     */
+    assert.equal(await all.getCharacteristic(Characteristic.On).triggerGet(), true, "and the account-wide switch reads on after the re-derive its handler ran");
+
+    await all.getCharacteristic(Characteristic.On).triggerSet(false);
+
+    assert.equal(entryOf(h)?.state, "scheduled", "a resume-all returns every zone to what the wire reports");
+    assert.equal(await all.getCharacteristic(Characteristic.On).triggerGet(), false, "and the switch follows it back off");
+  });
+
+  test("strictly newer facts retire a command and own the projection, while an older snapshot changes nothing", async (t) => {
+
+    // The retirement rule reaching the projection rather than the switch alone. A command is the freshest witness only until the account answers past it.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: pacedSchedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(entryOf(h)?.state, "suspended", "the command composes the suspension");
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() - 5);
+
+    assert.equal(entryOf(h)?.state, "suspended", "a snapshot that predates the command leaves it standing in the projection too");
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() + 2);
+
+    assert.equal(entryOf(h)?.state, "unscheduled", "and one that postdates it retires the command, handing the projection back to the account");
+  });
+
+  test("a command costs exactly one flush, one publish, and one narration - and a no-op command costs none", async (t) => {
+
+    /* Cardinality, read before any poll can intervene: the poll cadence publishes unconditionally and re-derives on its own account, so its arrival would
+     * inflate every count here for reasons unrelated to the command.
+     *
+     * The second half is the change gate doing its job. Suspending a zone the account's own facts already report as suspended moves no classification, so the
+     * re-derive writes nothing, publishes nothing, and narrates nothing.
+     */
+    const h = buildController({ hasV2Client: true, mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: pacedSchedule([scheduledZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [ SUSPEND_ZONE_ON, "Enable.Log.Zone" ] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+
+    // A refresh lands first, for the same reason the pin above states, and every count below is taken after it settles.
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
+
+    const flushesBefore = h.flushes.length;
+    const publishesBefore = h.mqtt?.publishes.length ?? 0;
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(h.flushes.length, flushesBefore + 1, "the command writes the accessory cache exactly once");
+    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "publishes exactly once");
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates exactly once");
+
+    // The same command again, against a classification that already reads suspended. Nothing moved, so nothing is written, published, or said.
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(h.flushes.length, flushesBefore + 1, "a command that moves no classification writes nothing");
+    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "publishes nothing");
+    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates nothing a second time");
+  });
+
+  test("a suspend-all issued before the first poll classifies nothing and stamps its own answer", async (t) => {
+
+    /* The pre-first-poll window, where there is no wire report to classify against at all. The account-wide switch answers from its own command record, the
+     * per-zone stamp loop has an empty population to walk, and the re-derive is structurally a no-op because the projection step returns early.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: true, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+
+    t.after(() => h.abort());
+
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+
+    await all.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    assert.equal(all.getCharacteristic(Characteristic.On).value, true, "the account-wide switch answers from the command it just recorded");
+    assert.deepEqual(projectionOf(h), [], "and nothing is classified, because no poll has reported a zone to classify");
+    assert.equal(h.flushes.length, 0, "so the command writes nothing to the accessory cache");
+  });
+
+  test("a projection restored carrying a commanded suspension survives the restart and reconciles on fresh facts", async (t) => {
+
+    /* Restart honesty. The command records die with the process, so what comes back is the composed projection alone - and the carry holds its suspension
+     * through the window before the first refresh answers, exactly as it holds one the account reported. A fresh snapshot then reconciles it, which is what
+     * keeps a restart from stranding a claim nothing can clear.
+     */
+    const restored = scheduleStatus(pacedSchedule([alphaZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
+      { commands: new Map([[ ALPHA_RELAY_ID, SUSPENDED_UNTIL ]]) });
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: pacedSchedule([alphaZone()]), kind: "response" }),
+      seedContext: (seed) => { seed.context = { schedule: restored }; }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => suspendSwitch(h.accessory));
+
+    assert.equal(entryOf(h)?.state, "suspended", "the restored suspension carries through the first poll, which has no facts and no command of its own");
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
+
+    assert.equal(entryOf(h)?.state, "unscheduled", "and the first real answer from the account reconciles it");
   });
 });
 
