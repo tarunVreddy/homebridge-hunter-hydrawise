@@ -62,6 +62,15 @@ export const HYDRAWISE_V2_BUDGET_CALLS = 5;
 // The trailing window, in seconds, the v2 call ceiling above is measured over.
 export const HYDRAWISE_V2_BUDGET_WINDOW = 1800;
 
+/* How long, in seconds, a per-zone suspension command waits for the v2 ceiling to admit it before it gives up.
+ *
+ * A command is a person standing at their phone watching a switch, so it is bounded by a beat rather than by the budget's own window: that window is half an hour
+ * wide, and a command that queued for it would take effect long after the user had walked away. Giving up inside a second turns contention into a switch that flicks
+ * back carrying a reason, which is the answer the user can act on. An abandoned wait consumes no slot and leaves every other waiter in place, so bounding a command
+ * this tightly costs the scheduled reads nothing.
+ */
+export const HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT = 1;
+
 /* The v2 response timeout, in seconds. It is deliberately more generous than the v1 timeout: a v2 call can carry an OAuth round trip ahead of the query itself, and
  * the graph endpoint answers a whole account in one response where a v1 call answers one controller, so the same budget would cut off requests that were simply
  * doing more work.

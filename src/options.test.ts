@@ -4,6 +4,7 @@
  * scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
  */
 import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
+import type { HydrawiseControllerOption, HydrawiseZoneOption } from "./options.ts";
 import { describe, test } from "node:test";
 import { describeOptionScope, featureOptionCategories, featureOptions } from "./options.ts";
 import assert from "node:assert/strict";
@@ -53,31 +54,38 @@ describe("hydrawise feature options", () => {
     const device = optionEntry("Device", "");
     const name = optionEntry("Device", "Name");
     const suspend = optionEntry("Device", "Suspend.All");
+    const suspendZone = optionEntry("Device", "Suspend.Zone");
     const syncName = optionEntry("Device", "SyncName");
     const logZone = optionEntry("Log", "Zone");
 
-    assert.ok(device && name && suspend && syncName && logZone, "every catalog entry the runtime names should exist");
+    assert.ok(device && name && suspend && suspendZone && syncName && logZone, "every catalog entry the runtime names should exist");
     assert.equal(device.default, true, "the base Device option defaults to enabled");
     assert.equal(name.default, false, "the zone name option defaults to disabled, so an unconfigured zone resolves no override at all");
     assert.equal(name.defaultValue, "", "the zone name option is value-centric and defaults to empty, which the runtime reads as no override");
     assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
+    assert.equal(suspendZone.default, false, "the per-zone suspension switches default to disabled");
     assert.equal(syncName.default, true, "name synchronization defaults to enabled");
     assert.equal(logZone.default, true, "zone logging defaults to enabled");
+
+    /* The account login is a prose requirement rather than a gate - no mechanism withholds this option from an install without credentials - so the description
+     * is the only place a user learns that the switches need one. Losing that sentence would leave the option silently doing nothing for them.
+     */
+    assert.ok(suspendZone.description.includes("account login"), "the per-zone suspension description states the account login it needs");
   });
 
   test("the controller-scopable options match the controller option-name union", () => {
 
     // This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time HydrawiseControllerOption union.
     // A catalog scope change that is not mirrored in the union surfaces here.
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend.All", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName", "Log.Zone" ],
       "every controller-scoped option should be named in the controller union");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
 
     // The framework's "device" level is the zone level in this plugin's projection, so this set is the mirror of HydrawiseZoneOption plus the value-centric
-    // HydrawiseZoneValueOption. The suspend option is controller-only and stays out of it.
-    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.Standalone", "Device.SyncName", "Log.Zone" ],
+    // HydrawiseZoneValueOption. The account-wide suspend option is controller-only and stays out of it; its per-zone sibling is exactly the opposite case.
+    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.Zone", "Device.SyncName", "Log.Zone" ],
       "every zone-scoped option should be named in one of the zone unions");
   });
 
@@ -86,7 +94,20 @@ describe("hydrawise feature options", () => {
     // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
     // zone, so it resolves at the zone alone.
     assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
-      "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ], "the zone name override is the only option that does not resolve globally");
+      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
+    "the zone name override is the only option that does not resolve globally");
+  });
+
+  test("the per-zone suspension option is named in BOTH unions its scopes declare", () => {
+
+    /* The runtime pin above compares the catalog against string literals, which is blind to a stale TypeScript union - the literals would still match a catalog
+     * whose new option no member of either union names. These are the compile-time half, and they are two SEPARATE checks on purpose: a single check against the
+     * combined union is satisfied by membership in either one, so it would pass on a zone-only union while the controller-scope lookup failed to compile.
+     */
+    const asControllerOption = { option: "Device.Suspend.Zone" } satisfies { option: HydrawiseControllerOption };
+    const asZoneOption = { option: "Device.Suspend.Zone" } satisfies { option: HydrawiseZoneOption };
+
+    assert.equal(asControllerOption.option, asZoneOption.option, "one option name resolves at both the controller and the zone");
   });
 
   test("the account login options are value-centric and unset by default", () => {

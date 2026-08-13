@@ -17,7 +17,7 @@ import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap
 import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
-  HydrawiseZoneV2Facts } from "../types.ts";
+  HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
@@ -241,9 +241,14 @@ export interface TestPlatform {
   mqtt: Nullable<TestMqttClient>;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
+  setZoneSuspension: HydrawisePlatform["setZoneSuspension"];
   signal: AbortSignal;
   timers: TimerRegistry;
 }
+
+// One recorded per-zone suspension command the controller issued: the whole argument object it passed. Typed by indexed access against the real method, so a
+// signature drift is a compile error here rather than a silent mismatch.
+export type RecordedSuspensionCall = Parameters<HydrawisePlatform["setZoneSuspension"]>[0];
 
 // Options for makeTestPlatform: the platform config overrides, whether the account-credentialed client is present (the gate a controller reads to decide whether
 // cached hardware facts are still worth honoring), whether to attach a recording MQTT double, whether the platform signal starts pre-aborted (the default, which
@@ -254,6 +259,18 @@ export interface MakeTestPlatformOptions {
   hasV2Client?: boolean;
   mqtt?: boolean;
   signalAborted?: boolean;
+
+  /* A REAL account-credentialed client for the suspension surface to delegate to, built by the test from the platform double's own log so every layer's lines land
+   * in one capture buffer. That shared buffer is the point: a pin about how many voices narrate one failure can only be written where all of them are recorded.
+   *
+   * It is a factory rather than a client because the log does not exist until this double is built, and answering the question this option exists for means the
+   * client must write into that same log rather than one of its own.
+   */
+  suspensionClient?: (log: HomebridgePluginLogging) => Pick<TestV2Client, "setZoneSuspension">;
+
+  // The answer the per-zone suspension surface gives when no client is supplied above, or a function of the one-based command number so a test can answer
+  // differently command by command. Defaults to accepting every command, which is what a test pinning anything other than a refusal wants.
+  suspensionResult?: HydrawiseZoneSuspensionResult | ((command: number) => HydrawiseZoneSuspensionResult);
   userOptions?: string[];
 }
 
@@ -271,6 +288,9 @@ export interface MakeTestPlatformResult {
   reconciles: RecordedReconcileCall[];
   retrieve: RetrieveRecorder;
   signalController: AbortController;
+
+  // Every per-zone suspension command the controller issued, in order.
+  suspensions: RecordedSuspensionCall[];
 
   // The zone accessories the reconcile stub owns, keyed by relay id. It is both the stub's own store and the seeding hook a warm-restart test pre-populates, so a
   // test can hand the first poll an accessory that already carries a cache-restored valve.
@@ -304,6 +324,29 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const reconciles: RecordedReconcileCall[] = [];
   const zoneAccessories = new Map<number, TestAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
+  const suspensions: RecordedSuspensionCall[] = [];
+
+  /* A recording stand-in for the platform's per-zone suspension surface. It is a DOUBLE rather than a thin executor because what it stands in for is the network:
+   * the real method reaches the account-credentialed client, which no controller test may ever touch. The programmed answer is what drives the controller's own
+   * success, revert, and refusal paths.
+   */
+  const suspensionClient = options.suspensionClient?.(logger);
+
+  const setZoneSuspension: HydrawisePlatform["setZoneSuspension"] = async (request) => {
+
+    suspensions.push(request);
+
+    // With a real client supplied, this stands in only for the platform's mapping - which passes the client's answer through untouched - so the command runs the
+    // whole production path beneath it. The platform's own four-state mapping is pinned in its own suite.
+    if(suspensionClient) {
+
+      return suspensionClient.setZoneSuspension(request);
+    }
+
+    const programmed = options.suspensionResult ?? { status: "done" };
+
+    return (typeof programmed === "function") ? programmed(suspensions.length) : programmed;
+  };
 
   /* A THIN EXECUTOR standing in for the platform's zone-accessory reconcile, not a second copy of its policy. It records the call, keeps one accessory per
    * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and drops the entries the request does not name. The grace window,
@@ -364,12 +407,13 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt,
     reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
+    setZoneSuspension,
     signal: signalController.signal,
     timers
   };
 
   return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, reconciles, retrieve,
-    signalController, zoneAccessories };
+    signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -595,12 +639,18 @@ export function v2DispatcherOf(platform: HydrawisePlatform): { destroyed: boolea
   return (platform as unknown as { v2Client?: { dispatcher: { destroyed: boolean } } }).v2Client?.dispatcher;
 }
 
-// The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, and the whole-account facts fetch its refresh loop
-// drives. A distribution test supplies this shape rather than a real client, so no test ever reaches the live account API.
+/* The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, the whole-account facts fetch its refresh loop
+ * drives, and the per-zone suspension its write surface delegates to. A distribution test supplies this shape rather than a real client, so no test ever reaches
+ * the live account API.
+ *
+ * A REAL client satisfies this shape too, which is deliberate: a test that wants the client's own admission phase in the picture installs one built over a
+ * MockAgent, and the whole path from the platform's pre-check down runs production code with nothing on the wire.
+ */
 export interface TestV2Client {
 
   dispatcher: { destroy: () => Promise<void> };
   fetchAccountFacts: () => Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>>;
+  setZoneSuspension: (options: { until: Nullable<number>; zoneId: number }) => Promise<HydrawiseV2MutationResult>;
 }
 
 /**
@@ -667,7 +717,11 @@ export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseController
       fetches++;
 
       return (typeof facts === "function") ? facts(fetches) : facts;
-    } }, fetches: (): number => fetches };
+    },
+
+    // The facts double answers every command, because a test that programs facts is pinning distribution rather than commands; a test pinning commands installs a
+    // real client over a MockAgent instead.
+    setZoneSuspension: async (): Promise<HydrawiseV2MutationResult> => ({ status: "done" }) }, fetches: (): number => fetches };
 }
 
 /**

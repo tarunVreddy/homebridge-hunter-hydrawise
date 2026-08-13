@@ -6,7 +6,7 @@ import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAcce
 import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName,
   superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
-  HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity } from "./types.ts";
+  HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
   HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL,
   HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
@@ -365,6 +365,37 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public get hasV2Client(): boolean {
 
     return this.v2Client !== undefined;
+  }
+
+  /* Suspend one zone until an instant, or resume it - the single per-zone write surface every controller commands through, exactly as retrieve() is the single
+   * key-based one. The account-credentialed client stays private to this class, so what a controller ever sees is the outcome alone.
+   *
+   * The budget pre-check answers the common saturated case for FREE: a ceiling with nothing to give refuses here having touched no connection and spent no call,
+   * which is what keeps a burst of taps from costing the account anything. On its own it carries a check-then-act race - two near-simultaneous callers can both read
+   * the last free slot - and the client's admission phase is what closes it, bounding the loser to a beat rather than to the budget's own half-hour window.
+   *
+   * The unavailable answer is honest rather than reachable from a live switch: those switches exist only where a client does, and that is fixed at construction. It
+   * is what any other caller gets.
+   *
+   * @param options        - The command.
+   * @param options.until  - The absolute instant, in epoch seconds, the suspension lifts, or null to resume the zone.
+   * @param options.zoneId - The zone to command, named by the id the key-based and account APIs agree about.
+   *
+   * @returns What became of the command: accepted, attempted and refused, never admitted, or impossible for want of a client.
+   */
+  public async setZoneSuspension(options: { until: Nullable<number>; zoneId: number }): Promise<HydrawiseZoneSuspensionResult> {
+
+    if(!this.v2Client) {
+
+      return { status: "unavailable" };
+    }
+
+    if(this.v2Budget.available === 0) {
+
+      return { status: "rejected" };
+    }
+
+    return this.v2Client.setZoneSuspension(options);
   }
 
   // Whether the user has left a controller enabled. The controller-wide Device gate is keyed on the serial number in the canonical controller position, with the

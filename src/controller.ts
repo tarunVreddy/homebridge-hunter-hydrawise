@@ -5,12 +5,12 @@
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
-import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
-  sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity, zoneScheduleStatus } from "./types.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity,
+  isZoneStoppedBySensor, sameEntries, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, SetZoneResponse,
-  StatusScheduleResponse } from "./types.ts";
+  HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
+  SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
@@ -175,6 +175,18 @@ interface HydrawiseControllerFactsSnapshot extends HydrawiseControllerV2Facts {
   fetchedAt: number;
 }
 
+/* One per-zone suspension command the account accepted, as the display needs it: the instant it was accepted, and WHICH WAY it went - the instant a suspension
+ * lifts, or null for a resume.
+ *
+ * The direction is what a bare timestamp could not carry. A stamp alone says that the user commanded something, which is enough to know that an older snapshot is
+ * uninformed, but not enough to know what to show in its place.
+ */
+interface HydrawiseZoneSuspendCommand {
+
+  at: number;
+  commandedUntil: Nullable<number>;
+}
+
 export class HydrawiseController {
 
   private readonly accessory: HydrawiseControllerAccessory;
@@ -209,6 +221,23 @@ export class HydrawiseController {
   private v2Facts: Nullable<HydrawiseControllerFactsSnapshot> = null;
 
   private readonly zoneHints: HydrawiseZoneHintLedger;
+
+  /* Where each zone the last walk projected has its valve, and therefore its companion suspension switch. The walk already resolves this to host the valve, so
+   * recording it costs nothing and is what lets the shared projection tail reach a switch on a standalone accessory without asking the platform to reconcile
+   * outside a poll - the tail never calls that method, because reconciling decides accessory existence and a refresh tick has no wire truth to decide it from.
+   *
+   * It is rebuilt from empty at the top of every walk, so a zone that left the projection cannot leave its entry behind. Between polls the recorded host is
+   * definitionally current, since hosting changes only when a walk changes it.
+   */
+  private readonly zoneHosts = new Map<number, HydrawiseAccessory>();
+
+  /* The per-zone suspension commands the account has accepted and no fresher truth has yet superseded, keyed by relay id. It is the zone-grain twin of the scalar
+   * stamp above, and the two live side by side because they answer different questions: one guards the account-wide switch, the other guards a single zone's.
+   *
+   * It dies with the process by design. After a restart the projection's own carried suspensions own the display, which is the truth the account confirmed rather
+   * than one this process remembered commanding.
+   */
+  private readonly zoneSuspendCommands = new Map<number, HydrawiseZoneSuspendCommand>();
 
   // The constructor initializes key variables and calls configureDevice(). The platform passes the denormalized account roster - every account controller's identity,
   // enabled or not - so this controller can seed it into its own accessory context, giving any one accessory knowledge of all its siblings.
@@ -284,6 +313,13 @@ export class HydrawiseController {
     // Surface a name-synchronization opt-out at startup. Synchronization is read live on each poll rather than cached in a hint, since a zone can opt out
     // independently of its controller; this line reports the controller-scope answer, which is the one that governs when no zone says otherwise.
     this.platform.featureOptions.logFeature("Device.SyncName", "Zone name synchronization", this.log, undefined, this.controller.serial_number);
+
+    // Surface the per-zone suspension switches on the same terms, and only where the account credentials that can command a suspension are configured: without them
+    // these switches are never created, so naming them would advertise a feature this install does not have.
+    if(this.platform.hasV2Client) {
+
+      this.platform.featureOptions.logFeature("Device.Suspend.Zone", "Per-zone suspension switches", this.log, undefined, this.controller.serial_number);
+    }
 
     return true;
   }
@@ -478,7 +514,72 @@ export class HydrawiseController {
     this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On,
       this.isAllSuspended(facts));
 
+    // The per-zone switches answer to the same classification, on both cadences, for the same reason.
+    this.refreshZoneSuspendSwitches(facts);
+
     return changed;
+  }
+
+  /* Retire the per-zone suspension commands this pass supersedes, then show every companion switch what its zone now reads as.
+   *
+   * Both cadences that can move a zone's suspension arrive here - the poll, which brings fresh wire truth, and the refresh tick, which brings the account facts a
+   * suspension is actually reported on - so a suspension made in the Hydrawise app reaches its switch with the refresh that learned of it rather than waiting for a
+   * poll that cannot see it.
+   *
+   * A command retires on either of the two things that can make it moot: facts that postdate it, which is the freshness rule's other face, and its zone leaving the
+   * wire report, which leaves nothing for the command to speak for.
+   */
+  private refreshZoneSuspendSwitches(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
+
+    const reported = new Set(this.status.relays.map(zone => zone.relay_id));
+
+    for(const [ relayId, command ] of this.zoneSuspendCommands) {
+
+      if(!this.commandStands(command, facts) || !reported.has(relayId)) {
+
+        this.zoneSuspendCommands.delete(relayId);
+      }
+    }
+
+    for(const entry of this.accessory.context.schedule?.zones ?? []) {
+
+      // The switch speaks its own name's language: On means SUSPENDED, matching the account-wide suspend switch's convention. A zone's active state already lives
+      // on its valve, so a switch that read the other way would put two answers to one question in front of the user.
+      this.zoneHosts.get(entry.relayId)?.getServiceById(this.hap.Service.Switch, suspendZoneSubtype(entry.relayId))
+        ?.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(entry.relayId, entry, facts));
+    }
+  }
+
+  /* Whether a per-zone suspension command still speaks for its zone, which it does exactly while no fresher truth has arrived to supersede it. This is the one
+   * comparison home for the guard - the render and the sweep that clears it both ask here - so what "still standing" means cannot be answered two ways.
+   *
+   * Only a STRICTLY newer snapshot retires a command, which is the account-wide guard's own rule at the zone grain. Both instants are whole seconds, so a fetch
+   * stamped in the same second as the command could have been dispatched either side of it, and the tie goes to the user: holding their command costs at most one
+   * refresh of staleness, while handing the second to the fetch reopens the very race of a snapshot flipping a switch back under their finger.
+   *
+   * A null snapshot KEEPS a standing command standing. None ever arrived, the last one aged out, or the refresh has stalled: in every case nothing newer has
+   * contradicted the user, so their own command is the honest thing to display until facts that postdate it land.
+   */
+  private commandStands(command: HydrawiseZoneSuspendCommand | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>):
+    command is HydrawiseZoneSuspendCommand {
+
+    return (command !== undefined) && (!facts || (facts.fetchedAt <= command.at));
+  }
+
+  /* Whether a zone reads as suspended right now. A standing command answers first, which is what stops a fetch already in flight when the user pressed the switch
+   * from flipping it straight back, and the classified projection answers otherwise - so the switch and the zone list are one reading rather than two derivations
+   * that can drift.
+   */
+  private isZoneSuspended(relayId: number, state: HydrawiseZoneScheduleStatus | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+
+    const command = this.zoneSuspendCommands.get(relayId);
+
+    if(this.commandStands(command, facts)) {
+
+      return command.commandedUntil !== null;
+    }
+
+    return state?.state === "suspended";
   }
 
   /* Project whether Hydrawise can currently reach this controller onto the irrigation system's fault characteristic, which exists only where the plugin can
@@ -710,7 +811,19 @@ export class HydrawiseController {
        * answers from the wire heuristic until a refresh that postdates the command lands - which is what stops a fetch already in flight when the user pressed
        * the switch from flipping it straight back. A resume stamps too, for the same reason in the other direction.
        */
-      this.lastSuspendCommandAt = Math.floor(Date.now() / 1000);
+      const at = Math.floor(Date.now() / 1000);
+
+      this.lastSuspendCommandAt = at;
+
+      /* An account-wide command is also a fact about every zone beneath it, so it stamps each one's own guard with the direction it went. The population is every
+       * zone the WIRE has reported rather than the enabled projection, which is empty until the first poll completes and which silently omits any zone a feature
+       * option has turned off; without this, the next refresh's pre-command facts would fight the account-wide switch's optimistic state zone by zone. A command
+       * issued before any poll at all stamps nothing, and the scalar above carries the account-wide answer alone until the first poll seeds the walk.
+       */
+      for(const zone of this.status.relays) {
+
+        this.zoneSuspendCommands.set(zone.relay_id, { at, commandedUntil: value ? timestamp : null });
+      }
 
       this.log.info("%s scheduled watering for all zones.", value ? "Suspending" : "Resuming");
     });
@@ -820,6 +933,14 @@ export class HydrawiseController {
     // Find the irrigation system service.
     const irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
 
+    /* Where each zone's companion suspension switch belongs this poll, keyed by its composed subtype. It is the sweep's keep-set and its hosting check in one: a
+     * switch survives only on the accessory this map names for it, so one left behind on a former host is swept even though its zone still has a switch elsewhere.
+     */
+    const suspendHosts = new Map<string, HydrawiseAccessory>();
+
+    // Rebuild the hosting record from empty, so a zone that has left the projection cannot leave its entry standing for the refresh cadence to read.
+    this.zoneHosts.clear();
+
     // Discover any new zones and update our zone state.
     for(const zone of this.enabledZones) {
 
@@ -831,6 +952,8 @@ export class HydrawiseController {
       // decision below that depends on which it is.
       const host = zoneAccessories.get(zone.relay_id) ?? this.accessory;
       const isStandaloneHost = host !== this.accessory;
+
+      this.zoneHosts.set(zone.relay_id, host);
 
       // Whether this zone's names track the configured truth. Resolved once per zone, because the valve service and the standalone accessory answer to the same
       // gate at the same cadence.
@@ -915,6 +1038,14 @@ export class HydrawiseController {
       // Resolve this zone's hint entry, seeded on first sighting with the live state. The view is the ledger's own entry, so the reads below see every write the
       // rest of this pass makes to it.
       const hints = this.zoneHints.ensure(zone.relay_id, isStopped, state?.state === "suspended");
+
+      // Establish this zone's companion suspension switch where the user asked for one, and record where it landed for the sweep below to judge against.
+      const suspendSubtype = this.configureZoneSuspendSwitch({ effectiveName, facts, host, isFirstRun, state, syncName, zone });
+
+      if(suspendSubtype) {
+
+        suspendHosts.set(suspendSubtype, host);
+      }
 
       // Inform the user.
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
@@ -1049,6 +1180,24 @@ export class HydrawiseController {
       this.zoneHints.refreshStopped(zone.relay_id, isStopped);
     }
 
+    /* Sweep away every companion suspension switch this poll no longer wants: a zone whose option went off, a zone that lost its credentials or left the projection,
+     * and a switch left behind on an accessory that no longer hosts its zone. Both host kinds are swept, because the controller owns every service-level removal
+     * wherever a zone's services landed - the platform's reconcile decides which accessories exist and never touches a service.
+     *
+     * The match is on the COMPOSED SUBTYPE, never on the Switch service type alone: the account-wide suspend switch shares that type, and an unscoped sweep would
+     * destroy it.
+     */
+    for(const suspendHost of new Set<HydrawiseAccessory>([ this.accessory, ...this.zoneHosts.values() ])) {
+
+      for(const service of suspendHost.services.filter(x => (x.UUID === this.hap.Service.Switch.UUID) && isSuspendZoneSubtype(x.subtype))) {
+
+        if(suspendHosts.get(service.subtype ?? "") !== suspendHost) {
+
+          suspendHost.removeService(service);
+        }
+      }
+    }
+
     // Update the irrigation system state.
     irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse,
       (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
@@ -1069,6 +1218,143 @@ export class HydrawiseController {
     // lands in the log instead of floating as an unhandled rejection.
     guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
       label: "MQTT publish (controller)", log: this.log });
+  }
+
+  /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.
+   *
+   * The switch exists only where the account credentials do, because the key-based API has no per-zone suspend to offer: its one suspend command carries no zone
+   * parameter at all and acts on the whole controller, so a switch built on it would render and resolve while doing something else entirely.
+   *
+   * @param options               - This zone's pass.
+   * @param options.effectiveName - The zone's effective display name, which the switch's own name is composed from.
+   * @param options.facts         - The account-credentialed facts this pass resolved, or null when there are none to trust.
+   * @param options.host          - The accessory hosting this zone's valve, and therefore its switch.
+   * @param options.isFirstRun    - Whether this is the controller's first completed poll, which is half the establishment gate.
+   * @param options.state         - The zone's classified schedule state, which the starting characteristic is written from.
+   * @param options.syncName      - Whether this zone's names track the configured truth.
+   * @param options.zone          - The wire zone.
+   *
+   * @returns The composed subtype of the switch this established, or null when the zone is to have none.
+   */
+  private configureZoneSuspendSwitch({ effectiveName, facts, host, isFirstRun, state, syncName, zone }: { effectiveName: string;
+    facts: Nullable<HydrawiseControllerFactsSnapshot>; host: HydrawiseAccessory; isFirstRun: boolean; state: HydrawiseZoneScheduleStatus | undefined;
+    syncName: boolean; zone: HydrawiseZoneConfig; }): Nullable<string> {
+
+    if(!this.platform.hasV2Client || !this.hasZoneFeature("Device.Suspend.Zone", zone.relay_id.toString())) {
+
+      return null;
+    }
+
+    const name = effectiveName + " Suspend";
+    const subtype = suspendZoneSubtype(zone.relay_id);
+    let isNewSwitch = false;
+
+    const service = acquireService(host, this.hap.Service.Switch, name, subtype, () => {
+
+      isNewSwitch = true;
+    });
+
+    if(!service) {
+
+      this.log.error("Unable to add the suspension switch for zone: %s (%s).", zone.name, zone.relay_id);
+
+      return null;
+    }
+
+    // The switch's name tracks its zone's on every poll, under the gate the valve answers to, so a Hydrawise rename reaches the companion rather than stranding it
+    // under a name the zone no longer carries.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if(!isNewSwitch && syncName && (getServiceName(service) !== sanitizeName(name))) {
+
+      setServiceName(service, name);
+    }
+
+    /* Bind the handler under the establishment gate the valve uses - a first poll, or a service this pass created - so a warm restart, where the service returns
+     * from the accessory cache and this process has never bound to it, binds exactly once.
+     *
+     * The starting state is written on that same gate rather than left to the projection tail, because the tail runs BEFORE this walk and so cannot have shown a
+     * switch that did not yet exist. Every refresh after this one is the tail's, and it writes the same polarity: On means suspended.
+     */
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if(isFirstRun || isNewSwitch) {
+
+      service.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(zone.relay_id, state, facts));
+
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
+
+        await this.commandZoneSuspension(zone, service, value);
+      });
+    }
+
+    return subtype;
+  }
+
+  /* Command one zone's suspension from its companion switch and answer for it: the optimistic state the user is already looking at stands when the account accepts
+   * the command, and goes back after a beat when it does not.
+   *
+   * The switch speaks its own name's language: turning it ON is what SUSPENDS the zone, which is the account-wide suspend switch's convention at the zone grain. A
+   * zone's active state already lives on its valve, so a switch that commanded the other way would leave the user two controls disagreeing about one thing.
+   *
+   * A suspension runs to the same one-year horizon the account-wide suspend uses, through the same constant, because an open-ended suspension is what both commands
+   * mean and Hydrawise expresses that as a distant instant.
+   *
+   * Nothing is read back afterward. The recurring refresh reconciles the optimistic state on its own cadence, and spending a call to confirm what the account has
+   * just acknowledged would cost a slot the next command may need.
+   */
+  private async commandZoneSuspension(zone: HydrawiseZoneConfig, service: Service, value: CharacteristicValue): Promise<void> {
+
+    const until = value ? (Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION) : null;
+    const result = await this.platform.setZoneSuspension({ until, zoneId: zone.relay_id });
+
+    if(result.status === "done") {
+
+      /* Stamp the command so a snapshot fetched before it cannot answer for this zone, on exactly the terms the account-wide stamp above works on. The direction
+       * rides along with the instant, because while the command stands it is the command itself that says what to show.
+       */
+      this.zoneSuspendCommands.set(zone.relay_id, { at: Math.floor(Date.now() / 1000), commandedUntil: until });
+
+      return;
+    }
+
+    // A shutdown reaching us mid-command is orderly teardown rather than a refusal, so the handler exits here, skipping both the sentence and the revert.
+    if(this.platform.signal.aborted) {
+
+      return;
+    }
+
+    this.log.error("%s: Unable to %s this zone. %s", this.zoneLabel(zone), until ? "suspend" : "resume", this.suspensionRefusal(result));
+
+    // Put the switch back where it was after a brief beat, scheduled through the platform's registry exactly as every other revert on this controller is.
+    this.platform.timers.schedule(() => service.updateCharacteristic(this.hap.Characteristic.On, !value), HYDRAWISE_REVERT_DELAY);
+  }
+
+  /* The sentence a refused per-zone suspension gives the operator, one per answer the platform can give, because they ask the user for different things: a paced
+   * ceiling asks for a moment's patience, a refusal from Hydrawise asks them to look at the account, and a missing client says the enhanced features this switch
+   * runs on are not configured at all.
+   *
+   * The failed arm serves BOTH ways a command can fail, because the reason it reads carries either - the account's own words when it refused in band, and the
+   * transport's when the request did not land. Telling them apart here would be this layer knowing something it has no use for: what the user wants is the reason,
+   * and the fallback covers only a failure already reported in its own words elsewhere.
+   *
+   * Every answer is named with no default arm, so an answer added to the union surfaces as a compile error rather than as a command silently reporting someone
+   * else's reason.
+   */
+  private suspensionRefusal(result: Exclude<HydrawiseZoneSuspensionResult, { status: "done" }>): string {
+
+    switch(result.status) {
+
+      case "failed":
+
+        return result.reason ?? "Hydrawise did not accept the command.";
+
+      case "rejected":
+
+        return "The Hydrawise account API is pacing requests right now, so the command was not sent. Please try again in a moment.";
+
+      case "unavailable":
+
+        return "Enhanced features are not configured.";
+    }
   }
 
   // Send a command to the Hydrawise API.

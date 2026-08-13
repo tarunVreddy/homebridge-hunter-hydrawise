@@ -1,0 +1,717 @@
+/* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * controller.suspension.test.ts: The per-zone suspension switches - where they exist, where they must not, what they show, and what a tap on one does. Covers the
+ * creation gate and the subtype the sweep depends on, the name resynchronization a zone rename drives, the optimistic command and its revert, the command guard
+ * that keeps a snapshot older than the user's own tap from undoing it, the account-wide command's per-zone stamp, and the subtype-scoped sweep that must never
+ * touch the account-wide switch it shares a service type with.
+ *
+ * Every command runs against the platform double's recording suspension surface, so no test here reaches the account API or its client - the client's own
+ * admission and transport behavior is pinned in its suite, and what this one pins is the projection above it.
+ */
+
+// The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
+/* eslint-disable camelcase */
+import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
+  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import type { HydrawiseZoneConfig, HydrawiseZoneV2Facts, StatusScheduleResponse } from "./types.ts";
+import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
+import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
+import { buildController, countLogged, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
+import { describe, test } from "node:test";
+import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HydrawiseV2Client } from "./v2.ts";
+import { MockAgent } from "undici";
+import { RateBudget } from "homebridge-plugin-utils";
+import assert from "node:assert/strict";
+import { getServiceName } from "homebridge-plugin-utils";
+import { suspendZoneSubtype } from "./types.ts";
+
+const CONTROLLER_SERIAL = "SN0A1B2C3D4";
+const ALPHA_RELAY_ID = 700001;
+const BETA_RELAY_ID = 700002;
+const ALPHA_VALVE_SUBTYPE = "700001";
+
+/* The composed subtypes, written as LITERALS rather than through the composer. The composer is production's single home for this shape, so a test that called it
+ * would agree with any shape it ever produced; the literal is what pins the shape itself - and it is what a cached accessory in the field carries, so changing it
+ * silently orphans every switch already published.
+ */
+const ALPHA_SWITCH_SUBTYPE = "Suspend.700001";
+
+const BETA_SWITCH_SUBTYPE = "Suspend.700002";
+
+// The account-wide switch's own subtype, which shares the Switch service type with the two above and must survive their sweep.
+const SUSPEND_ALL_SUBTYPE = "All";
+
+// The option entries each scenario names. The per-zone switches are enabled at the CONTROLLER scope here, which the engine resolves for every zone beneath it.
+const SUSPEND_ZONE_ON = "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL;
+
+const SUSPEND_ALL_ON = "Enable.Device.Suspend.All." + CONTROLLER_SERIAL;
+
+const STANDALONE_ON = "Enable.Device.Standalone." + ALPHA_VALVE_SUBTYPE;
+
+const BETA_DISABLED = "Disable.Device." + BETA_RELAY_ID.toString();
+
+// A far-future suspension instant, in the shape the account API reports one.
+const SUSPENDED_UNTIL = 1903928399;
+
+// The reason a refused command carries back, which the controller's one sentence has to name.
+const REFUSAL_SUMMARY = "Hydrawise refused this one.";
+
+// The v2 origin and paths the real client used by the combined-layers pin below targets, derived from the endpoint constants exactly as the client derives its own.
+const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
+
+const GRAPH_PATH = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname;
+
+const TOKEN_PATH = new URL(HYDRAWISE_V2_TOKEN_ENDPOINT).pathname;
+
+// A successful token grant, shaped as the live capture recorded it, so the command under test gets past the token chokepoint and reaches the transport.
+const TOKEN_BODY = { access_token: "access-one", expires_in: 3600, refresh_token: "refresh-one" };
+
+/* The zone under test, carrying the unscheduled sentinel shape. That shape is what a suspended zone presents on the key-based wire, so it is the only shape the
+ * account API's suspension facts can actually classify - a running or scheduled zone answers from the wire alone whatever the facts say.
+ */
+function alphaZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "", ...overrides });
+}
+
+// A second zone in the same shape, so a scenario can turn one zone off while the projection stays non-empty.
+function betaZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Bravo", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "", ...overrides });
+}
+
+// A fast-cadence status body carrying the given zones and a sensor block covering nothing, so no zone classifies as sensor-stopped and the suspension arm is the
+// only thing that can move a switch.
+function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
+
+  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+}
+
+// The current whole second, which is the unit every command stamp and every facts snapshot speaks.
+function now(): number {
+
+  return Math.floor(Date.now() / 1000);
+}
+
+/* Hand the controller one refresh tick's worth of facts, stating each zone's suspension and the instant the fetch that carried them was made.
+ *
+ * That instant is stated by every caller rather than defaulted, because every guard comparison in this suite turns on whether the fetch predates or postdates the
+ * user's own command - and in a test they otherwise land in the same whole second, where a real refresh is a quarter of an hour away from one.
+ */
+function applyFacts(h: BuildControllerResult, suspended: Record<number, boolean>, fetchedAt: number): void {
+
+  const zones = Object.entries(suspended).map(([ relayId, isSuspended ]): [ number, HydrawiseZoneV2Facts ] => {
+
+    return [ Number(relayId), makeZoneV2Facts({ suspendedUntil: isSuspended ? SUSPENDED_UNTIL : null }) ];
+  });
+
+  h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt });
+}
+
+// Wait until the controller has completed enough polls that the projection it produced is certainly in hand.
+async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
+
+  await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > count) ? true : undefined);
+}
+
+/* The configured name of one of the double's services. The library helper takes HAP's own Service type, so the double-to-production bridge lives here once rather
+ * than at each read site - the same posture the harness takes for its own construction-boundary casts.
+ */
+function serviceName(service: TestService | undefined): string | undefined {
+
+  return getServiceName(service as never);
+}
+
+// One zone's companion switch on a given accessory, or undefined when it has none there.
+function suspendSwitch(accessory: TestAccessory, subtype = ALPHA_SWITCH_SUBTYPE): ReturnType<TestAccessory["getServiceById"]> {
+
+  return accessory.getServiceById(Service.Switch, subtype);
+}
+
+// Whether the switch reads the zone as SUSPENDED, which is what its characteristic carries directly: the switch speaks its own name's language, so On means
+// suspended, exactly as the account-wide suspend switch has always read.
+function readsSuspended(accessory: TestAccessory, subtype = ALPHA_SWITCH_SUBTYPE): unknown {
+
+  return suspendSwitch(accessory, subtype)?.getCharacteristic(Characteristic.On).value;
+}
+
+describe("HydrawiseController per-zone suspension switches", () => {
+
+  test("the composed subtype is the shape every cached accessory in the field carries", () => {
+
+    // Production's own composer, pinned against the literal the rest of this suite - and every accessory already published - depends on.
+    assert.equal(suspendZoneSubtype(ALPHA_RELAY_ID), ALPHA_SWITCH_SUBTYPE, "a zone's switch subtype is the reserved prefix and its relay id");
+    assert.notEqual(suspendZoneSubtype(ALPHA_RELAY_ID), ALPHA_VALVE_SUBTYPE, "and it cannot collide with the valve subtype the same zone already carries");
+  });
+
+  test("creates a companion switch beside the zone's valve, named for the zone", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    assert.equal(serviceName(service), "Alpha Suspend", "the switch takes the zone's effective name and the suspend suffix");
+    assert.ok(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE), "and it sits beside the valve rather than replacing it");
+
+    // ON means the zone is suspended, so an unsuspended zone reads off. The pin that this one cannot make - a switch established on an ALREADY suspended zone,
+    // where HAP's own default would be the wrong answer rather than accidentally the right one - is driven separately below.
+    assert.equal(readsSuspended(h.accessory), false, "a zone under no suspension reads as unsuspended");
+    assert.ok(loggedAt(h.lines(), "info", "Per-zone suspension switches enabled."), "the enabled feature is reported once at the startup grain");
+  });
+
+  test("a switch established on an already-suspended zone starts ON", async (t) => {
+
+    /* The establishment write's own pin, and the one the common case cannot make: an unsuspended zone's answer happens to coincide with HAP's own default for a
+     * fresh characteristic, so a walk that wrote nothing at all would pass it. Here the answer is the opposite of that default, so only a real write satisfies it.
+     *
+     * The zone is brought in on a LATER poll, after facts have landed, because that is the only way a switch is first established with a classified suspension
+     * already in hand - on the very first poll there are no facts yet for any zone.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+    }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => suspendSwitch(h.accessory));
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: true }, now());
+
+    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE));
+
+    assert.equal(beta.getCharacteristic(Characteristic.On).value, true, "a zone the account reports suspended shows its switch on the moment it is established");
+    assert.equal(readsSuspended(h.accessory), false, "while its unsuspended sibling reads the other way");
+  });
+
+  test("creates none when the option is off", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE));
+    await pollsCompleted(h, 2);
+
+    assert.equal(suspendSwitch(h.accessory), undefined, "the default-off option publishes no switch at all");
+    assert.equal(h.suspensions.length, 0, "and nothing can command a suspension");
+    assert.ok(!loggedAt(h.lines(), "info", "Per-zone suspension switches"), "a default left alone says nothing at startup");
+  });
+
+  test("creates none on an install without account credentials, however the option is set", async (t) => {
+
+    /* The parity floor. The key-based API has no per-zone suspend to offer - its one suspend command carries no zone parameter and acts on the whole controller -
+     * so a switch here would render and resolve while doing something else entirely, which is the trap the option exists to avoid rather than to walk into.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }),
+      signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE));
+    await pollsCompleted(h, 2);
+
+    assert.equal(suspendSwitch(h.accessory), undefined, "an install with only an API key publishes no per-zone switch");
+    assert.ok(!loggedAt(h.lines(), "info", "Per-zone suspension switches"), "and never mentions a feature it cannot offer");
+  });
+
+  test("the switch follows the zone's suspension across refresh ticks", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => suspendSwitch(h.accessory));
+
+    /* A suspension is a fact only the account API reports, so it arrives on the REFRESH cadence rather than on a poll. The switch has to move with it, which is
+     * what the shared projection tail is for: a switch refreshed only by the walk would sit wrong for up to a full poll after a suspension landed.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
+
+    assert.equal(readsSuspended(h.accessory), true, "a refresh reporting the zone suspended turns the switch on");
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
+
+    assert.equal(readsSuspended(h.accessory), false, "and a refresh reporting the suspension lifted turns it back off");
+  });
+
+  test("the switch's name follows a zone renamed on the wire", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([alphaZone({ name: "Alpha North" })]), kind: "response" });
+    }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    // A rename must reach the companion, not just the valve. Naming the switch once at creation would leave it wearing a stale name for the life of the accessory.
+    await waitFor(() => (serviceName(suspendSwitch(h.accessory)) === "Alpha North Suspend") ? true : undefined);
+    assert.equal(serviceName(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE)), "Alpha North", "the valve moved with it");
+  });
+});
+
+describe("HydrawiseController per-zone suspension commands", () => {
+
+  test("turning the switch on suspends the zone for the account-wide duration", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const before = now();
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    const after = now();
+
+    assert.equal(h.suspensions.length, 1, "one tap sends exactly one command");
+    assert.equal(h.suspensions[0]?.zoneId, ALPHA_RELAY_ID, "and it names the zone the switch belongs to");
+
+    // The horizon is the account-wide suspend's own constant, bracketed by whole-second reads either side of the tap. One convention, one constant, both grains.
+    const until = h.suspensions[0]?.until ?? 0;
+
+    assert.ok((until >= (before + HYDRAWISE_SUSPEND_DURATION)) && (until <= (after + HYDRAWISE_SUSPEND_DURATION)),
+      "the suspension runs to the same one-year horizon the account-wide suspend uses");
+    assert.equal(readsSuspended(h.accessory), true, "and the switch holds the state the user just chose");
+  });
+
+  test("turning the switch off resumes the zone, carrying no instant at all", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(false);
+
+    // A null instant is what composes the resume rather than a suspension to some instant in the past, which is the shape the two commands are told apart by.
+    assert.deepEqual(h.suspensions, [{ until: null, zoneId: ALPHA_RELAY_ID }], "a resume names the zone and no instant");
+  });
+
+  test("N accepted flips send exactly N commands", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    for(const value of [ true, false, true, false ]) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await service.getCharacteristic(Characteristic.On).triggerSet(value);
+    }
+
+    /* BOTH bounds, by strict equality. The upper bound catches a handler that retried or read back after commanding; the lower catches one that coalesced a burst
+     * into fewer commands than the user made, which is the queue-and-batch shape the design deliberately rejected.
+     */
+    assert.equal(h.suspensions.length, 4, "four taps are four commands, neither dropped nor doubled");
+  });
+
+  test("a refused command reverts the switch and says why, exactly once", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      suspensionResult: { reason: REFUSAL_SUMMARY, status: "failed" }, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+
+    assert.equal(readsSuspended(h.accessory), false, "a command the account refused puts the switch back where it was");
+    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. " + REFUSAL_SUMMARY),
+      "and the one sentence names the zone and what the account said");
+
+    /* The one-voice pin. The layers below this one carry their outcome in a value rather than in a line, so a user reads exactly one sentence about a command they
+     * made - the one written by the layer that knows which zone they touched.
+     */
+    assert.equal(h.lines().filter(line => line.level === "error").length, 1, "a refused command produces exactly one error line");
+  });
+
+  test("a command the ceiling would not admit reverts with the pacing sentence rather than the account's", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      suspensionResult: { status: "rejected" }, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+
+    /* Reject-with-feedback, made legible. The two refusals ask the user for different things - wait a moment, against look at your account - so they must not
+     * share a sentence, and a user who sees the pacing one knows their command was never sent.
+     */
+    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. The Hydrawise account API is pacing requests"),
+      "a paced refusal says so, and asks for a moment rather than blaming the account");
+    assert.ok(!loggedAt(h.lines(), "error", REFUSAL_SUMMARY), "and it carries no summary, because no command reached the account to produce one");
+    assert.equal(h.lines().filter(line => line.level === "error").length, 1, "a rejected command likewise produces exactly one error line");
+  });
+
+  test("a transport failure is narrated ONCE across every layer that saw it", async (t) => {
+
+    /* The combined-layers pin, and the one a per-layer suite structurally cannot write. Below the controller sits a REAL account-credentialed client over a mocked
+     * transport, and every layer writes into one capture buffer, so what is counted here is every voice that could speak about one failed command.
+     *
+     * Both transport failure shapes are driven, because they classify in different places: a non-2xx status is read off the response, while a GraphQL errors array
+     * arrives inside a clean HTTP 200 that no status check can see. Either way one command that did not take is ONE sentence for the user, carrying the reason and
+     * naming the zone - and the switch goes back to where it was.
+     */
+    const shapes = [ { body: { message: "Bad Gateway" }, expected: "The Hydrawise API answered with status 502.", label: "a refused transport", status: 502 },
+      { body: { errors: [{ message: "Cannot query field" }] }, expected: "Cannot query field.", label: "a GraphQL errors array", status: 200 } ];
+
+    for(const shape of shapes) {
+
+      const signal = new AbortController();
+      const agent = Object.assign(new MockAgent(), { destroy: async (): Promise<void> => { await agent.close(); } });
+
+      agent.disableNetConnect();
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, (): object => TOKEN_BODY).persist();
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH }).reply(shape.status, (): object => shape.body).persist();
+
+      const h = buildController({ hasV2Client: true,
+        program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+        suspensionClient: (log) => new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: signal.signal,
+          window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }), dispatcherFactory: (): MockAgent => agent, log, password: "test-password", signal: signal.signal,
+        username: "test-user" }), userOptions: [SUSPEND_ZONE_ON] });
+
+      t.after(() => { h.abort(); signal.abort("test-teardown"); });
+
+      // eslint-disable-next-line no-await-in-loop
+      const service = await waitFor(() => suspendSwitch(h.accessory));
+
+      // eslint-disable-next-line no-await-in-loop
+      await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+      // eslint-disable-next-line no-await-in-loop
+      await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+
+      const errors = h.lines().filter(line => line.level === "error");
+
+      assert.equal(errors.length, 1, shape.label + " produces exactly one error line across the client and the controller");
+      assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. " + shape.expected),
+        "and that line names the zone the user touched and the reason the command did not take");
+      assert.equal(readsSuspended(h.accessory), false, "with the switch put back where it was");
+    }
+  });
+
+  test("a command that finds no account client at all says what is missing", async (t) => {
+
+    /* The fourth answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is pinned
+     * here all the same, because the handler answers to every outcome the surface declares - and an unnamed one would compile into a switch reverting in silence.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      suspensionResult: { status: "unavailable" }, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. Enhanced features are not configured."),
+      "the sentence names the configuration the command needed rather than blaming the account");
+  });
+
+  test("a command torn down by shutdown reverts nothing and says nothing", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      suspensionResult: { status: "rejected" }, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    h.abort();
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    // Orderly teardown is not a refusal. A shutdown that narrated one would put an error in the log of every restart a user performs.
+    assert.equal(h.lines().filter(line => line.level === "error").length, 0, "a shutdown reaching a command in flight reports nothing");
+  });
+});
+
+describe("HydrawiseController per-zone suspension command guard", () => {
+
+  test("a snapshot older than the user's own command cannot undo it, and a newer one does", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    /* A fetch already in flight when the user tapped knows nothing about their command. Letting it answer would flip the switch straight back under their finger,
+     * which is the whole reason the guard exists.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() - 5);
+
+    assert.equal(readsSuspended(h.accessory), true, "an older snapshot leaves the command standing");
+
+    /* The tie, which every real refresh is a quarter of an hour away from and which a test lands on by default. Both instants are whole seconds, so a fetch stamped
+     * in the same second as the command could have been dispatched either side of it: the tie goes to the user, whose command holds for one more refresh rather
+     * than being undone by a snapshot that may well predate it.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
+
+    assert.equal(readsSuspended(h.accessory), true, "a snapshot from the command's own second does not outrank it");
+
+    /* The other direction, and the half a never-clearing guard would fail: facts that genuinely POSTDATE the command are the account's own confirmation - or
+     * correction - and they take over. A guard that never retired an entry would hold this switch off for the life of the process.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() + 2);
+
+    assert.equal(readsSuspended(h.accessory), false, "and a snapshot that postdates it retires the command and shows what the account says");
+  });
+
+  test("the guard carries WHICH WAY the command went, not merely that one happened", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    // Start from a suspended zone, so the classification and the command disagree and only the command's DIRECTION can produce the right answer.
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
+    assert.equal(readsSuspended(h.accessory), true, "the zone starts out suspended");
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(false);
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now() - 5);
+
+    /* A guard holding only a timestamp would fall through to the classification here and render the zone suspended again - the very state the user just commanded
+     * their way out of. Carrying the commanded direction is what makes the optimistic display honest in both directions.
+     */
+    assert.equal(readsSuspended(h.accessory), false, "a resume renders unsuspended against an older snapshot that still says otherwise");
+  });
+
+  test("a command the account refused stamps nothing", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      suspensionResult: { reason: REFUSAL_SUMMARY, status: "failed" }, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+
+    /* The snapshot below is OLDER than the tap, so a guard entry stamped by the failed command would stand and render the zone suspended. Nothing was commanded in
+     * the end, so nothing may claim to have been: the account's own answer is the only thing left to show.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() - 5);
+
+    assert.equal(readsSuspended(h.accessory), false, "a refused command leaves the display answering to the account alone");
+  });
+
+  test("a standing command survives the facts aging out from under it", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    /* No trustworthy snapshot at all - none ever arrived, the last aged out, or the refresh has stalled. Nothing newer has contradicted the user, so their own
+     * command is the honest thing to display; treating "we cannot tell" as "not suspended" would silently undo a command the account accepted.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, now() - (HYDRAWISE_V2_FACTS_TTL + 1));
+
+    assert.equal(readsSuspended(h.accessory), true, "an expired snapshot supersedes nothing, so the command stands");
+  });
+
+  test("an account-wide command stamps every zone the WIRE reported, enabled or not", async (t) => {
+
+    /* The source pin. The account-wide command has to stamp every zone the wire named, not the enabled projection: that projection is empty before the first poll
+     * completes and silently omits any zone a feature option turned off. Bravo is turned off here precisely so the two populations differ - a fixture where they
+     * matched could not tell the right source from the wrong one.
+     */
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON, BETA_DISABLED ] });
+
+    t.after(() => h.abort());
+
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+
+    assert.equal(suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), undefined, "the disabled zone has no switch of its own to be stamped through");
+
+    await all.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    // The snapshot predates the account-wide command, so without a per-zone stamp it would fight the account-wide switch's optimistic state zone by zone.
+    applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: false }, now() - 5);
+
+    assert.equal(readsSuspended(h.accessory), true, "the reported zone reads suspended from the account-wide command's own stamp");
+
+    // Bring the disabled zone back into the projection. Its switch is established now, and what it shows is whether the account-wide command reached it at all.
+    h.platform.featureOptions.configuredOptions = [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ];
+
+    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE));
+
+    assert.equal(beta.getCharacteristic(Characteristic.On).value, true, "and so does the zone the wire reported while a feature option had it turned off");
+  });
+
+  test("an account-wide resume stamps every zone the other way", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+
+    t.after(() => h.abort());
+
+    // The account-wide switch is established at construction while a zone's own switch waits on the first poll, so both are awaited before the account-wide command
+    // is driven - the zone switch is what this pin reads its answer off.
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+
+    await waitFor(() => suspendSwitch(h.accessory));
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
+    assert.equal(readsSuspended(h.accessory), true, "the zone starts out suspended");
+
+    await all.getCharacteristic(Characteristic.On).triggerSet(false);
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now() - 5);
+
+    // Both directions, because a stamp that only ever recorded suspensions would leave a resume-all fighting the same stale facts it was meant to outrank.
+    assert.equal(readsSuspended(h.accessory), false, "an account-wide resume renders every zone unsuspended against an older snapshot");
+  });
+});
+
+describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
+
+  test("a standalone zone's switch lives on its own accessory, and the refresh cadence reaches it there", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [ SUSPEND_ZONE_ON, STANDALONE_ON ] });
+
+    t.after(() => h.abort());
+
+    const zoneAccessory = await waitFor(() => h.zoneAccessories.get(ALPHA_RELAY_ID));
+
+    await waitFor(() => suspendSwitch(zoneAccessory));
+
+    assert.equal(suspendSwitch(h.accessory), undefined, "the switch follows its zone's valve rather than staying behind on the controller");
+
+    /* The refresh cadence reaching a standalone host is what the recorded hosting map exists for. Without it the tail would have nowhere to look, and a suspension
+     * landing between polls would not reach a promoted zone at all.
+     */
+    applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
+
+    assert.equal(readsSuspended(zoneAccessory), true, "a refresh tick reaches the switch on the accessory that hosts it");
+  });
+
+  test("the sweep is scoped to the composed subtype, so the account-wide switch survives it", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => suspendSwitch(h.accessory));
+    assert.ok(suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), "both switches start out published");
+
+    // Turn the per-zone switches off, leaving the account-wide one enabled. The two share the Switch service type, so a sweep matching on that type alone would
+    // take both - and the user would silently lose a switch they never touched.
+    h.platform.featureOptions.configuredOptions = [SUSPEND_ALL_ON];
+
+    await waitFor(() => (suspendSwitch(h.accessory) === undefined) ? true : undefined);
+
+    assert.ok(suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), "the account-wide switch is untouched by the per-zone sweep");
+  });
+
+  test("a zone that leaves the wire takes its switch and its standing command with it", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([betaZone()]), kind: "response" });
+    }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    const service = await waitFor(() => suspendSwitch(h.accessory));
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    // The zone falls off the wire, which takes its switch with it - the sweep answers to the walk, not to what was published last time.
+    await waitFor(() => (suspendSwitch(h.accessory) === undefined) ? true : undefined);
+
+    /* And its standing command goes too. Bringing the zone back with a snapshot that PREDATES that command is what makes the difference visible: a command left
+     * behind would still be standing and would render the returning zone suspended, against an account that says it is not.
+     */
+    h.retrieve.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+
+    const restored = await waitFor(() => suspendSwitch(h.accessory));
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: false }, now() - 5);
+
+    assert.equal(restored.getCharacteristic(Characteristic.On).value, false, "a returning zone answers to the account rather than to a command it outlived");
+  });
+
+  test("a v1-only install publishes nothing and logs nothing, whatever a poll reports", async (t) => {
+
+    // The whole parity floor in one pass: no switch, no command surface, and no line about a feature that does not exist here.
+    const h = buildController({ program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, STANDALONE_ON ] });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+
+    assert.equal(h.accessory.services.filter(service => (service.UUID === Service.Switch.UUID)).length, 0, "no switch of any kind is published");
+    assert.equal(countLogged(h.lines(), "error", "Unable to"), 0, "and nothing failed trying");
+  });
+});

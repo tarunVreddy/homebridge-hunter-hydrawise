@@ -8,11 +8,31 @@ import type { PlatformAccessory } from "homebridge";
 // HBHH reserved names.
 export const HydrawiseReservedNames = {
 
-  // Manage our switch types.
-  SWITCH_SUSPEND_ALL: "All"
+  // Manage our switch types. The account-wide switch names itself outright, while the per-zone switches share a PREFIX that the zone's own relay id completes, since
+  // a controller carries one of the first and one of the second per zone.
+  SWITCH_SUSPEND_ALL: "All",
+  SWITCH_SUSPEND_ZONE: "Suspend."
 } as const;
 
 export type HydrawiseReservedNames = typeof HydrawiseReservedNames[keyof typeof HydrawiseReservedNames];
+
+/* Compose the service subtype a zone's companion suspension switch carries. Every site that creates, looks up, or sweeps one of these switches composes its subtype
+ * here, so the shape lives in exactly one place and a change to it reaches all of them at once.
+ *
+ * The prefix is what makes the sweep safe. A per-zone switch and the account-wide switch share the Switch service UUID, so a sweep matching on that UUID alone would
+ * destroy the account-wide switch alongside the zone switches it was aiming at; matching the composed prefix is what tells the two apart.
+ */
+export function suspendZoneSubtype(relayId: number): string {
+
+  return HydrawiseReservedNames.SWITCH_SUSPEND_ZONE + relayId.toString();
+}
+
+// Whether a service subtype names a zone's companion suspension switch. This is the recognition half of the composition above and lives beside it deliberately, so
+// the two readings of the prefix cannot drift apart. A service carrying no subtype, or one carrying any other name, is not this sweep's business.
+export function isSuspendZoneSubtype(subtype: string | undefined): boolean {
+
+  return subtype?.startsWith(HydrawiseReservedNames.SWITCH_SUSPEND_ZONE) ?? false;
+}
 
 // Hydrawise API: the endpoints this plugin calls. Naming them as a union rather than a bare string keeps the platform's rate-ceiling classification total: a call
 // site can only name an endpoint the platform has already decided which budgets to draw against, so a typo or a newly added endpoint is a compile error rather
@@ -203,6 +223,48 @@ export interface HydrawiseV2Account {
 
   me?: { controllers?: HydrawiseV2Controller[] };
 }
+
+/* Hydrawise v2 API: what a suspension mutation answers with - a status word and the sentence the account composed about what it did.
+ *
+ * The status word is the necessary half, and a 2026-08-10 live probe is why: both mutations report a refusal INSIDE a clean HTTP 200 carrying no GraphQL errors
+ * array at all, so the transport-level classification every read relies on cannot see it and only a caller that reads this field can.
+ */
+export interface HydrawiseV2MutationStatus {
+
+  status?: string;
+  summary?: string;
+}
+
+// Hydrawise v2 API: the data half of a suspension mutation, whose single field is named after the mutation that was sent. Both mutations answer the same status pair
+// under their own name, so one shape describes either and the caller reads the field it asked for.
+export interface HydrawiseV2MutationData {
+
+  resumeZone?: HydrawiseV2MutationStatus;
+  suspendZone?: HydrawiseV2MutationStatus;
+}
+
+// Hydrawise v2 API: the status word a mutation answers with when it succeeded. Anything else is a refusal, whatever it spells, so the comparison is against this one
+// value rather than against a list of failures nobody published.
+export const HYDRAWISE_V2_MUTATION_OK = "OK";
+
+/* The answer one per-zone suspension command gives, as a discriminated union rather than a boolean, because its outcomes ask the caller for three different things.
+ *
+ * "done" means the account accepted the command, so the optimistic state the user is already looking at stands. "failed" means a genuinely attempted command did not
+ * take. "rejected" means the command never reached the wire at all - the ceiling had no slot to admit it inside the beat a user will wait - which asks for a retry in
+ * a moment rather than reporting a refusal that never happened.
+ *
+ * The failed arm's reason is ONE field for the two ways a command can fail: the account's own summary when it refused in band, and the transport's reason when the
+ * request itself did not land. They are one field because they answer one question the user is asking - why did my command not take - and because the layer that
+ * writes the sentence should not have to know which of the two it is holding. A null reason means the failure was already reported in its own words elsewhere.
+ */
+export type HydrawiseV2MutationResult =
+  { status: "done" } |
+  { reason: Nullable<string>; status: "failed" } |
+  { status: "rejected" };
+
+// The answer the platform's own per-zone suspension surface gives: the client's three outcomes, plus the one only the platform can know, which is that no
+// account-credentialed client exists to command through.
+export type HydrawiseZoneSuspensionResult = HydrawiseV2MutationResult | { status: "unavailable" };
 
 /* Hydrawise v2 API: the prefix marking the sensor kinds that report a level - the family a rain or freeze sensor belongs to, and the only family whose activity
  * can stop a zone's irrigation. The live capture records the owner's rain and freeze sensor answering LEVEL_CLOSED, and the schema declares the field as an

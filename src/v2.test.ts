@@ -11,7 +11,7 @@
 // The OAuth and GraphQL wire shapes use snake_case keys such as access_token, so camelcase is disabled here to let the fixtures mirror the captured bodies verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
-  HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import { describe, test } from "node:test";
 import type { CapturedLogLine } from "./testing.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
@@ -19,6 +19,8 @@ import { MockAgent } from "undici";
 import { RateBudget } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { capturingLog } from "./testing.helpers.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import util from "node:util";
 
 // The origin every v2 request targets, derived from the endpoint constant exactly as the client derives its own pool origin.
 const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
@@ -59,6 +61,21 @@ const QUIET_ZONE_ID = 6940181;
 
 // The far-future suspension instant the live capture recorded on that zone, kept exactly so the beyond-a-week rendering tiers are exercised against a real value.
 const SUSPENDED_UNTIL = 1903928399;
+
+/* The 2026-08-10 suspension probe's own values, kept verbatim. The instant is the one the account echoed back as the suspension it had recorded, and the two
+ * documents are the request bodies the account accepted, byte for byte.
+ *
+ * Pinning the composed text against the capture rather than against this plugin's own idea of the shape is the whole point: the argument names, the quoting, the
+ * two-digit year, and the explicit offset are all things the account enforces and none of them can be derived from the schema.
+ */
+const PROBE_SUSPEND_UNTIL = 1786392682;
+
+const PROBE_SUSPEND_MUTATION = "mutation { suspendZone(zoneId: 6940181, until: \"Mon, 10 Aug 26 15:11:22 -0500\") { status summary } }";
+
+const PROBE_RESUME_MUTATION = "mutation { resumeZone(zoneId: 6940181) { status summary } }";
+
+// The refusal summary a mutation carries back for the controller's one sentence to name, shaped as the account composes its own.
+const REFUSAL_SUMMARY = "This zone cannot be suspended right now.";
 
 // The zone block as the account query returns it: one zone under a suspension, one under none. The unsuspended zone answers a NULL suspendedUntil rather than
 // omitting the field, which is the shape the live capture records and the one that has to read as "not suspended" rather than as "unknown".
@@ -141,6 +158,37 @@ function programReply(agent: MockAgent, record: (path: string) => void, path: st
 
     return body;
   }).persist();
+}
+
+/* Program the graph endpoint on the same terms, additionally capturing the query text of every request it serves. That capture is what lets a test pin the exact
+ * document that went on the wire, which every other intercept here - matching on path and method alone - is blind to.
+ */
+function programGraph(agent: MockAgent, record: (path: string) => void, body: object, queries: string[], statusCode = 200): void {
+
+  agent.get(V2_ORIGIN).intercept({ body: (payload) => {
+
+    queries.push((JSON.parse(payload) as { query: string }).query);
+
+    return true;
+  }, method: "POST", path: GRAPH_PATH }).reply(statusCode, (): object => {
+
+    record(GRAPH_PATH);
+
+    return body;
+  }).persist();
+}
+
+// The operator-visible text of one captured line. The plugin logs printf-style, so a sentence and the detail it carries can sit in different arguments and only the
+// formatted line is what a user actually reads - which is what an assertion about the reported wording has to run against.
+function formatted(line: CapturedLogLine): string {
+
+  return util.format(line.message, ...line.args);
+}
+
+// The error lines a harness captured, already formatted.
+function errorLines(lines: CapturedLogLine[]): string[] {
+
+  return lines.filter(line => line.level === "error").map(line => formatted(line));
 }
 
 describe("HydrawiseV2Client tokens", () => {
@@ -578,8 +626,11 @@ describe("HydrawiseV2Client failure classification", () => {
     // The transport succeeded and the query did not. A classification that read the status alone would hand the caller the body's empty controller list as though
     // it were an answer, and every controller would be quietly left unenriched with nothing reported.
     assert.equal(await harness.client.fetchAccountFacts(), null, "a body-level errors array classifies as a failed query");
-    assert.ok(harness.lines().some(line => (line.level === "error") && String(line.args[0]).includes("Internal server error")),
-      "the reported failure names what the API said was wrong");
+
+    // The reported line is read as the operator sees it, whole. The read's own sentence and the account's message reach the log as separate printf arguments, so
+    // an assertion against either argument alone would pin half the sentence and pass while the other half went missing.
+    assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details: Internal server error."],
+      "the reported failure names the read that failed and what the API said was wrong");
   });
 
   test("a non-2xx query status is a failure", async () => {
@@ -591,6 +642,11 @@ describe("HydrawiseV2Client failure classification", () => {
     });
 
     assert.equal(await harness.client.fetchAccountFacts(), null, "a throttled query answers null rather than a partial result");
+
+    // The status branch's own sentence, pinned whole for the same reason the errors branch above is: the read states what it was doing and the transport states
+    // what it got, and the two now reach the log as separate arguments of one line.
+    assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details. The Hydrawise API answered with status 429."],
+      "the throttled read is reported under the read's own sentence");
   });
 
   test("a failed grant leaves the query unattempted", async () => {
@@ -619,11 +675,39 @@ describe("HydrawiseV2Client failure classification", () => {
 
     assert.equal(await harness.client.fetchAccountFacts(), null, "a thrown transport failure answers the same null every recoverable failure does");
 
-    const reported = harness.lines().filter(line => line.level === "error");
+    // Read as the operator sees it, whole. The read composes its own sentence with the reason the transport handed back, so what is asserted is the line rather
+    // than whichever argument a given composition happens to put it in.
+    const reported = errorLines(harness.lines());
 
     assert.equal(reported.length, 1, "it is reported exactly once");
-    assert.ok(reported.some(line => line.args.some(arg => String(arg).includes("socket hang up"))), "and the report carries what actually went wrong");
-    assert.ok(!reported.some(line => line.message.includes("too long to respond")), "a generic failure is not narrated as a timeout");
+    assert.ok(reported[0]?.startsWith("Unable to retrieve enhanced controller details: "), "under the read's own sentence");
+    assert.ok(reported.some(line => line.includes("socket hang up")), "and the report carries what actually went wrong");
+    assert.ok(!reported.some(line => line.includes("too long to respond")), "a generic failure is not narrated as a timeout");
+  });
+
+  test("a shutdown while a read is QUEUED for a slot answers the same quiet null", async () => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    }, { capacity: 1, signal: controller.signal });
+
+    // Spend the only slot, so the read below waits in the budget's queue rather than reaching the transport at all.
+    await harness.budget.acquire();
+
+    const read = harness.client.fetchAccountFacts();
+
+    controller.abort("shutdown");
+
+    /* The read's pacing wait sits inside its own try, which is what makes this quiet rather than an escaping rejection. Callers and tests alike consume this method
+     * bare, so a shutdown arriving while a scheduled read was still queued would otherwise surface as an unhandled rejection at teardown.
+     */
+    assert.equal(await read, null, "a read torn down while queued answers null like every other recoverable failure");
+    assert.deepEqual(errorLines(harness.lines()), [], "and a shutdown is not an error");
+    assert.deepEqual(harness.calls, [], "nothing reached the wire");
   });
 
   test("a shutdown in flight reports nothing", async () => {
@@ -648,6 +732,339 @@ describe("HydrawiseV2Client failure classification", () => {
 
     assert.equal(result, null, "a shutdown reached mid-request answers null");
     assert.equal(harness.lines().filter(line => line.level === "error").length, 0, "a shutdown is not an error and reports nothing");
+  });
+});
+
+describe("HydrawiseV2Client zone suspension", () => {
+
+  test("composes the exact suspendZone document the live probe recorded", async () => {
+
+    const queries: string[] = [];
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programGraph(agent, record, { data: { suspendZone: { status: "OK", summary: "Suspending Parkway North" } } }, queries);
+    });
+
+    const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+
+    /* The whole document, byte for byte against the capture. Every part of it is something the account enforces and none of it is derivable: the argument names,
+     * the quoting around the instant, the two-digit year, and the explicit offset. A formatter that rendered the host's own zone, or a four-digit year, composes a
+     * different string here rather than failing in the field.
+     */
+    assert.deepEqual(queries, [PROBE_SUSPEND_MUTATION], "the suspend composes the document the account accepted");
+    assert.deepEqual(result, { status: "done" }, "an accepted command answers done");
+  });
+
+  test("composes the exact resumeZone document the live probe recorded", async () => {
+
+    const queries: string[] = [];
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programGraph(agent, record, { data: { resumeZone: { status: "OK", summary: "Resuming scheduled watering" } } }, queries);
+    });
+
+    const result = await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID });
+
+    // The resume carries the zone and nothing else, which is what makes it per-zone: the probe suspended one zone, resumed it, and watched a sibling's standing
+    // suspension survive the cycle untouched.
+    assert.deepEqual(queries, [PROBE_RESUME_MUTATION], "the resume composes the document the account accepted");
+    assert.deepEqual(result, { status: "done" }, "an accepted resume answers done");
+  });
+
+  test("reads the status word out of the field its OWN mutation answers under", async () => {
+
+    /* The two mutations nest their answer under different field names, so a reader that looked at one field for both would pass every test written against that
+     * one shape and misread the other in the field. All four combinations are driven here, plus the pair that proves the correlation rather than the parsing: a
+     * body answering under the SIBLING mutation's name is not this command's answer at all, and reads as a refusal rather than as a success.
+     */
+    const cases = [
+      { answer: { data: { suspendZone: { status: "OK" } } }, expected: { status: "done" }, until: PROBE_SUSPEND_UNTIL },
+      { answer: { data: { resumeZone: { status: "OK" } } }, expected: { status: "done" }, until: null },
+      { answer: { data: { suspendZone: { status: "ERROR", summary: REFUSAL_SUMMARY } } }, expected: { reason: REFUSAL_SUMMARY, status: "failed" },
+        until: PROBE_SUSPEND_UNTIL },
+      { answer: { data: { resumeZone: { status: "ERROR", summary: REFUSAL_SUMMARY } } }, expected: { reason: REFUSAL_SUMMARY, status: "failed" }, until: null },
+      { answer: { data: { resumeZone: { status: "OK" } } }, expected: { reason: null, status: "failed" }, until: PROBE_SUSPEND_UNTIL },
+      { answer: { data: { suspendZone: { status: "OK" } } }, expected: { reason: null, status: "failed" }, until: null }
+    ];
+
+    for(const scenario of cases) {
+
+      const harness = makeV2Harness((agent, record) => {
+
+        programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+        programReply(agent, record, GRAPH_PATH, scenario.answer);
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const result = await harness.client.setZoneSuspension({ until: scenario.until, zoneId: QUIET_ZONE_ID });
+
+      assert.deepEqual(result, scenario.expected, "the command reads " + JSON.stringify(scenario.answer) + " correctly");
+
+      // A refusal reported inside a clean 200 is the command's own business to report, so the client says nothing at all about it - the one sentence the user reads
+      // belongs to the controller, which knows which zone was touched.
+      assert.deepEqual(errorLines(harness.lines()), [], "an in-band answer is never narrated by the client");
+    }
+  });
+
+  test("a transport failure carries its reason back in the result rather than logging one", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { message: "Bad Gateway" }, 502);
+    });
+
+    /* A command that failed at the TRANSPORT is silent here for the same reason one refused in band is: the controller is the layer that knows which zone the user
+     * touched, so it speaks, and the reason has to reach it to be spoken. A client that reported this itself would leave one failure narrated twice.
+     */
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
+      { reason: "The Hydrawise API answered with status 502.", status: "failed" }, "the transport's reason travels back in the result");
+    assert.deepEqual(errorLines(harness.lines()), [], "and the client says nothing about a command's failure, whatever caused it");
+  });
+
+  test("a GraphQL errors array likewise carries the account's words back rather than logging them", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { errors: [{ message: "Cannot query field" }] });
+    });
+
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID }), { reason: "Cannot query field.", status: "failed" },
+      "a body-level errors array is a failed command whose reason is what the API said");
+    assert.deepEqual(errorLines(harness.lines()), [], "reported by nobody at this layer");
+  });
+
+  test("a command that times out re-arms the pool, and still leaves the reporting to its caller", async () => {
+
+    /* The recovery half has to survive the silence. A timeout is the one classification that DOES something besides describing itself - it replaces the wedged
+     * connection pool - and moving the reporting out of the classifier must not take the re-arm with it.
+     */
+    const first = destroyable(new MockAgent());
+    const second = new MockAgent();
+    const built = [ first, second ];
+    const { lines, logger } = capturingLog();
+    const signal = new AbortController().signal;
+
+    first.disableNetConnect();
+    second.disableNetConnect();
+
+    first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, (): object => TOKEN_BODY).persist();
+    first.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH })
+      .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
+
+    const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger, password: "test-password", signal, username: "test-user" });
+
+    assert.deepEqual(await client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
+      { reason: "The Hydrawise API took too long to respond, which can usually be safely ignored.", status: "failed" },
+      "the timeout's reason travels back for the controller to say");
+    assert.equal(client.dispatcher, second, "and the wedged pool was replaced all the same");
+    assert.deepEqual(errorLines(lines()), [], "with nothing said here about the command that provoked it");
+  });
+
+  test("a saturated ceiling rejects the command having spent NOTHING on it", async (t) => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { capacity: 1, signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    // Spend the only slot, so the command arrives at a ceiling with nothing to give and a window it cannot wait out.
+    await harness.budget.acquire();
+
+    const started = Date.now();
+    const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+
+    assert.deepEqual(result, { status: "rejected" }, "a command the ceiling cannot admit is rejected rather than queued");
+    assert.deepEqual(harness.calls, [], "and it reached the wire for nothing at all - no grant, no mutation");
+
+    /* The bound is what makes this reject-with-feedback rather than a silent wait. Unbounded, this caller would sit in the library's blocking queue until the
+     * budget's own window released a slot, which is measured in half hours.
+     */
+    assert.ok((Date.now() - started) < (HYDRAWISE_V2_BUDGET_WINDOW * 1000), "the command gave up on the admission window rather than the budget's");
+  });
+
+  test("an admission that gives up on the token race leaves the grant, the pool, and the token state untouched", async (t) => {
+
+    const controller = new AbortController();
+    let released = (): void => undefined;
+    const grantInFlight = new Promise<void>(resolve => { released = resolve; });
+
+    const harness = makeV2Harness((agent, record) => {
+
+      // A grant that is genuinely IN FLIGHT when the admission window closes. That is the only fixture the token-reset control can be asserted against at all: the
+      // reset lives inside the grant's own failure paths, so a fixture with no live grant would assert an absence that could never have happened.
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, async (): Promise<object> => {
+
+        record(TOKEN_PATH);
+
+        await grantInFlight;
+
+        return TOKEN_BODY;
+      }).persist();
+
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    const pool = harness.client.dispatcher;
+    const command = harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+
+    assert.deepEqual(await command, { status: "rejected" }, "the window closed on a grant still in flight, so the command is rejected");
+
+    // The three faces of the misclassification this structure exists to make unrepresentable. An admission abort that reached the failure classification would
+    // re-arm the pool, would report itself as a request that took too long, and - by way of the grant it aborted - would reset the token state.
+    assert.equal(harness.client.dispatcher, pool, "an admission abort never re-arms the connection pool");
+    assert.deepEqual(errorLines(harness.lines()), [], "and never narrates itself as a request timeout, or as anything else");
+
+    // Let the grant land and confirm it was neither abandoned nor reset: the very next caller finds a usable token and spends no second grant.
+    released();
+
+    assert.equal(await harness.client.ensureToken(), "access-one", "the abandoned grant completed and its token was kept");
+    assert.deepEqual(harness.calls.map(call => call.path), [TOKEN_PATH], "which is to say the admission abort reset nothing and cost no second grant");
+  });
+
+  test("a reader waiting on the same grant is unaffected by a command abandoning its admission race", async (t) => {
+
+    const controller = new AbortController();
+    let released = (): void => undefined;
+    const grantInFlight = new Promise<void>(resolve => { released = resolve; });
+
+    const harness = makeV2Harness((agent, record) => {
+
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, async (): Promise<object> => {
+
+        record(TOKEN_PATH);
+
+        await grantInFlight;
+
+        return TOKEN_BODY;
+      }).persist();
+
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    }, { signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    /* Both callers are driven in ONE test, which is the only arrangement that can observe the claim at all: the read joins the grant the command's admission
+     * started, and the command then walks away from it. Threading the command's deadline INTO that shared grant - rather than racing it - would cancel the read's
+     * token too, and the read would answer null here.
+     */
+    const read = harness.client.fetchAccountFacts();
+    const command = harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID });
+
+    assert.deepEqual(await command, { status: "rejected" }, "the command gave up on its own window");
+
+    released();
+
+    const facts = await read;
+
+    assert.ok(facts, "the read the command left behind resolved on the very grant that command abandoned");
+    assert.equal(facts.get(1058515)?.online, true, "and it carries the account's own answer, whole");
+  });
+
+  test("an admitted command draws the ceiling ONCE, in its admission phase, and never again in the transport", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { resumeZone: { status: "OK" } } });
+    });
+
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID }), { status: "done" }, "the command was accepted");
+
+    /* The draws attributed BY PHASE, which a bare total could not do. A cold client spends exactly two: the admission's own slot and the token grant it triggers.
+     * A transport step that drew a third would show up as a lower count here and as a lower reading at the mutation's dispatch.
+     */
+    assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 2, "one command on a cold client costs its admission slot and its grant, and nothing more");
+    assert.deepEqual(harness.calls.map(call => call.path), [ TOKEN_PATH, GRAPH_PATH ], "the grant dispatches before the mutation it authenticates");
+    assert.equal(harness.calls[1]?.budgetAvailableAtDispatch, HYDRAWISE_V2_BUDGET_CALLS - 2, "and the mutation dispatched against those same two slots");
+  });
+
+  test("a command admitted on the last slot gives up within its window when the token needs renewing", async (t) => {
+
+    /* The compound case, and the one an admission bound on step ONE alone would fail. The command is admitted on the last aging slot, which saturates the ceiling,
+     * and the token it then needs is inside its renewal window - so the grant's own draw has nothing left to take and would block toward the budget's half-hour
+     * horizon. Racing that wait, rather than merely bounding the slot, is what answers the user inside the beat.
+     */
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      // A grant whose lifetime is already inside the proactive-renewal threshold, so the very next caller renews.
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, (): object => {
+
+        record(TOKEN_PATH);
+
+        return { access_token: "access-one", expires_in: 30, refresh_token: "refresh-one" };
+      }).persist();
+
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { capacity: 2, signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    // Warm the client, which spends one of the two slots on the short-lived grant and leaves exactly one for the command's admission to take.
+    assert.equal(await harness.client.ensureToken(), "access-one", "the client starts holding a token that is already due for renewal");
+    assert.equal(harness.budget.available, 1, "one slot is left, which the command's admission will take");
+
+    const started = Date.now();
+    const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+    const elapsed = Date.now() - started;
+
+    assert.deepEqual(result, { status: "rejected" }, "the renewal could not be paid for inside the window, so the command is rejected");
+    assert.ok(elapsed < (HYDRAWISE_V2_BUDGET_WINDOW * 1000), "and it resolved on its own window rather than blocking toward the budget's");
+    assert.deepEqual(harness.calls.map(call => call.path), [TOKEN_PATH], "the mutation never reached the wire");
+  });
+
+  test("a grant that fails inside the window answers failed without spending a second one", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, { error: "invalid_grant" }, 401);
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    });
+
+    /* The fast-null arm of the race, which is a FAILURE rather than a rejection: the account was reached and refused, which is something the user can act on.
+     * Entering the transport here would run the token chokepoint a second time and spend a duplicate grant on an account that has just said no.
+     */
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID }), { reason: null, status: "failed" },
+      "a grant that failed inside the window is a failed command, carrying no reason of its own because the sign-in reported itself");
+    assert.deepEqual(harness.calls.map(call => call.path), [TOKEN_PATH], "exactly one grant was attempted, and the mutation never dispatched");
+  });
+
+  test("a shutdown reaching the admission phase reports nothing at all", async () => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { capacity: 1, signal: controller.signal });
+
+    await harness.budget.acquire();
+
+    const command = harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+
+    // Teardown, not a refusal. The lifetime signal is read ahead of everything else, so a shutdown reaching a queued command answers quietly rather than
+    // manufacturing a line about a ceiling nobody is waiting on any more.
+    await delay(HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT * 100);
+    controller.abort("shutdown");
+
+    assert.deepEqual(await command, { status: "rejected" }, "a command torn down mid-admission is rejected");
+    assert.deepEqual(harness.lines().filter(line => line.level !== "debug"), [], "and a shutdown narrates nothing, at any level a user reads");
   });
 });
 
