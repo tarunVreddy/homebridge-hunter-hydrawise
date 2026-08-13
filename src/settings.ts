@@ -62,12 +62,30 @@ export const HYDRAWISE_V2_BUDGET_CALLS = 5;
 // The trailing window, in seconds, the v2 call ceiling above is measured over.
 export const HYDRAWISE_V2_BUDGET_WINDOW = 1800;
 
-/* How long, in seconds, a per-zone suspension command waits for the v2 ceiling to admit it before it gives up.
+/* The v2 COMMAND ceiling, as a COUNT OF CALLS inside the trailing window below. It paces the per-zone suspension commands, where the ceiling above paces the
+ * scheduled reads and the token grants they carry. Each kind of traffic draws its own because they are unlike: a command is an event-shaped user action, someone
+ * standing at a switch waiting for it to take, while the reads are a recurring cadence that runs whether anybody is watching or not. Separately, a burst of switch
+ * flips neither starves the scheduled reads nor is starved by them.
  *
- * A command is a person standing at their phone watching a switch, so it is bounded by a beat rather than by the budget's own window: that window is half an hour
- * wide, and a command that queued for it would take effect long after the user had walked away. Giving up inside a second turns contention into a switch that flicks
- * back carrying a reason, which is the answer the user can act on. An abandoned wait consumes no slot and leaves every other waiter in place, so bounding a command
- * this tightly costs the scheduled reads nothing.
+ * The value is deliberately observational, on the same terms the read ceiling is: generous enough that ordinary use never meets it, small enough that a runaway
+ * automation cannot hammer a throttle Hydrawise does not publish. It is also the whole of the policy - what a burst of commands may spend is this constant and
+ * nothing else.
+ *
+ * The arithmetic is worth stating plainly, because independent ceilings do add up: an hour in which commands and reads both run to their limits admits more v2
+ * calls than the read ceiling alone ever could. That is the deliberate price of giving a user action headroom of its own, and the read ceiling's own conservatism
+ * is untouched by it.
+ */
+export const HYDRAWISE_V2_MUTATION_BUDGET_CALLS = 10;
+
+// The trailing window, in seconds, the v2 command ceiling above is measured over.
+export const HYDRAWISE_V2_MUTATION_BUDGET_WINDOW = 3600;
+
+/* How long, in seconds, a per-zone suspension command waits for the command ceiling to admit it before it gives up.
+ *
+ * A command is a person standing at their phone watching a switch, so it is bounded by a beat rather than by the budget's own window: that window is an hour wide,
+ * and a command that queued for it would take effect long after the user had walked away. Giving up inside a second turns contention into a switch that flicks back
+ * carrying a reason, which is the answer the user can act on. An abandoned wait consumes no slot and leaves every other waiter in place, so bounding a command this
+ * tightly costs the scheduled reads nothing.
  */
 export const HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT = 1;
 

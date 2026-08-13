@@ -4,8 +4,8 @@
  */
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC,
-  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME,
-  PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
+  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -41,6 +41,19 @@ describe("settings", () => {
     assert.equal(HYDRAWISE_V2_BUDGET_WINDOW / HYDRAWISE_V2_REFRESH_INTERVAL, 2, "which is two reads per budget window");
     assert.ok((HYDRAWISE_V2_BUDGET_WINDOW / HYDRAWISE_V2_REFRESH_INTERVAL) < HYDRAWISE_V2_BUDGET_CALLS,
       "leaving headroom inside the ceiling for the token grants those reads carry");
+  });
+
+  test("the command ceiling is stated as its own count and window, independent of the read ceiling", () => {
+
+    /* The command ceiling is pinned apart from the read ceiling because their separation IS the policy: commands are event-shaped user actions where the reads are
+     * a recurring cadence, so neither number is derivable from the other and a change to either is a deliberate edit. The relationship worth asserting alongside
+     * them is the one the split was made for - a command ceiling narrower than the read ceiling would put a user's own action on a tighter leash than the
+     * background traffic it was separated from.
+     */
+    assert.equal(HYDRAWISE_V2_MUTATION_BUDGET_CALLS, 10, "the command ceiling admits 10 commands");
+    assert.equal(HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, 3600, "the command ceiling is measured over 3600 seconds");
+    assert.ok(HYDRAWISE_V2_MUTATION_BUDGET_CALLS > HYDRAWISE_V2_BUDGET_CALLS,
+      "and it is the more generous, which is what gives a burst of commands its headroom");
   });
 
   test("the facts lifetime is derived from the cadence rather than restated beside it", () => {

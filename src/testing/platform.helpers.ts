@@ -620,15 +620,29 @@ export function budgetsOf(platform: HydrawisePlatform): { account: RateBudget; c
 }
 
 /**
- * Read the platform's account-credentialed rate budget through its private field, on exactly the terms budgetsOf reads the other two.
+ * Read the platform's account-credentialed READ budget through its private field, on exactly the terms budgetsOf reads the key-based two. This is the ceiling the
+ * scheduled whole-account read and every token grant draw.
  *
  * @param platform - The constructed HydrawisePlatform.
  *
- * @returns The v2 budget.
+ * @returns The v2 read budget.
  */
 export function v2BudgetOf(platform: HydrawisePlatform): RateBudget {
 
   return (platform as unknown as { v2Budget: RateBudget }).v2Budget;
+}
+
+/**
+ * Read the platform's account-credentialed COMMAND budget through its private field, the twin of v2BudgetOf and confined here on the same terms. This is the
+ * ceiling a per-zone suspension's admission draws, and the one the platform's zero-cost pre-check reads.
+ *
+ * @param platform - The constructed HydrawisePlatform.
+ *
+ * @returns The v2 mutation budget.
+ */
+export function v2MutationBudgetOf(platform: HydrawisePlatform): RateBudget {
+
+  return (platform as unknown as { v2MutationBudget: RateBudget }).v2MutationBudget;
 }
 
 /**

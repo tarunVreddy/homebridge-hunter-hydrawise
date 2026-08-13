@@ -13,7 +13,7 @@
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
-  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneScheduleStatus, HydrawiseZoneV2Facts,
   StatusScheduleResponse } from "./types.ts";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
@@ -452,7 +452,9 @@ describe("HydrawiseController per-zone suspension commands", () => {
       const h = buildController({ hasV2Client: true,
         program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
         suspensionClient: (log) => new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: signal.signal,
-          window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }), dispatcherFactory: (): MockAgent => agent, log, password: "test-password", signal: signal.signal,
+          window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }), dispatcherFactory: (): MockAgent => agent, log,
+        mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal: signal.signal,
+          window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }), password: "test-password", signal: signal.signal,
         username: "test-user" }), userOptions: [SUSPEND_ZONE_ON] });
 
       t.after(() => { h.abort(); signal.abort("test-teardown"); });

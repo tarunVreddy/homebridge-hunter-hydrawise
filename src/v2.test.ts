@@ -11,7 +11,8 @@
 // The OAuth and GraphQL wire shapes use snake_case keys such as access_token, so camelcase is disabled here to let the fixtures mirror the captured bodies verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
-  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
+  HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import { describe, test } from "node:test";
 import type { CapturedLogLine } from "./testing.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
@@ -100,45 +101,64 @@ const GRAPH_ERRORS_BODY = { data: { me: { controllers: [] } },
     path: [ "me", "controllers", 0, "sensors", 0, "model", "mode" ] }] };
 
 // One recorded request the injected dispatcher served, in the order it was served. The path is what tells a token grant from a query, and the order is what a
-// budget-before-dispatch pin reads.
+// budget-before-dispatch pin reads. BOTH ceilings are sampled, because a draw attributed to the wrong one is exactly what a split into two ceilings can get wrong.
 interface RecordedCall {
 
   budgetAvailableAtDispatch: number;
+  mutationAvailableAtDispatch: number;
   path: string;
 }
 
-// The handles a harness hands back: the client under test, the recorded call log, the budget it draws against, and the captured log lines.
+// The handles a harness hands back: the client under test, the recorded call log, the two ceilings it draws against, and the captured log lines.
 interface V2Harness {
 
   budget: RateBudget;
   calls: RecordedCall[];
   client: HydrawiseV2Client;
   lines: () => CapturedLogLine[];
+  mutationBudget: RateBudget;
 }
 
 /* Build a client over a MockAgent handed in through the constructor's dispatcher factory - the SAME parameter production leaves unset, so nothing here is a path
  * production does not have. The factory answers one agent for the life of the harness; a test that wants to observe the timeout self-heal would supply its own.
  *
- * Each intercept records the call before it replies, capturing the budget's free slots AT DISPATCH. That single number is what proves the draw is awaited rather
- * than merely present: a call that reached the wire without waiting would be recorded with the budget untouched.
+ * Each intercept records the call before it replies, capturing both ceilings' free slots AT DISPATCH. Those numbers are what prove the draw is awaited rather than
+ * merely present: a call that reached the wire without waiting would be recorded with its ceiling untouched. Each capacity is settable on its own, which is what
+ * lets a test saturate one ceiling and leave the other roomy - the arrangement every independence pin below rests on.
  */
 function makeV2Harness(program: (agent: MockAgent, record: (path: string) => void) => void,
-  options: { capacity?: number; signal?: AbortSignal } = {}): V2Harness {
+  options: { capacity?: number; mutationCapacity?: number; signal?: AbortSignal } = {}): V2Harness {
 
   const { lines, logger } = capturingLog();
   const signal = options.signal ?? new AbortController().signal;
   const budget = new RateBudget({ capacity: options.capacity ?? HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
+  const mutationBudget = new RateBudget({ capacity: options.mutationCapacity ?? HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal,
+    window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 });
   const calls: RecordedCall[] = [];
   const agent = new MockAgent();
 
   agent.disableNetConnect();
 
-  program(agent, (path: string): void => { calls.push({ budgetAvailableAtDispatch: budget.available, path }); });
+  program(agent, (path: string): void => {
 
-  const client = new HydrawiseV2Client({ budget, dispatcherFactory: (): MockAgent => agent, log: logger, password: "test-password", signal,
+    calls.push({ budgetAvailableAtDispatch: budget.available, mutationAvailableAtDispatch: mutationBudget.available, path });
+  });
+
+  const client = new HydrawiseV2Client({ budget, dispatcherFactory: (): MockAgent => agent, log: logger, mutationBudget, password: "test-password", signal,
     username: "test-user" });
 
-  return { budget, calls, client, lines };
+  return { budget, calls, client, lines, mutationBudget };
+}
+
+// Spend every slot of ONE ceiling, leaving the other exactly as it was. Saturating one bucket and watching the traffic that draws the other carry on is the whole
+// shape of an independence pin, and naming the bucket at the call site is what says which direction the pin is testing.
+async function saturate(budget: RateBudget): Promise<void> {
+
+  while(budget.available > 0) {
+
+    // eslint-disable-next-line no-await-in-loop
+    await budget.acquire();
+  }
 }
 
 /* A MockAgent whose destroy tears it down for real. undici's MockAgent implements close but inherits the base dispatcher's unimplemented destroy, and the client
@@ -973,7 +993,9 @@ describe("HydrawiseV2Client zone suspension", () => {
       .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger, password: "test-password", signal, username: "test-user" });
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
+      password: "test-password", signal, username: "test-user" });
 
     assert.deepEqual(await client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
       { reason: "The Hydrawise API took too long to respond, which can usually be safely ignored.", status: "failed" },
@@ -982,7 +1004,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     assert.deepEqual(errorLines(lines()), [], "with nothing said here about the command that provoked it");
   });
 
-  test("a saturated ceiling rejects the command having spent NOTHING on it", async (t) => {
+  test("a saturated command ceiling rejects the command having spent NOTHING on it", async (t) => {
 
     const controller = new AbortController();
 
@@ -990,12 +1012,13 @@ describe("HydrawiseV2Client zone suspension", () => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
       programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
-    }, { capacity: 1, signal: controller.signal });
+    }, { mutationCapacity: 1, signal: controller.signal });
 
     t.after(() => controller.abort("test-teardown"));
 
-    // Spend the only slot, so the command arrives at a ceiling with nothing to give and a window it cannot wait out.
-    await harness.budget.acquire();
+    // Spend the only COMMAND slot, so the command arrives at the ceiling it draws with nothing to give and a window it cannot wait out. The read ceiling is left
+    // whole on purpose: this is a claim about the ceiling commands are paced by, and draining the other one would prove it against the wrong bucket.
+    await harness.mutationBudget.acquire();
 
     const started = Date.now();
     const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
@@ -1004,9 +1027,10 @@ describe("HydrawiseV2Client zone suspension", () => {
     assert.deepEqual(harness.calls, [], "and it reached the wire for nothing at all - no grant, no mutation");
 
     /* The bound is what makes this reject-with-feedback rather than a silent wait. Unbounded, this caller would sit in the library's blocking queue until the
-     * budget's own window released a slot, which is measured in half hours.
+     * command budget's own window released a slot, which is measured in hours.
      */
-    assert.ok((Date.now() - started) < (HYDRAWISE_V2_BUDGET_WINDOW * 1000), "the command gave up on the admission window rather than the budget's");
+    assert.ok((Date.now() - started) < (HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000), "the command gave up on the admission window rather than the budget's");
+    assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS, "and the reads' own ceiling was never touched on its way past");
   });
 
   test("an admission that gives up on the token race leaves the grant, the pool, and the token state untouched", async (t) => {
@@ -1089,7 +1113,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     assert.equal(facts.get(1058515)?.online, true, "and it carries the account's own answer, whole");
   });
 
-  test("an admitted command draws the ceiling ONCE, in its admission phase, and never again in the transport", async () => {
+  test("an admitted command draws its admission from the command ceiling and its grant from the read ceiling, ONCE each and never again in the transport", async () => {
 
     const harness = makeV2Harness((agent, record) => {
 
@@ -1099,19 +1123,27 @@ describe("HydrawiseV2Client zone suspension", () => {
 
     assert.deepEqual(await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID }), { status: "done" }, "the command was accepted");
 
-    /* The draws attributed BY PHASE, which a bare total could not do. A cold client spends exactly two: the admission's own slot and the token grant it triggers.
-     * A transport step that drew a third would show up as a lower count here and as a lower reading at the mutation's dispatch.
+    /* The draws attributed BY PHASE AND BY CEILING, neither of which a bare total could do. A cold client spends exactly two calls, one out of each bucket: the
+     * admission is the command's own and comes off the command ceiling, while the token grant is shared infrastructure and comes off the read ceiling that pays
+     * for the scheduled reads. Asserting them apart is what catches a grant quietly re-pointed at the command ceiling - a change that would leave the TOTAL
+     * spend identical and this suite green if it only counted. A transport step drawing a third would show up as a lower reading at the mutation's dispatch.
      */
-    assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 2, "one command on a cold client costs its admission slot and its grant, and nothing more");
+    assert.equal(harness.mutationBudget.available, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1, "the admission spent one slot of the command ceiling and no more");
+    assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 1, "and the grant spent one slot of the read ceiling and no more");
     assert.deepEqual(harness.calls.map(call => call.path), [ TOKEN_PATH, GRAPH_PATH ], "the grant dispatches before the mutation it authenticates");
-    assert.equal(harness.calls[1]?.budgetAvailableAtDispatch, HYDRAWISE_V2_BUDGET_CALLS - 2, "and the mutation dispatched against those same two slots");
+    assert.equal(harness.calls[1]?.budgetAvailableAtDispatch, HYDRAWISE_V2_BUDGET_CALLS - 1, "with the mutation dispatching against the grant's spent read slot");
+    assert.equal(harness.calls[1]?.mutationAvailableAtDispatch, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1, "and against its own already-spent admission slot");
   });
 
-  test("a command admitted on the last slot gives up within its window when the token needs renewing", async (t) => {
+  test("a command admitted on a roomy command ceiling still gives up when the drained READ ceiling cannot pay for its token renewal", async (t) => {
 
-    /* The compound case, and the one an admission bound on step ONE alone would fail. The command is admitted on the last aging slot, which saturates the ceiling,
-     * and the token it then needs is inside its renewal window - so the grant's own draw has nothing left to take and would block toward the budget's half-hour
-     * horizon. Racing that wait, rather than merely bounding the slot, is what answers the user inside the beat.
+    /* The compound case, and the one an admission bound on step ONE alone would fail. It is also the DELIBERATE residual of pacing commands and reads on separate
+     * ceilings: a grant is one shared thing serving both, so it draws the read ceiling wherever it was triggered from. Here the command's own ceiling is wide open
+     * and it is admitted at once, but the token it then needs is inside its renewal window and the read ceiling has nothing left to buy that renewal with, so the
+     * grant's draw would block toward the read budget's own horizon. Racing that wait, rather than merely bounding the slot, is what answers the user in a beat.
+     *
+     * The corner is narrow by arithmetic rather than by luck: the scheduled reads renew the token perpetually at a cadence well inside its lifetime, so a drained
+     * read ceiling meeting a token due for renewal belongs to the seconds before a session's first read lands, or to a refresh loop that has stopped.
      */
     const controller = new AbortController();
 
@@ -1126,21 +1158,23 @@ describe("HydrawiseV2Client zone suspension", () => {
       }).persist();
 
       programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
-    }, { capacity: 2, signal: controller.signal });
+    }, { capacity: 1, signal: controller.signal });
 
     t.after(() => controller.abort("test-teardown"));
 
-    // Warm the client, which spends one of the two slots on the short-lived grant and leaves exactly one for the command's admission to take.
+    // Warm the client, which spends the read ceiling's only slot on the short-lived grant and leaves the renewal nothing to draw.
     assert.equal(await harness.client.ensureToken(), "access-one", "the client starts holding a token that is already due for renewal");
-    assert.equal(harness.budget.available, 1, "one slot is left, which the command's admission will take");
+    assert.equal(harness.budget.available, 0, "with the read ceiling spent, which is the whole precondition of this corner");
 
     const started = Date.now();
     const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
     const elapsed = Date.now() - started;
 
     assert.deepEqual(result, { status: "rejected" }, "the renewal could not be paid for inside the window, so the command is rejected");
-    assert.ok(elapsed < (HYDRAWISE_V2_BUDGET_WINDOW * 1000), "and it resolved on its own window rather than blocking toward the budget's");
+    assert.ok(elapsed < (HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000), "and it resolved on its own window rather than blocking toward either budget's");
     assert.deepEqual(harness.calls.map(call => call.path), [TOKEN_PATH], "the mutation never reached the wire");
+    assert.equal(harness.mutationBudget.available, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1,
+      "and the admission it did win is spent all the same, which is what this corner costs");
   });
 
   test("a grant that fails inside the window answers failed without spending a second one", async () => {
@@ -1167,9 +1201,10 @@ describe("HydrawiseV2Client zone suspension", () => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
       programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
-    }, { capacity: 1, signal: controller.signal });
+    }, { mutationCapacity: 1, signal: controller.signal });
 
-    await harness.budget.acquire();
+    // The COMMAND ceiling is drained, so the command is genuinely sitting in the admission phase when the teardown arrives - which is the phase this test names.
+    await harness.mutationBudget.acquire();
 
     const command = harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
 
@@ -1180,6 +1215,89 @@ describe("HydrawiseV2Client zone suspension", () => {
 
     assert.deepEqual(await command, { status: "rejected" }, "a command torn down mid-admission is rejected");
     assert.deepEqual(harness.lines().filter(line => line.level !== "debug"), [], "and a shutdown narrates nothing, at any level a user reads");
+  });
+
+  test("a command holding a warm token completes with the READ ceiling fully saturated", async (t) => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    /* The WARM TOKEN is the precondition that gives this pin its meaning, and the order it is established in is the whole of the setup. A token comfortably inside
+     * its lifetime short-circuits the chokepoint without touching any ceiling at all, so the only bucket this command goes on to draw is the one under test. Cold,
+     * the command's grant would block on the drained read ceiling under either wiring and the pin would prove nothing about which bucket admits a command.
+     */
+    assert.equal(await harness.client.ensureToken(), "access-one", "the client is warmed with a token good for the rest of the test");
+
+    await saturate(harness.budget);
+
+    assert.equal(harness.budget.available, 0, "and the read ceiling is then spent to the last slot");
+
+    const result = await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+
+    assert.deepEqual(result, { status: "done" }, "the command is admitted and completed by a ceiling the reads cannot exhaust");
+    assert.deepEqual(harness.calls.map(call => call.path), [ TOKEN_PATH, GRAPH_PATH ], "with the warm token spending no second grant on its way to the wire");
+    assert.equal(harness.mutationBudget.available, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1, "and the command paid for itself out of the command ceiling alone");
+    assert.equal(harness.budget.available, 0, "leaving the read ceiling exactly as drained as it found it");
+  });
+
+  test("a saturated command ceiling turns a command away while a scheduled read proceeds on the READ ceiling", async (t) => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    }, { signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    // The other polarity of the same independence, and the direction that actually motivated the split: a burst of switch flips that has spent its own ceiling must
+    // not take the scheduled reads down with it. Driving both in ONE test is the only arrangement that can observe that, since the claim is about their relation.
+    await saturate(harness.mutationBudget);
+
+    const command = harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID });
+    const facts = await harness.client.fetchAccountFacts();
+
+    assert.ok(facts, "the scheduled read is admitted and answered while the command ceiling stands at zero");
+    assert.equal(facts.get(1058515)?.online, true, "and it carries the account's own answer, whole");
+    assert.deepEqual(await command, { status: "rejected" }, "while the command is turned away by the ceiling that is actually its own");
+  });
+
+  test("the command ceiling admits exactly its capacity inside one window, and turns the next one away", async (t) => {
+
+    const controller = new AbortController();
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
+    }, { signal: controller.signal });
+
+    t.after(() => controller.abort("test-teardown"));
+
+    // Warmed first, so the burst below is metered by the command ceiling and by nothing else: a cold client would run the narrower read ceiling out partway through
+    // and the boundary this test is looking for would be the wrong one's.
+    assert.equal(await harness.client.ensureToken(), "access-one", "the client is warmed before the burst, so no command in it pays for a grant");
+
+    const burst = await Promise.all(Array.from({ length: HYDRAWISE_V2_MUTATION_BUDGET_CALLS },
+      (_, index) => harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID + index })));
+
+    assert.deepEqual(burst, Array.from({ length: HYDRAWISE_V2_MUTATION_BUDGET_CALLS }, () => ({ status: "done" })),
+      "a burst the size of the ceiling is admitted whole");
+    assert.equal(harness.mutationBudget.available, 0, "which is the ceiling spent exactly, with nothing over");
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }), { status: "rejected" },
+      "and the command past the boundary is refused rather than queued behind an hour-wide window");
+    assert.equal(harness.calls.filter(call => call.path === GRAPH_PATH).length, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
+      "with exactly the admitted commands reaching the wire");
+    assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 1, "and the read ceiling down only the one slot the warming grant spent");
   });
 });
 
@@ -1202,7 +1320,9 @@ describe("HydrawiseV2Client dispatcher", () => {
       .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger, password: "test-password", signal, username: "test-user" });
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
+      password: "test-password", signal, username: "test-user" });
 
     assert.equal(client.dispatcher, first, "the client starts on the dispatcher its factory built");
     assert.equal(await client.ensureToken(), null, "a timed-out grant answers null");

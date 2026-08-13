@@ -87,13 +87,18 @@ type HydrawiseV2TransportResult<T> =
  *
  * The dispatcher arrives as a FACTORY rather than a dispatcher because this client re-arms its connection pool after a timeout. A factory keeps that self-heal
  * running the same code in every context: a caller that supplies one owns what a re-arm answers with, and a caller that supplies none gets the keep-alive pool the
- * constructor builds. The budget is likewise injected rather than built here, because pacing is an account-wide concern the platform owns.
+ * constructor builds.
+ *
+ * Each budget is likewise injected rather than built here, because pacing is an account-wide concern the platform owns. They arrive separately because the kinds
+ * of traffic this client carries pace on ceilings of their own: `budget` is what a read and any token grant draw, and `mutationBudget` is what a per-zone
+ * command's admission draws.
  */
 export interface HydrawiseV2ClientOptions {
 
   budget: RateBudget;
   dispatcherFactory?: () => Dispatcher;
   log: HomebridgePluginLogging;
+  mutationBudget: RateBudget;
   password: string;
   signal: AbortSignal;
   username: string;
@@ -115,6 +120,7 @@ export class HydrawiseV2Client {
   private currentDispatcher: Dispatcher;
   private readonly dispatcherFactory: () => Dispatcher;
   private readonly log: HomebridgePluginLogging;
+  private readonly mutationBudget: RateBudget;
   private readonly password: string;
   private readonly signal: AbortSignal;
   private token: HydrawiseV2TokenState;
@@ -125,6 +131,7 @@ export class HydrawiseV2Client {
 
     this.budget = options.budget;
     this.log = options.log;
+    this.mutationBudget = options.mutationBudget;
     this.password = options.password;
     this.signal = options.signal;
     this.token = { state: "none" };
@@ -217,14 +224,21 @@ export class HydrawiseV2Client {
    * transport method entirely, so a command the ceiling never admitted cannot be mistaken downstream for a request that reached the wire and failed. Both admission
    * steps share ONE window: a beat, composed with this client's own lifetime.
    *
-   * Step one takes a budget slot, with that window as its per-call signal. The library's queue is first-in-first-out and blocking, so an unbounded wait would leave a
-   * command that lost a race for the last slot sitting behind the scheduled reads for the length of the budget's own half-hour window. Bounded, the loser answers
-   * within the beat, consumes no slot, and leaves every other waiter exactly where it stood.
+   * Step one takes a slot on the COMMAND ceiling, with that window as its per-call signal. Commands pace on a ceiling of their own precisely so that a burst of them
+   * cannot be held up by the scheduled reads, and the bound is what handles the case that ceiling can still produce: the library's queue is first-in-first-out and
+   * blocking, so an unbounded wait would leave a command that lost a race for the last slot sitting behind the other commands for the length of that budget's own
+   * hour-wide window. Bounded, the loser answers within the beat, consumes no slot, and leaves every other waiter exactly where it stood.
    *
    * Step two waits for a usable token, and RACES the window rather than cancelling on it. The grant is shared - a scheduled read may be waiting on the very same
    * promise - so threading this command's deadline into it would impose one caller's impatience on another's unbounded patience. Abandoning the race leaves the
    * grant running untouched for everyone else, and a grant an abandoned admission started is kept rather than wasted: it primes the client for the next caller. The
    * race's three outcomes are exhaustive and each has its own exit, because falling through here is what would put a duplicate grant on the wire.
+   *
+   * A grant is shared infrastructure, so it draws the READ ceiling wherever it was triggered from, and that is what puts one corner of the command path outside the
+   * separation above: a command needing a token while the read ceiling is drained gives up inside its window even though its own ceiling had room. The reads renew
+   * the token perpetually at a cadence far inside its lifetime, so that corner is reachable in the seconds before the first read of a session completes, or once
+   * the refresh loop has stopped. Metering a grant on the ceiling it was not spent against would be the worse trade: one kind of traffic's meter would then be
+   * reading another's calls.
    *
    * @param options       - The command.
    * @param options.until - The absolute instant, in epoch seconds, the suspension lifts, or null to resume the zone.
@@ -238,7 +252,7 @@ export class HydrawiseV2Client {
 
     try {
 
-      await this.budget.acquire({ signal: admission });
+      await this.mutationBudget.acquire({ signal: admission });
     } catch {
 
       /* A shutdown supersedes every other reading here, exactly as it does in the failure classification below: teardown is not a refusal, so it reports nothing.
@@ -246,7 +260,7 @@ export class HydrawiseV2Client {
        */
       if(!this.signal.aborted) {
 
-        this.log.debug("The zone suspension command was not admitted: the account ceiling had no free slot inside the admission window.");
+        this.log.debug("The zone suspension command was not admitted: the command ceiling had no free slot inside the admission window.");
       }
 
       return { status: "rejected" };
@@ -304,7 +318,7 @@ export class HydrawiseV2Client {
 
     try {
 
-      // Pace this call against the v2 ceiling before anything else happens, so a query and any token grant it triggers each cost a slot.
+      // Pace this call against the READ ceiling before anything else happens, so a query and any token grant it triggers each cost a slot of it.
       await this.budget.acquire();
 
       const result = await this.execute<T>(query);
@@ -427,8 +441,8 @@ export class HydrawiseV2Client {
 
     try {
 
-      // A token grant draws the same ceiling a query does. It is a call against the account either way, and counting it is the conservative reading of a limit
-      // Hydrawise does not publish.
+      // A token grant draws the READ ceiling wherever it was triggered from, a command's admission included. It is one shared grant serving every caller, so the
+      // alternative would be metering it against whichever ceiling happened to ask for it first - one kind of traffic's meter reading another's calls.
       await this.budget.acquire();
 
       const params = new URLSearchParams();

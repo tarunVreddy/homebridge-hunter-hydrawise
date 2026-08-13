@@ -8,8 +8,9 @@ import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, cr
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL,
-  HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
+  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
+  PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
@@ -41,6 +42,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly timers: TimerRegistry;
   private readonly v2Budget: RateBudget;
   private readonly v2Client?: HydrawiseV2Client;
+  private readonly v2MutationBudget: RateBudget;
 
   /* Everything shutdown has to undo, declared in one place and disposed in one call. A DisposableStack runs its registered work in reverse registration order, so
    * the ordering teardown depends on is expressed by the order things are registered rather than by a handler body that has to be read to be trusted, and the
@@ -97,12 +99,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * so a caller still waiting for a slot when Homebridge stops is rejected rather than left pending forever. Construction schedules nothing, so they are built
      * here alongside the signal, ahead of the missing-API-key return below that leaves the rest of the platform unbuilt.
      *
-     * The first two are the ceilings Hydrawise publishes for its key-based API. The third paces the optional account-credentialed API, which publishes no ceiling
-     * at all and throttles hard, so its budget is an envelope chosen to stay clear of trouble rather than a documented limit made enforceable.
+     * The account-wide and zone-command budgets make the ceilings Hydrawise publishes for its key-based API enforceable. The account-credentialed budgets are
+     * envelopes instead, because that API publishes no ceiling at all and throttles hard, and they are separate from each other because the traffic they pace is:
+     * the scheduled reads and the token grants riding them draw one, while the per-zone commands a user is standing at a switch waiting for draw the other.
      */
     this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
     this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
     this.v2Budget = new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
+    this.v2MutationBudget = new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal: this.signal,
+      window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 });
 
     // The one home for every deferred HomeKit write this plugin arms, shared by every controller the platform builds. Construction schedules nothing, so it is
     // built here beside the budgets, ahead of the missing-API-key return below. Its lifetime IS the shutdown signal - the abort drains whatever is pending and
@@ -142,8 +147,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     if(this.config.username?.length && this.config.password?.length) {
 
-      this.v2Client = new HydrawiseV2Client({ budget: this.v2Budget, log: this.log, password: this.config.password, signal: this.signal,
-        username: this.config.username });
+      this.v2Client = new HydrawiseV2Client({ budget: this.v2Budget, log: this.log, mutationBudget: this.v2MutationBudget, password: this.config.password,
+        signal: this.signal, username: this.config.username });
 
       this.log.info("Enhanced features are enabled using your Hydrawise account login.");
     }
@@ -388,9 +393,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   /* Suspend one zone until an instant, or resume it - the single per-zone write surface every controller commands through, exactly as retrieve() is the single
    * key-based one. The account-credentialed client stays private to this class, so what a controller ever sees is the outcome alone.
    *
-   * The budget pre-check answers the common saturated case for FREE: a ceiling with nothing to give refuses here having touched no connection and spent no call,
-   * which is what keeps a burst of taps from costing the account anything. On its own it carries a check-then-act race - two near-simultaneous callers can both read
-   * the last free slot - and the client's admission phase is what closes it, bounding the loser to a beat rather than to the budget's own half-hour window.
+   * The pre-check reads the COMMAND ceiling, which is the one a command draws, and it answers the common saturated case for FREE: a ceiling with nothing to give
+   * refuses here having touched no connection and spent no call, which is what keeps a burst of taps from costing the account anything. On its own it carries a
+   * check-then-act race - two near-simultaneous callers can both read the last free slot - and the client's admission phase is what closes it, bounding the loser
+   * to a beat rather than to the budget's own hour-wide window.
    *
    * The unavailable answer is honest rather than reachable from a live switch: those switches exist only where a client does, and that is fixed at construction. It
    * is what any other caller gets.
@@ -408,7 +414,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return { status: "unavailable" };
     }
 
-    if(this.v2Budget.available === 0) {
+    if(this.v2MutationBudget.available === 0) {
 
       return { status: "rejected" };
     }
