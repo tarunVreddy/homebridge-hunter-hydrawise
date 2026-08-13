@@ -16,7 +16,7 @@ import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
 import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-utils";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity } from "../types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
@@ -235,6 +235,7 @@ export interface TestPlatform {
   config: HydrawiseOptions;
   featureOptions: FeatureOptions;
   hap: TestHap;
+  hasV2Client: boolean;
   log: HomebridgePluginLogging;
   mqtt: Nullable<TestMqttClient>;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
@@ -243,11 +244,13 @@ export interface TestPlatform {
   timers: TimerRegistry;
 }
 
-// Options for makeTestPlatform: the platform config overrides, whether to attach a recording MQTT double, whether the platform signal starts pre-aborted (the
-// default, which lets a controller construct fully while its polling loop exits silently), and the feature-option strings.
+// Options for makeTestPlatform: the platform config overrides, whether the account-credentialed client is present (the gate a controller reads to decide whether
+// cached hardware facts are still worth honoring), whether to attach a recording MQTT double, whether the platform signal starts pre-aborted (the default, which
+// lets a controller construct fully while its polling loop exits silently), and the feature-option strings.
 export interface MakeTestPlatformOptions {
 
   config?: Partial<HydrawiseOptions>;
+  hasV2Client?: boolean;
   mqtt?: boolean;
   signalAborted?: boolean;
   userOptions?: string[];
@@ -355,6 +358,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     config,
     featureOptions: featureOpts,
     hap: testHap,
+    hasV2Client: options.hasV2Client ?? false,
     log: logger,
     mqtt,
     reconcileZoneAccessories,
@@ -564,7 +568,79 @@ export function budgetsOf(platform: HydrawisePlatform): { account: RateBudget; c
   return { account: budgets.accountBudget, command: budgets.commandBudget };
 }
 
-// Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter.
+/**
+ * Read the platform's account-credentialed rate budget through its private field, on exactly the terms budgetsOf reads the other two.
+ *
+ * @param platform - The constructed HydrawisePlatform.
+ *
+ * @returns The v2 budget.
+ */
+export function v2BudgetOf(platform: HydrawisePlatform): RateBudget {
+
+  return (platform as unknown as { v2Budget: RateBudget }).v2Budget;
+}
+
+/**
+ * Read the account-credentialed client's dispatcher through the platform's private field, exposing the destroyed flag a teardown test asserts on - the v2 twin of
+ * dispatcherOf, and confined here for the same reason. The read goes through the client's public getter rather than a captured reference, which is exactly how the
+ * platform's own teardown reads it, so this observes what that registration observes.
+ *
+ * @param platform - The constructed HydrawisePlatform.
+ *
+ * @returns The v2 dispatcher's destroyed view, or undefined when no credentials were configured and no client was built.
+ */
+export function v2DispatcherOf(platform: HydrawisePlatform): { destroyed: boolean } | undefined {
+
+  return (platform as unknown as { v2Client?: { dispatcher: { destroyed: boolean } } }).v2Client?.dispatcher;
+}
+
+// The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, and the whole-account hardware fetch its discovery
+// dispatches. A distribution test supplies this shape rather than a real client, so no test ever reaches the live account API.
+export interface TestV2Client {
+
+  dispatcher: { destroy: () => Promise<void> };
+  fetchHardware: () => Promise<Nullable<Map<number, HydrawiseControllerHardware>>>;
+}
+
+/**
+ * Substitute a double for the platform's account-credentialed client, destroying the real one it constructed so no connection pool is left behind. The platform
+ * must have been built WITH credentials, so the production gate that decides whether a client exists at all has genuinely run; this only replaces what that gate
+ * produced, leaving the distribution logic under test unchanged. The cast is confined here exactly as dispatcherOf and budgetsOf confine their own.
+ *
+ * @param platform - The constructed HydrawisePlatform.
+ * @param client   - The double to install.
+ */
+export function installV2Client(platform: HydrawisePlatform, client: TestV2Client): void {
+
+  const slot = platform as unknown as { v2Client?: TestV2Client };
+
+  void slot.v2Client?.dispatcher.destroy();
+  slot.v2Client = client;
+}
+
+/**
+ * Build a recording double of the account-credentialed client, answering a programmed hardware result and counting how many times it was asked. The count is what a
+ * one-shot pin reads: a second discovery pass that re-fetched would show up here as a second call.
+ *
+ * @param hardware - The result fetchHardware resolves to, or null for a failed fetch.
+ *
+ * @returns The double, plus a reader for the number of fetches it served.
+ */
+export function makeTestV2Client(hardware: Nullable<Map<number, HydrawiseControllerHardware>>): { client: TestV2Client; fetches: () => number } {
+
+  let fetches = 0;
+
+  return { client: { dispatcher: { destroy: async (): Promise<void> => undefined },
+    fetchHardware: async (): Promise<Nullable<Map<number, HydrawiseControllerHardware>>> => {
+
+      fetches++;
+
+      return hardware;
+    } }, fetches: (): number => fetches };
+}
+
+// Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter. The account credentials travel as feature
+// options rather than properties, because that is their only home, so a test that wants them supplies the entries the engine reads.
 export interface BuildPlatformOptions {
 
   apiKey?: string;

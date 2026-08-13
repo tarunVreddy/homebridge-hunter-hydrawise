@@ -45,33 +45,50 @@ export interface HydrawiseConfigPatch {
 }
 
 /**
- * The commit-shaped patch the degraded-mode interpreter produces for a first-run write. It writes the legacy property rather than an option entry, which is the
- * deliberate difference between the two interpreters' write shapes.
+ * The commit-shaped patch the degraded-mode interpreter produces for a first-run write. The API key writes the legacy property rather than an option entry, which
+ * is the deliberate difference between the two interpreters' write shapes; the account credentials have no legacy property, so they ride the options array in both
+ * interpreters alike and this patch carries one only when a credential pair was written.
  */
 export interface HydrawiseLegacyConfigPatch {
 
   apiKey: string;
+  options?: string[];
 }
 
 /**
- * The interpreter over a fetched catalog: the effective API key, the legacy-settings migration, and the first-run key write.
+ * The values a first-run write commits. The API key is always present, because first run exists to collect it; the account credentials are optional and are only
+ * ever written as a pair, since neither half authenticates on its own.
+ */
+export interface HydrawiseFirstRunValues {
+
+  apiKey: string;
+  password?: string;
+  username?: string;
+}
+
+/**
+ * The interpreter over a fetched catalog: the effective settings, the legacy-settings migration, and the single first-run write.
  */
 export interface HydrawiseConfigInterpreter {
 
   apiKey(config?: HydrawiseConfig): string;
   migrate(config?: HydrawiseConfig): HydrawiseConfigPatch | null;
-  withApiKey(config: HydrawiseConfig | undefined, apiKey: string): HydrawiseConfigPatch;
+  password(config?: HydrawiseConfig): string;
+  username(config?: HydrawiseConfig): string;
+  withFirstRun(config: HydrawiseConfig | undefined, values: HydrawiseFirstRunValues): HydrawiseConfigPatch;
 }
 
 /**
- * The degraded-mode interpreter, answering the same three questions with no catalog and no engine. Its migration is always `null` and its write is the legacy
- * property, so a session whose fetches are failing still loads and still completes first run.
+ * The degraded-mode interpreter, answering the same questions with no catalog and no engine. Its migration is always `null`, so a session whose fetches are failing
+ * still loads and still completes first run.
  */
 export interface HydrawiseLegacyConfigInterpreter {
 
   apiKey(config?: HydrawiseConfig): string;
   migrate(config?: HydrawiseConfig): null;
-  withApiKey(config: HydrawiseConfig | undefined, apiKey: string): HydrawiseLegacyConfigPatch;
+  password(config?: HydrawiseConfig): string;
+  username(config?: HydrawiseConfig): string;
+  withFirstRun(config: HydrawiseConfig | undefined, values: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch;
 }
 
 /**

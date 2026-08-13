@@ -32,6 +32,48 @@ export const HYDRAWISE_COMMAND_BUDGET_WINDOW = 30;
 // The platform's draw branch and the controller's command dispatch both read this constant, so the endpoint identity has a single home.
 export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
 
+/* The Hydrawise v2 API. This group states endpoints and credentials, which is a different kind of constant from the durations and call counts the rest of this
+ * file carries, so it is marked out as its own group. Everything below is optional at runtime: the v2 surface is reached only when the user has configured their
+ * account credentials, and the plugin runs its whole v1 feature set without it.
+ *
+ * The two endpoint URLs are stated whole. The client derives the origin its connection pool is built on from the URL rather than carrying a third constant, so the
+ * host a request goes to and the host the pool connects to can never disagree.
+ */
+export const HYDRAWISE_V2_GRAPH_ENDPOINT = "https://app.hydrawise.com/api/v2/graph";
+
+// The v2 OAuth2 token endpoint, which answers both the initial password grant and every refresh.
+export const HYDRAWISE_V2_TOKEN_ENDPOINT = "https://app.hydrawise.com/api/v2/oauth/access-token";
+
+/* The OAuth2 client identity the token grant presents. These are the Hydrawise application's own embedded client credentials, not a secret belonging to any user:
+ * Hydrawise issues no per-integration client registration, so presenting the app's client is the only way to reach v2 at all. They identify the CLIENT; the user's
+ * own username and password are what authenticate the account, and those are configuration the user supplies.
+ */
+export const HYDRAWISE_V2_CLIENT_ID = "hydrawise_app";
+
+// The secret half of the client identity above, embedded on the same terms.
+export const HYDRAWISE_V2_CLIENT_SECRET = "zn3CrjglwNV1";
+
+/* The v2 ceiling, as a COUNT OF CALLS inside the trailing window below. Hydrawise publishes no v2 rate limit, so this is not a documented ceiling being made
+ * structural the way the v1 budgets are - it is the envelope the Home Assistant integration settled on after repeatedly tripping v2 throttling, and staying well
+ * inside it is what keeps an optional enrichment from costing the account the API access its irrigation actually depends on.
+ */
+export const HYDRAWISE_V2_BUDGET_CALLS = 5;
+
+// The trailing window, in seconds, the v2 call ceiling above is measured over.
+export const HYDRAWISE_V2_BUDGET_WINDOW = 1800;
+
+/* The v2 response timeout, in seconds. It is deliberately more generous than the v1 timeout: a v2 call can carry an OAuth round trip ahead of the query itself, and
+ * the graph endpoint answers a whole account in one response where a v1 call answers one controller, so the same budget would cut off requests that were simply
+ * doing more work.
+ */
+export const HYDRAWISE_V2_TIMEOUT = 15;
+
+/* How long, in seconds, before an access token expires that the client treats it as due for renewal. The renewal is lazy - it happens on the next call that needs
+ * a token, never on a timer - so this window only has to be wider than the gap between noticing and finishing, and a token used inside it is refreshed rather than
+ * spent on a request that could expire mid-flight.
+ */
+export const HYDRAWISE_V2_REFRESH_THRESHOLD = 300;
+
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 
@@ -43,6 +85,23 @@ export const HYDRAWISE_REVERT_DELAY = 50;
 
 // The suspend-all duration, in seconds. Hydrawise's suspend-all convention pushes the resume boundary one year into the future; a resume sends the current time.
 export const HYDRAWISE_SUSPEND_DURATION = 31556926;
+
+/* The value an unenriched controller's FirmwareRevision characteristic carries. This is Homebridge's own unknown-firmware marker - the value it stamps onto every
+ * accessory it restores from its cache, before a plugin is handed that accessory - so writing it is how this plugin says "no firmware version is known" in the
+ * platform's own vocabulary rather than inventing a second spelling of the same idea.
+ *
+ * It is a real write rather than an omitted one on purpose. HAP round-trips characteristic values through Homebridge's accessory cache, so an accessory whose
+ * firmware was once populated keeps showing that version until something writes over it; without this write, removing the account credentials would strand a real
+ * version on display permanently. On a restored accessory the write matches what Homebridge already stamped, which HAP drops as a same-value write, so the
+ * unenriched display is exactly what it has always been.
+ */
+export const HOMEBRIDGE_UNKNOWN_FIRMWARE = "0";
+
+/* The model string HAP constructs a Model characteristic with, mirrored here because this plugin READS it and HAP exposes its own accessor as protected. It is the
+ * one signal that tells a brand-new accessory from one restored out of the cache: only an accessory nothing has ever stamped still carries it. That read is what
+ * lets the enrichment path leave a restored real model alone while still stamping a fresh accessory with something a user can recognize.
+ */
+export const HAP_DEFAULT_MODEL = "Default-Model";
 
 /* The HAP accessory category a standalone zone accessory declares - Apple's sprinkler category, so the Home app renders a lone irrigation valve as sprinkler rather
  * than as a generic accessory. The value is the Apple-defined protocol number, carried here as a typed numeric constant rather than read off the `Categories` enum:

@@ -37,6 +37,13 @@ class ConfiguredNameCharacteristicType {
   public readonly hapKind = "ConfiguredName" as const;
 }
 
+class FirmwareRevisionCharacteristicType {
+
+  public static readonly DEFAULT_VALUE = "0.0.0";
+  public static readonly UUID = "FirmwareRevision";
+  public readonly hapKind = "FirmwareRevision" as const;
+}
+
 class InUseCharacteristicType {
 
   public static readonly IN_USE = 1;
@@ -55,12 +62,14 @@ class IsConfiguredCharacteristicType {
 
 class ManufacturerCharacteristicType {
 
+  public static readonly DEFAULT_VALUE = "Default-Manufacturer";
   public static readonly UUID = "Manufacturer";
   public readonly hapKind = "Manufacturer" as const;
 }
 
 class ModelCharacteristicType {
 
+  public static readonly DEFAULT_VALUE = "Default-Model";
   public static readonly UUID = "Model";
   public readonly hapKind = "Model" as const;
 }
@@ -94,6 +103,7 @@ class RemainingDurationCharacteristicType {
 
 class SerialNumberCharacteristicType {
 
+  public static readonly DEFAULT_VALUE = "Default-SerialNumber";
   public static readonly UUID = "SerialNumber";
   public readonly hapKind = "SerialNumber" as const;
 }
@@ -133,6 +143,7 @@ export const Characteristic = {
 
   Active: ActiveCharacteristicType,
   ConfiguredName: ConfiguredNameCharacteristicType,
+  FirmwareRevision: FirmwareRevisionCharacteristicType,
   InUse: InUseCharacteristicType,
   IsConfigured: IsConfiguredCharacteristicType,
   Manufacturer: ManufacturerCharacteristicType,
@@ -174,7 +185,7 @@ export class TestCharacteristic {
   public static readonly Name = NameCharacteristicType;
 
   public readonly type: CharacteristicType;
-  private currentValue: unknown = null;
+  private currentValue: unknown;
   private getHandler: (() => unknown) | undefined = undefined;
   private readonly recordWrite: ((value: unknown) => void) | undefined;
   private setHandler: ((value: unknown) => Promise<void> | void) | undefined = undefined;
@@ -183,6 +194,13 @@ export class TestCharacteristic {
 
     this.recordWrite = recordWrite;
     this.type = type;
+
+    /* Seed the value HAP itself constructs this kind with, mirrored from the kind's own static. Only the AccessoryInformation string characteristics declare one -
+     * every other kind starts null, exactly as before - and modeling them is not decoration: production READS the model characteristic and branches on whether it
+     * still holds HAP's default, which is how it tells a brand-new accessory from one restored out of the cache. A double that started every characteristic at
+     * null would send that branch down the wrong arm and let a broken implementation pass.
+     */
+    this.currentValue = (type as { DEFAULT_VALUE?: unknown }).DEFAULT_VALUE ?? null;
   }
 
   // The kind's identity string, mirrored from the type's static, matching how HAP exposes a UUID on a characteristic instance. The real acquireService compares

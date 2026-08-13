@@ -23,6 +23,11 @@ const SHUTDOWN = "shutdown";
 const LEGACY_KEY = "AAAA-BBBB-CCCC-DDD";
 const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 
+// The optional account login. The username carries an "=" deliberately - an email address does not, but the entry grammar's own value delimiter does, so a value
+// split on the first delimiter rather than the last would come back truncated here.
+const ACCOUNT_USERNAME = "gardener=test@example.com";
+const ACCOUNT_PASSWORD = "correct horse battery";
+
 // The interpreter under test, built the way the webUI builds it: the real engine class and the real served catalog.
 const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories, options: featureOptions } });
 
@@ -127,19 +132,74 @@ describe("hydrawise webUI config interpreters", () => {
     }
   });
 
-  test("withApiKey composes the key option, replacing any entry already addressing it", () => {
+  test("withFirstRun composes the key option, replacing any entry already addressing it", () => {
 
-    const fresh = config.withApiKey({}, OPTION_KEY);
+    const fresh = config.withFirstRun({}, { apiKey: OPTION_KEY });
 
     assert.deepEqual(entriesFor(fresh.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "a fresh config composes the entry");
     assert.ok(Object.hasOwn(fresh, "apiKey"), "the write always carries the legacy property for deletion");
     assert.equal(fresh.apiKey, undefined, "the legacy property is carried as undefined");
 
-    const replaced = config.withApiKey({ options: [ "Enable.Account.ApiKey=" + LEGACY_KEY, "Disable.Device.ABC123" ] }, OPTION_KEY);
+    const replaced = config.withFirstRun({ options: [ "Enable.Account.ApiKey=" + LEGACY_KEY, "Disable.Device.ABC123" ] }, { apiKey: OPTION_KEY });
 
     assert.deepEqual(entriesFor(replaced.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY],
       "an existing key entry is replaced rather than duplicated");
     assert.ok(replaced.options?.includes("Disable.Device.ABC123"), "unrelated entries survive the write");
+  });
+
+  test("withFirstRun composes the key and both account credentials into ONE patch", () => {
+
+    const patch = config.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    /* All three values have to survive the SAME patch. Each write through an engine answers its own complete snapshot of the options array, so a writer that
+     * composed them through separate engines and merged the results would keep only the last snapshot and silently drop the other two entries - which is exactly
+     * what this three-way assertion catches.
+     */
+    assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the key rides the patch");
+    assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the username rides the same patch");
+    assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the password rides the same patch");
+    assert.ok(patch.options?.includes("Disable.Device.ABC123"), "unrelated entries survive the write");
+  });
+
+  test("withFirstRun writes the account credentials only as a complete pair", () => {
+
+    // Neither half authenticates alone, so writing one would configure a login that cannot work. A partial pair leaves the configuration exactly as it stood.
+    for(const values of [ { apiKey: OPTION_KEY, username: ACCOUNT_USERNAME }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD },
+      { apiKey: OPTION_KEY, password: "", username: ACCOUNT_USERNAME } ]) {
+
+      const patch = config.withFirstRun({}, values);
+
+      assert.deepEqual(entriesFor(patch.options, "Account.Username"), [], "a partial pair composes no username entry");
+      assert.deepEqual(entriesFor(patch.options, "Account.Password"), [], "a partial pair composes no password entry");
+      assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the key is still written");
+    }
+  });
+
+  test("the account credentials read back from the option alone, with no legacy precedence", () => {
+
+    const written = config.withFirstRun({}, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    assert.equal(config.username({ options: written.options }), ACCOUNT_USERNAME, "the username reads back from the entry the write composed");
+    assert.equal(config.password({ options: written.options }), ACCOUNT_PASSWORD, "the password reads back from the entry the write composed");
+
+    /* There is deliberately no legacy-property arm to test here, unlike the API key. These settings have never had a config.json property, so a raw property
+     * carrying one is not an older configuration to honor - it is a hand edit addressing nothing, and it reads as nothing set.
+     *
+     * The hand edit reaches the reader through a cast because the config type declares no such properties, and declaring them would describe a home these
+     * settings do not have. The cast is the honest model of where the shape comes from: a user's own config.json, which answers to no static type.
+     */
+    const handEdited = { password: "raw-password", username: "raw-username" } as unknown as Parameters<typeof config.username>[0];
+
+    assert.equal(config.username(handEdited), "", "a raw property is not a home these settings have");
+    assert.equal(config.password(handEdited), "", "and the same for the password");
+    assert.equal(config.username({}), "", "an unconfigured account reads as nothing set");
+    assert.equal(config.password({}), "", "and the same for the password");
+  });
+
+  test("an explicitly disabled credential option reads as nothing set", () => {
+
+    assert.equal(config.username({ options: ["Disable.Account.Username"] }), "", "an explicitly disabled option is the user saying there is no username");
+    assert.equal(config.password({ options: ["Enable.Account.Password"] }), "", "an entry carrying no value reads as nothing set");
   });
 
   test("the effective API key reads the option first and the property second", () => {
@@ -266,13 +326,13 @@ describe("hydrawise webUI config interpreters", () => {
 
     assert.equal(legacy.apiKey({ apiKey: LEGACY_KEY }), LEGACY_KEY, "the legacy property answers directly");
     assert.equal(legacy.migrate({ apiKey: LEGACY_KEY }), null, "degraded mode never migrates blind");
-    assert.deepEqual(legacy.withApiKey({}, OPTION_KEY), { apiKey: OPTION_KEY }, "the degraded write is the legacy-shaped one");
+    assert.deepEqual(legacy.withFirstRun({}, { apiKey: OPTION_KEY }), { apiKey: OPTION_KEY }, "the degraded key write is the legacy-shaped one");
     assert.equal(legacy.apiKey({}), "", "a config carrying neither reads as no key");
 
     /* The scan is cross-checked end to end against what the real interpreter actually produces, never against a hand-typed entry, so a drifted prefix fails
      * here rather than silently sending a migrated install back through first run.
      */
-    const written = { ...{}, ...config.withApiKey({}, OPTION_KEY) };
+    const written = { ...{}, ...config.withFirstRun({}, { apiKey: OPTION_KEY }) };
 
     assert.equal(legacy.apiKey(written), OPTION_KEY, "a first-run write is readable in a later degraded session");
 
@@ -281,5 +341,76 @@ describe("hydrawise webUI config interpreters", () => {
 
     assert.ok(patch, "the migration should produce a patch");
     assert.equal(legacy.apiKey({ ...source, ...patch }), LEGACY_KEY, "a migrated config is readable in a later degraded session");
+  });
+
+  test("the degraded interpreter writes the account credentials as option entries, not as properties", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+    const patch = legacy.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    /* The key writes a property because a property is always safe to write blind. The credentials cannot: there is no property home for them, so a property write
+     * would land somewhere nothing ever reads and the user's validated login would silently evaporate. They compose the canonical entry instead.
+     */
+    assert.equal(patch.apiKey, OPTION_KEY, "the key still takes the safe property write");
+    assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the username composes an entry");
+    assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the password composes an entry");
+    assert.ok(patch.options?.includes("Disable.Device.ABC123"), "unrelated entries survive the write");
+  });
+
+  test("the degraded credential write replaces rather than accumulates", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+    const first = legacy.withFirstRun({}, { apiKey: OPTION_KEY, password: "first-password", username: "first-user" });
+    const second = legacy.withFirstRun({ options: first.options }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    // Without a supersede pass there is no engine to deduplicate, so a second validation would leave two entries addressing the same option and the reader would
+    // answer whichever it happened to reach first.
+    assert.deepEqual(entriesFor(second.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "exactly one username entry survives");
+    assert.deepEqual(entriesFor(second.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "exactly one password entry survives");
+  });
+
+  test("the degraded credential write supersedes an explicitly disabled entry too", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+    const patch = legacy.withFirstRun({ options: [ "Disable.Account.Username", "Enable.Account.Password" ] },
+      { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    // A disabled entry and a valueless enabled entry both address the option, so both are superseded. Leaving either behind would put two entries on the same
+    // option with opposite meanings.
+    assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the disable is replaced, not stacked under");
+    assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the valueless entry is replaced too");
+  });
+
+  test("the two interpreters read each other's credential writes", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+    const values = { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME };
+
+    /* Both directions matter, because a session can degrade or recover between one open and the next. What is on disk has to be ONE shape either way: a degraded
+     * session's write must be readable once the catalog is back, and a healthy session's write must still be readable if the next one cannot fetch it.
+     */
+    const degradedWrite = { ...{}, ...legacy.withFirstRun({}, values) };
+
+    assert.equal(config.username(degradedWrite), ACCOUNT_USERNAME, "a degraded write is readable by the catalog-backed interpreter");
+    assert.equal(config.password(degradedWrite), ACCOUNT_PASSWORD, "and the password with it");
+
+    const healthyWrite = { ...{}, ...config.withFirstRun({}, values) };
+
+    assert.equal(legacy.username(healthyWrite), ACCOUNT_USERNAME, "a healthy write is readable by the degraded interpreter");
+    assert.equal(legacy.password(healthyWrite), ACCOUNT_PASSWORD, "and the password with it");
+  });
+
+  test("the platform resolves the credentials a first-run write composed", (t) => {
+
+    // The end-to-end claim: what the webUI writes is what the runtime reads. The interpreter composes the entries, a real platform is built on them, and the
+    // effective configuration it assembles is what the account-credentialed client would be constructed from.
+    const written = config.withFirstRun({}, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+    const built = buildPlatform({ apiKey: "", options: written.options });
+
+    t.after(() => built.emit(SHUTDOWN));
+
+    assert.equal(built.platform.config.username, ACCOUNT_USERNAME, "the runtime resolves the username the webUI wrote");
+    assert.equal(built.platform.config.password, ACCOUNT_PASSWORD, "the runtime resolves the password the webUI wrote");
+    assert.equal(built.platform.hasV2Client, true, "and builds the account-credentialed client from them");
   });
 });

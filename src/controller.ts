@@ -3,13 +3,13 @@
  * controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY,
-  HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
+import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
+  HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isScheduleStatus, isZoneIdentity, isZoneStoppedBySensor, sameEntries,
   sameScheduleStatus, sameZoneIdentity, scheduleStatus, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseZoneConfig,
-  HydrawiseZoneIdentity, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
+  HydrawiseZoneConfig, HydrawiseZoneIdentity, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
@@ -244,25 +244,86 @@ export class HydrawiseController {
     return true;
   }
 
-  /* Configure the accessory information for one of the accessories this controller projects onto. The parameter pairs an accessory with the serial number that
-   * belongs to it as a single correlated value, so an accessory can never be stamped with another accessory's serial, and it defaults to the controller's own
-   * accessory and its wire serial. A standalone zone accessory has no wire serial of its own, so its caller synthesizes one.
+  /* Configure the accessory information for one of the accessories this controller projects onto. The parameters pair an accessory with the serial number and the
+   * hardware facts that belong to it as one correlated value, so an accessory can never be stamped with another accessory's details, and they default to the
+   * controller's own accessory and its wire serial with no hardware named. A standalone zone accessory has no wire serial of its own, so its caller synthesizes
+   * one, and it names no hardware either: model and firmware describe the controller, not one valve hanging off it.
+   *
+   * The manufacturer and the serial always write. What happens to the model and the firmware depends on who owns those two values right now, and there are exactly
+   * three cases.
+   *
+   * Called WITH hardware, this writes it - that is the enrichment landing, and it writes unconditionally, comparing nothing first. HAP already drops a write whose
+   * value matches what the characteristic holds, so a compare here would only duplicate the library's own work and add a second place for the two answers to
+   * disagree.
+   *
+   * Called WITHOUT hardware while the account credentials are configured, it leaves BOTH alone. Those characteristics are the store: HAP restored real values from
+   * a previous session into them, and the fetch that will refresh those values is already on its way, so writing a placeholder over them would blank a correct
+   * display for the length of a network round trip. The single exception is an accessory that has never been stamped at all, which still carries HAP's own default
+   * model - there is nothing to preserve there, and leaving it would show the user a library-internal string, so the placeholder is written.
+   *
+   * Called WITHOUT hardware and with no credentials configured, both write unconditionally: the product-line placeholder, and the firmware returned to the
+   * unknown-firmware marker Homebridge itself stamps on a restored accessory. That reset is what makes removing the credentials a clean revert - the
+   * characteristics outlive the credentials that populated them, so an omitted write would strand a real version on display permanently, with nothing left in the
+   * plugin that could refresh or correct it.
    */
-  private configureInfo({ accessory, serialNumber }: { accessory: HydrawiseAccessory; serialNumber: string } = { accessory: this.accessory,
-    serialNumber: this.controller.serial_number }): boolean {
+  private configureInfo({ accessory, hardware, serialNumber }: { accessory: HydrawiseAccessory; hardware?: HydrawiseControllerHardware; serialNumber: string } =
+    { accessory: this.accessory, serialNumber: this.controller.serial_number }): boolean {
 
     const informationService = accessory.getService(this.hap.Service.AccessoryInformation);
 
     // Update the manufacturer information.
     informationService?.updateCharacteristic(this.hap.Characteristic.Manufacturer, "Hunter");
 
-    // Update the model information.
-    informationService?.updateCharacteristic(this.hap.Characteristic.Model, "Hydrawise");
-
     // Update the serial number.
     informationService?.updateCharacteristic(this.hap.Characteristic.SerialNumber, serialNumber);
 
+    if(hardware) {
+
+      informationService?.updateCharacteristic(this.hap.Characteristic.Model, hardware.model);
+      informationService?.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, hardware.firmware);
+
+      return true;
+    }
+
+    /* With no facts in hand and an enrichment on the way, the one read below decides between preserving and stamping. HAP's own default model is the only value
+     * that can mean "nothing has ever written here", so it is the only value worth overwriting blind.
+     *
+     * The preserve arm belongs to the controller's OWN accessory alone, which is what the identity check asks. A standalone zone accessory is never enriched, so
+     * it has no incoming values to protect, and leaving its characteristics unwritten would strand whatever the last session happened to leave on them.
+     */
+    if(this.platform.hasV2Client && (accessory === this.accessory)) {
+
+      if(informationService?.getCharacteristic(this.hap.Characteristic.Model).value === HAP_DEFAULT_MODEL) {
+
+        informationService.updateCharacteristic(this.hap.Characteristic.Model, "Hydrawise");
+      }
+
+      return true;
+    }
+
+    informationService?.updateCharacteristic(this.hap.Characteristic.Model, "Hydrawise");
+    informationService?.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, HOMEBRIDGE_UNKNOWN_FIRMWARE);
+
     return true;
+  }
+
+  /* Adopt the hardware facts the account-credentialed API reported for this controller: display them, then make them durable.
+   *
+   * The characteristics are the only store these facts have. HAP round-trips them through Homebridge's on-disk accessory cache, so writing them here and flushing
+   * once is the whole of the persistence - no parallel copy is kept, which is what keeps a restart from having two answers to reconcile.
+   *
+   * The flush is explicit, unlike every other durable write this class makes. Those ride the polling projection's single chokepoint, which turns whatever moved in
+   * a poll into that poll's one cache write; this arrives from outside a poll entirely, so it owns its own persistence or the values are gone at the next restart -
+   * and losing them would spend a cloud call on every launch to relearn a fact that never changes.
+   *
+   * @param hardware - The model and firmware this controller reports.
+   */
+  public applyHardware(hardware: HydrawiseControllerHardware): void {
+
+    this.configureInfo({ accessory: this.accessory, hardware, serialNumber: this.controller.serial_number });
+    this.api.updatePlatformAccessories([this.accessory]);
+
+    this.log.debug("Hardware details updated: %s (firmware %s).", hardware.model, hardware.firmware);
   }
 
   // Compose the wire-level MQTT topic for this controller. Every publish and subscription routes through this helper so the per-controller prefix shape

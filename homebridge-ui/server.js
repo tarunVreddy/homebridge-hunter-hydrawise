@@ -4,12 +4,26 @@
  */
 "use strict";
 
+import { HYDRAWISE_API_TIMEOUT, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TIMEOUT,
+  HYDRAWISE_V2_TOKEN_ENDPOINT } from "../dist/settings.js";
 import { featureOptionCategories, featureOptions } from "../dist/options.js";
-import { HYDRAWISE_API_TIMEOUT } from "../dist/settings.js";
 import { HomebridgePluginUiServer } from "@homebridge/plugin-ui-utils";
 
 // The base URL for every Hydrawise cloud API call this server makes.
 const HYDRAWISE_API_BASE = "https://api.hydrawise.com/api/v1/";
+
+/* The account-login validation this server performs is a SECOND implementation of the OAuth grant and graph call the plugin's own v2 client runs, and that is a
+ * deliberate duplication rather than an oversight. This is a separate process from the running plugin: it can import compiled constants from dist, which is why
+ * every endpoint and client credential below is imported rather than retyped, but it cannot reach the plugin's runtime classes or the rate budget they draw
+ * against. What it duplicates is small and stable - a form-encoded grant and a one-field query - and it is spent once, on an explicit click, during first run.
+ */
+
+// The trivial query the validation runs once a grant succeeds. It asks for the one field that proves an account was authenticated and nothing that could fail on
+// its own, which keeps a validation failure meaning what it says.
+const HYDRAWISE_V2_IDENTITY_QUERY = "query { me { id } }";
+
+// The generic failure sentence for an account login that failed for a reason no specific sentence covers.
+const GENERIC_ACCOUNT_ERROR = "Unable to sign in to your Hydrawise account. Please check your username and password and try again.";
 
 // The generic failure sentence for a controllers fetch that failed or returned a malformed response.
 const GENERIC_CONTROLLERS_ERROR = "Unable to retrieve your Hydrawise irrigation controllers. Please check your API key and try again.";
@@ -145,6 +159,70 @@ const fetchZones = async (apiKey, controllers) => {
   return { error: "", zones };
 };
 
+/* Validate a Hydrawise account login against the account-credentialed API: run the OAuth2 password grant, then spend the grant on a trivial query. Both halves are
+ * needed to answer the question honestly - a grant proves the credentials are accepted, and the query proves the resulting token actually reaches the API.
+ *
+ * Failure classification reads the body as well as the status. This API answers a failed query with HTTP 200 and reports the failure in a body-level errors array,
+ * so a status check alone would report a broken login as a success. Every path resolves a shaped result rather than throwing, on the same terms the key-based
+ * validation beside it uses.
+ */
+const validateAccount = async (username, password) => {
+
+  try {
+
+    const grantParams = new URLSearchParams();
+
+    grantParams.set("client_id", HYDRAWISE_V2_CLIENT_ID);
+    grantParams.set("client_secret", HYDRAWISE_V2_CLIENT_SECRET);
+    grantParams.set("grant_type", "password");
+    grantParams.set("password", password);
+    grantParams.set("scope", "all");
+    grantParams.set("username", username);
+
+    const grantResponse = await fetch(HYDRAWISE_V2_TOKEN_ENDPOINT, { body: grantParams.toString(),
+      headers: { "content-type": "application/x-www-form-urlencoded" }, method: "POST", signal: AbortSignal.timeout(HYDRAWISE_V2_TIMEOUT * 1000) });
+
+    if(!grantResponse.ok) {
+
+      const sentence = errorSentenceForStatus(grantResponse.status);
+
+      return { result: sentence.length ? sentence : GENERIC_ACCOUNT_ERROR };
+    }
+
+    const grant = await grantResponse.json();
+
+    if(typeof grant?.access_token !== "string") {
+
+      return { result: GENERIC_ACCOUNT_ERROR };
+    }
+
+    const queryResponse = await fetch(HYDRAWISE_V2_GRAPH_ENDPOINT, { body: JSON.stringify({ query: HYDRAWISE_V2_IDENTITY_QUERY }),
+      headers: { "authorization": "Bearer " + grant.access_token, "content-type": "application/json" }, method: "POST",
+      signal: AbortSignal.timeout(HYDRAWISE_V2_TIMEOUT * 1000) });
+
+    if(!queryResponse.ok) {
+
+      const sentence = errorSentenceForStatus(queryResponse.status);
+
+      return { result: sentence.length ? sentence : GENERIC_ACCOUNT_ERROR };
+    }
+
+    const body = await queryResponse.json();
+
+    if(Array.isArray(body?.errors) && body.errors.length) {
+
+      return { result: "Your Hydrawise account signed in, but the account API rejected the request. Please try again." };
+    }
+
+    return { result: "success" };
+  } catch(error) {
+
+    const sentence = timeoutSentence(error);
+
+    return { result: sentence.length ? sentence : GENERIC_ACCOUNT_ERROR };
+  }
+};
+
 class PluginUiServer extends HomebridgePluginUiServer {
 
   constructor() {
@@ -187,6 +265,10 @@ class PluginUiServer extends HomebridgePluginUiServer {
         return { controllers: [], result: sentence.length ? sentence : GENERIC_CONTROLLERS_ERROR };
       }
     });
+
+    // Register the account-login validation with the Homebridge server API. It runs only on an explicit click during first run, and it answers the same shaped
+    // result the key validation above does: a sentence that is either "success" or the reason it is not.
+    this.onRequest("/loginV2", (payload) => validateAccount(payload?.username ?? "", payload?.password ?? ""));
 
     // Return the account's irrigation controllers on an explicit user refresh. This is a fresh controller-list fetch with no caching: the webUI's automatic listings
     // read the accessory cache, so this endpoint runs only when the user clicks the refresh control.

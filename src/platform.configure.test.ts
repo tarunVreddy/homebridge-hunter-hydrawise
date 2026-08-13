@@ -5,7 +5,7 @@
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
  * retry failure paths, and the shutdown teardown.
  */
-import { buildPlatform, countLogged, dispatcherOf, installMockDispatcher, loggedAt, programJsonReply, programStatusReply, seedAccessory, waitFor }
+import { buildPlatform, countLogged, dispatcherOf, installMockDispatcher, loggedAt, programJsonReply, programStatusReply, seedAccessory, v2DispatcherOf, waitFor }
   from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
@@ -272,5 +272,35 @@ describe("HydrawisePlatform configure", () => {
 
     assert.equal(destroyedAtAbort, false, "the abort runs first, while the dispatcher is still live");
     assert.equal(dispatcherOf(platform)?.destroyed, true, "the dispatcher is destroyed by the time the shutdown handler returns, in the same synchronous frame");
+  });
+
+  test("shutdown destroys the account-credentialed dispatcher too, and aborts before it", (t) => {
+
+    /* The v2 twin of the two pins above. Its own transport keeps its own keep-alive pool, so it owns a teardown registration of its own, and without this pin
+     * deleting that registration reds nothing: the pool simply outlives the plugin, holding a connection nothing will ever use again.
+     *
+     * No wire traffic is needed. The client's pool is constructed with the platform and destroyed by the shutdown handler whether or not a request ever crossed it,
+     * which is precisely the leak a missing defer would cause on an install that never spent a v2 call.
+     */
+    const { emit, platform } = buildPlatform({ options: [ "Enable.Account.Password=test-password", "Enable.Account.Username=test-user" ] });
+
+    t.after(() => emit(SHUTDOWN));
+
+    assert.equal(platform.hasV2Client, true, "the credentials build the client, so there is a second dispatcher to tear down");
+    assert.equal(v2DispatcherOf(platform)?.destroyed, false, "the second dispatcher is live before shutdown");
+
+    let destroyedAtAbort: boolean | undefined;
+
+    // Sampled AT ABORT TIME for the reason the v1 ordering pin states: the end state converges either way, so the frame between the two teardown steps is the only
+    // place the registration order is observable at all.
+    onAbort(platform.signal, () => {
+
+      destroyedAtAbort = v2DispatcherOf(platform)?.destroyed;
+    });
+
+    emit(SHUTDOWN);
+
+    assert.equal(destroyedAtAbort, false, "the abort runs first, while the second dispatcher is still live");
+    assert.equal(v2DispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the account-credentialed dispatcher as well");
   });
 });

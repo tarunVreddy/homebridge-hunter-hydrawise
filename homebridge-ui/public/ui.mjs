@@ -90,6 +90,12 @@ let scheduleMountSignal;
 let tickSequence = 0;
 let inFlightTick = null;
 
+/* The account login first run has actually VALIDATED, held as the pair the submit will commit, or null when there is nothing validated to commit. Only a successful
+ * validation puts a pair here, and editing either field clears it again, so what first run writes is always a pair the cloud has confirmed rather than whatever
+ * happened to be sitting in the inputs when the user pressed the button.
+ */
+let validatedCredentials = null;
+
 const getCatalog = () => {
 
   catalogPromise ??= withDeadline({ promise: homebridge.request("/getOptions"), seconds: CATALOG_DEADLINE }).then((response) => {
@@ -265,6 +271,65 @@ const notifyError = (message) => {
 // the persisted config rather than a reach into the feature-options page's state, and the interpreter is what knows where a key can live.
 const firstRunIsRequired = ({ config }) => hydrawiseConfig.apiKey(config).length !== API_KEY_LENGTH;
 
+/* The classes a credential result line wears in every state. The tone rides on top of this base, so a line's blank, failure, and success states are one layout with
+ * one color decision between them rather than a separate class string per state, which is what would let the states drift apart.
+ */
+const RESULT_ROW_CLASS = "hbhh-result small mt-2";
+
+/* Paint one credential validation's result line in the tone its outcome calls for - a Bootstrap text color, or an empty string for the blank state. The sentence
+ * lands through textContent, so a reason the server reported renders as text rather than as markup, matching the trust boundary every other display in this file
+ * holds. The line keeps its height while blank, which is what stops a card from shifting under the user as a validation answers.
+ */
+const renderResultRow = ({ id, text, tone }) => {
+
+  const row = document.getElementById(id);
+
+  row.className = tone.length ? (RESULT_ROW_CLASS + " " + tone) : RESULT_ROW_CLASS;
+  row.textContent = text;
+};
+
+// The property the first-run cards read their frame color from. It is ours rather than the framework's, so writing it can never disturb the accent the framework
+// manages for its own page.
+const ACCENT_PROPERTY = "--hbhh-accent";
+
+/* Read the accent Homebridge is actually rendering and publish it for the first-run cards.
+ *
+ * The accent cannot be read from a Bootstrap custom property. The host themes its buttons by rule, so --bs-primary carries stock Bootstrap blue rather than the
+ * color the user picked, which is why the framework learns the accent by probing what a .btn-primary actually renders. This is that same probe, kept here because
+ * first run paints before the framework's token sheet and its probe exist: a hidden button, one computed read, one property write.
+ *
+ * A probe that runs before the host's stylesheet applies reads an empty or fully transparent color. Writing that would replace a sensible default with a useless
+ * value, so such a reading is discarded and whatever is already in force stands - the probe may improve the page's color, never degrade it.
+ */
+const probeAccent = () => {
+
+  const probe = document.createElement("button");
+
+  probe.className = "btn btn-primary";
+  probe.style.display = "none";
+  document.body.appendChild(probe);
+
+  const background = getComputedStyle(probe).backgroundColor;
+
+  probe.remove();
+
+  if(!background.length || (background === "transparent") || background.replace(/\s+/g, "").startsWith("rgba(0,0,0,0")) {
+
+    return;
+  }
+
+  document.documentElement.style.setProperty(ACCENT_PROPERTY, background);
+};
+
+// Discard any validated account login and blank the result the validation showed for it. This runs when a field is edited and when first run opens, so the
+// indicator on screen and the pair that would be committed always describe the same thing.
+const clearValidatedCredentials = () => {
+
+  validatedCredentials = null;
+
+  renderResultRow({ id: "validateV2Result", text: "", tone: "" });
+};
+
 // Initialize our first run screen with any information from our existing configuration. The key's length is a validation fact the interpreter module owns, so the
 // input's own bounds are stamped from it here rather than restated in the markup.
 const firstRunOnStart = ({ config }) => {
@@ -276,6 +341,16 @@ const firstRunOnStart = ({ config }) => {
 
   // Pre-populate with anything we might already have in our configuration.
   input.value = hydrawiseConfig.apiKey(config);
+
+  // Pre-populate the optional account login the same way, so a user returning to this screen sees what is already configured rather than two empty fields. A
+  // pre-populated pair is NOT a validated one - it is only rewritten if the user validates it again, and left exactly as it stands otherwise.
+  document.getElementById("hydrawiseUsername").value = hydrawiseConfig.username(config);
+  document.getElementById("hydrawisePassword").value = hydrawiseConfig.password(config);
+
+  clearValidatedCredentials();
+
+  // Publish the host's rendered accent before the page is revealed, so the cards paint in the theme's own color from their first frame.
+  probeAccent();
 
   return true;
 };
@@ -330,10 +405,13 @@ const seedSessionControllers = (controllers) => {
 const firstRunOnSubmit = async ({ commit, config }) => {
 
   const apiKey = document.getElementById("apiKey").value;
-  const tdLoginError = document.getElementById("loginError");
+  const loginError = document.getElementById("loginError");
 
-  // Reset the failure placeholder to a non-breaking space via textContent, keeping the cell's height without routing any text through a markup assignment.
-  tdLoginError.textContent = " ";
+  /* Clear both of the key card's result lines before the call, each through textContent so no text is routed through a markup assignment. The button's own line is
+   * cleared alongside the submit's, because a verdict it left standing would otherwise sit beside a submit that has just failed, saying the opposite.
+   */
+  loginError.textContent = "";
+  renderResultRow({ id: "apiKeyResult", text: "", tone: "" });
 
   // The /login endpoint answers a shaped object: a result sentence ("success" or the failure reason) plus the controllers it parsed from the same customerdetails
   // body it already fetched. On failure we render the sentence inline through the DOM helper, so the user sees the specific reason on the form.
@@ -350,9 +428,14 @@ const firstRunOnSubmit = async ({ commit, config }) => {
   // Seed the session roster from the login response so a first-run user sees their controllers immediately, with no extra call, once the feature-options view opens.
   seedSessionControllers(controllers);
 
-  // Persist the validated key through commit, the framework's single write path. The interpreter composes the patch, so the key is written to the feature option
-  // that owns it and any legacy property carrying an older key leaves on the same save.
-  await commit(hydrawiseConfig.withApiKey(config, apiKey));
+  /* Persist everything first run collected through commit, the framework's single write path, as ONE patch composed by the interpreter. One patch is required
+   * rather than tidy: each interpreter write returns its own complete snapshot of the options array, so committing two of them would leave the shallow merge
+   * holding only the second and silently dropping whatever the first composed.
+   *
+   * Only a VALIDATED account login rides along. An unvalidated edit sitting in the fields is not committed, and an absent pair leaves whatever the configuration
+   * already held untouched.
+   */
+  await commit(hydrawiseConfig.withFirstRun(config, { apiKey, password: validatedCredentials?.password, username: validatedCredentials?.username }));
 
   return true;
 };
@@ -394,6 +477,11 @@ const cachedValveName = (accessory, relayId) => {
  * option catalog so a global-scope option entry never reads as a controller; and (c) the session roster itself, so a controller that appeared once stays listed. A
  * controller whose floor Disable the user removed this session, with no live accessory yet, is marked as awaiting a restart. The apiKey is never consulted here - the
  * listing is answered from the local accessory cache, the local config, and the option catalog the plugin's own UI server publishes.
+ *
+ * The resolution carries the listing and the connection outcome together, which is the framework's contract for this hook. Reporting a failed read through the error
+ * half rather than a toast is what lets the page tell "this account has no controllers configured" apart from "the controllers could not be read": the first is a
+ * calm empty listing the user may have intended, the second routes to a retry view. A toast could say neither, because it leaves the empty listing on screen
+ * underneath it saying the opposite.
  */
 const getControllers = async ({ config }) => {
 
@@ -441,7 +529,11 @@ const getControllers = async ({ config }) => {
     }
   } catch(err) {
 
-    notifyError((err instanceof Error) ? err.message : String(err));
+    /* The accessory cache is the listing's primary source, so a read that fails leaves us with nothing trustworthy to show and the failure travels back as the
+     * result's error half. Returning here rather than carrying on is deliberate: the later sources could still compose a partial roster, and a partial roster
+     * rendered as though it were the whole account is a worse answer than an honest failure the user can retry.
+     */
+    return { controllers: [], error: "Unable to read the Homebridge accessory cache: " + ((err instanceof Error) ? err.message : String(err)) };
   }
 
   /* (b) The config floor, screened against the option catalog. Each named serial is remembered for the session; one that is neither a known controller nor a known
@@ -482,7 +574,9 @@ const getControllers = async ({ config }) => {
     resolved.push({ controllerId: entry.controllerId, name: pendingRestart ? (entry.name + " (pending restart)") : entry.name, serialNumber: entry.serialNumber });
   }
 
-  return resolved;
+  // A successful read carries no error, empty roster or not: an account with every controller disabled and no floor entries is a legitimate empty listing, and the
+  // page's own no-controllers message is the right thing for the user to see there.
+  return { controllers: resolved, error: "" };
 };
 
 /* Return a selected controller's zones for the two-level sidebar, with zero automatic cloud calls. We resolve the zones from the accessory whose own controller
@@ -1242,6 +1336,182 @@ const onRefreshControllers = async () => {
  * one dispatch per click no matter how many times the panel has been reopened.
  */
 document.getElementById("hbhhRefreshControllers")?.addEventListener("click", () => void onRefreshControllers(), { signal: ui.epochSignal });
+
+/* Validate the Hydrawise API key on demand, during first run. It is early feedback and nothing else: the submit validates the key through this same endpoint before
+ * it commits anything, so a user who never presses the button is no worse off, and one who does learns whether their key works before committing a configuration.
+ *
+ * The length is answered locally rather than by the cloud. The interpreter module owns what a key's length must be and first run stamps the input's own bounds from
+ * it, so an incomplete key is already known to be invalid and spending a call against the account's rate budget to be told so would buy nothing.
+ */
+const onValidateApiKey = async () => {
+
+  const button = document.getElementById("validateApiKey");
+  const apiKey = document.getElementById("apiKey").value;
+
+  if(apiKey.length !== API_KEY_LENGTH) {
+
+    renderResultRow({ id: "apiKeyResult", text: "Enter your complete Hydrawise API key.", tone: "text-danger" });
+
+    return;
+  }
+
+  // Whatever the last validation said is stale the moment a new one starts, so the line is blanked before the call rather than after it - a call that never
+  // resolves must not leave an older verdict standing beside newer input.
+  renderResultRow({ id: "apiKeyResult", text: "", tone: "" });
+
+  button.disabled = true;
+
+  try {
+
+    const { result } = await homebridge.request("/login", apiKey);
+
+    // The epoch signal is read after the await for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired
+    // copy must not paint over what the copy the user is looking at is showing.
+    if(ui.epochSignal.aborted) {
+
+      return;
+    }
+
+    if(result !== "success") {
+
+      renderResultRow({ id: "apiKeyResult", text: result, tone: "text-danger" });
+
+      return;
+    }
+
+    renderResultRow({ id: "apiKeyResult", text: "Your Hydrawise API key is valid.", tone: "text-success" });
+  } finally {
+
+    /* The re-enable is unconditional, superseded copy or not, for the reason the refresh control's own finally states: the invocation that disabled the control is
+     * the only thing that can balance its own disable, and the button element outlives any one module copy.
+     */
+    button.disabled = false;
+  }
+};
+
+/* Validate the optional account login on demand, during first run. This is the only cloud call first run makes beyond the API-key check, it is spent solely on an
+ * explicit click, and it changes nothing on disk: a successful validation stages the pair in memory, and the submit below is what commits it.
+ *
+ * Staging rather than writing is what makes the button's meaning honest. The pair that gets committed is the pair the cloud confirmed, so a user who validates and
+ * then edits a field cannot end up with an unchecked credential written as though it had been checked - the edit handlers below clear the staged pair.
+ */
+const onValidateV2 = async () => {
+
+  const button = document.getElementById("validateV2");
+  const username = document.getElementById("hydrawiseUsername").value;
+  const password = document.getElementById("hydrawisePassword").value;
+
+  // Anything already staged is stale the moment a new validation starts, so it is cleared before the call rather than after it - a call that never resolves must
+  // not leave an older result standing beside newer input.
+  clearValidatedCredentials();
+
+  if(!username.length || !password.length) {
+
+    renderResultRow({ id: "validateV2Result", text: "Enter both your Hydrawise username and password.", tone: "text-danger" });
+
+    return;
+  }
+
+  button.disabled = true;
+
+  try {
+
+    const { result: outcome } = await homebridge.request("/loginV2", { password, username });
+
+    // The epoch signal is read after the await for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired
+    // copy must not paint over what the copy the user is looking at is showing.
+    if(ui.epochSignal.aborted) {
+
+      return;
+    }
+
+    if(outcome !== "success") {
+
+      renderResultRow({ id: "validateV2Result", text: outcome, tone: "text-danger" });
+
+      return;
+    }
+
+    validatedCredentials = { password, username };
+
+    renderResultRow({ id: "validateV2Result", text: "Your Hydrawise account login is valid.", tone: "text-success" });
+  } finally {
+
+    /* The re-enable is unconditional, superseded copy or not, for the reason the refresh control's own finally states: the invocation that disabled the control is
+     * the only thing that can balance its own disable, and the button element outlives any one module copy.
+     */
+    button.disabled = false;
+  }
+};
+
+// A reveal toggle's accessible name, naming what the NEXT click will do rather than what the field is doing now, which is what a control announced as a button
+// wants to say. The subject is the field's own plain name, so each toggle on the page announces which credential it acts on.
+const revealLabel = (subject, revealed) => (revealed ? "Hide the " : "Show the ") + subject + ".";
+
+/* Flip one masked credential between hidden and shown. Every reveal on the page comes through here: a toggle names the field it serves and the subject its
+ * accessible name uses on its own data attributes, so a field gains a reveal by carrying a button in the markup rather than by growing a handler of its own. The
+ * sidebar's zone dots carry their identity the same way, for the same reason.
+ *
+ * The field's type, the toggle's accessible name, and its pressed state describe one state between them, so they are written together and no path can move one and
+ * leave the others saying something else. Nothing here touches a value or the staged pair: whether a secret is on screen right now says nothing about the
+ * configuration, so the flip commits nothing and invalidates nothing.
+ */
+const toggleReveal = (toggle) => {
+
+  const input = document.getElementById(toggle.dataset.reveal);
+  const revealed = input.type === "password";
+
+  input.type = revealed ? "text" : "password";
+  toggle.setAttribute("aria-label", revealLabel(toggle.dataset.revealSubject, revealed));
+  toggle.setAttribute("aria-pressed", revealed ? "true" : "false");
+};
+
+// Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding joins the page epoch exactly as
+// the refresh control does, so a superseded module copy's handlers die when a newer copy claims the window.
+document.getElementById("validateApiKey")?.addEventListener("click", () => void onValidateApiKey(), { signal: ui.epochSignal });
+document.getElementById("validateV2")?.addEventListener("click", () => void onValidateV2(), { signal: ui.epochSignal });
+document.getElementById("apiKey")?.addEventListener("input", () => renderResultRow({ id: "apiKeyResult", text: "", tone: "" }), { signal: ui.epochSignal });
+
+// Each masked credential's reveal, bound from the markup itself: a toggle declares the field it serves, so the page grows a reveal without this wiring changing.
+for(const toggle of document.querySelectorAll("[data-reveal]")) {
+
+  toggle.addEventListener("click", () => toggleReveal(toggle), { signal: ui.epochSignal });
+}
+
+/* Follow the host's theme while the page is open, by the routes Homebridge uses to announce a change into a plugin frame: it retints our document by swapping
+ * the theme classes on our own body element, and it posts a message to the frame. Each arrives whether the user picked a mode by hand or the system flipped one
+ * underneath an auto-detecting install, because every route runs the same retint. Watching our own body is the arm that settles the ordering, since a class
+ * change IS the retint rather than an announcement of one, and mutation records are delivered after the change has landed.
+ *
+ * The system color-scheme query is deliberately not among them. It answers before the host has retinted anything, so a probe driven by it would read the colors
+ * that are on their way out, and on an install pinned to one mode it would fire when nothing about the page has changed at all.
+ *
+ * Re-probing the accent is the whole of the work. Every other color this page wears comes from the host's own themed stylesheet, which re-matches the moment
+ * those classes change, so those colors follow with no help. The message payload is read for nothing but its type, so traffic from anywhere else costs one
+ * string comparison.
+ */
+const followThemeChange = () => probeAccent();
+
+window.addEventListener("message", (event) => {
+
+  if(event.data?.type === "theme-update") {
+
+    followThemeChange();
+  }
+}, { signal: ui.epochSignal });
+
+const themeClassObserver = new window.MutationObserver(followThemeChange);
+
+themeClassObserver.observe(document.body, { attributeFilter: ["class"], attributes: true });
+
+// A MutationObserver takes no abort signal of its own, so it joins the page epoch the way the schedule ticker's interval does: one explicit teardown, registered
+// once, so a superseded copy of this module leaves no observer watching the document on behalf of a page nobody is looking at.
+ui.epochSignal.addEventListener("abort", () => themeClassObserver.disconnect(), { once: true });
+
+for(const id of [ "hydrawisePassword", "hydrawiseUsername" ]) {
+
+  document.getElementById(id)?.addEventListener("input", clearValidatedCredentials, { signal: ui.epochSignal });
+}
 
 /* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
  * wiring step that hangs against an unresponsive host can never be what makes the settings panel look broken.

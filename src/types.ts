@@ -2,6 +2,7 @@
  *
  * types.ts: Interface and type definitions for Hydrawise.
  */
+import type { Nullable } from "homebridge-plugin-utils";
 import type { PlatformAccessory } from "homebridge";
 
 // HBHH reserved names.
@@ -103,6 +104,128 @@ export interface SetZoneResponse {
   message: string;
   message_type: "error" | "info";
 }
+
+/* Hydrawise v2 API: the OAuth2 token endpoint's response, typed to the three fields the client consumes. The lifetime arrives as a duration in seconds rather than
+ * an instant, so the client turns it into an absolute expiry against its own clock at the moment it reads the response.
+ *
+ * Every field is optional, because this describes untrusted JSON rather than a promise the wire keeps. Each absence has its own honest handling: a grant carrying
+ * no access token is a failed grant, a grant stating no lifetime is treated as expiring at once, and a grant answering with no refresh token is still perfectly
+ * usable - the client simply re-authenticates with the account credentials when that access token runs out.
+ */
+export interface HydrawiseV2TokenResponse {
+
+  access_token?: string;
+  expires_in?: number;
+  refresh_token?: string;
+}
+
+/* Hydrawise v2 API: the envelope every GraphQL response arrives in, parameterized by the selection's own data shape. Both halves are optional because both absences
+ * are real: a request that failed carries errors and no data, and a malformed answer can carry neither.
+ *
+ * The errors array is what makes GraphQL failure classification different from REST. The v2 endpoint answers a failed query with HTTP 200 and reports the failure in
+ * the body, so a status-code check alone would read a failure as a success - which is why every consumer of this envelope inspects errors before it trusts data.
+ */
+export interface HydrawiseV2GraphResponse<T> {
+
+  data?: T;
+  errors?: { message?: string }[];
+}
+
+/* Hydrawise v2 API: one entry of a controller's firmware list. A controller reports firmware as a LIST of typed components rather than a single version string -
+ * the capture from a live HCC controller carries an entry of type "controller" - so reading a version means selecting the entry whose type names it, never taking
+ * the first entry. Both fields are optional because a partial hardware block is a shape the wire can produce for an offline or unlinked controller.
+ */
+export interface HydrawiseV2FirmwareEntry {
+
+  type?: string;
+  version?: string;
+}
+
+// Hydrawise v2 API: the model block of a controller's hardware. The description is the full marketing name a user recognizes ("HCC 38 Zones"), where the sibling
+// name field carries the shorter capacity fragment alone ("38 Zones"); the description is what this plugin projects into HomeKit.
+export interface HydrawiseV2ModelBlock {
+
+  description?: string;
+}
+
+// Hydrawise v2 API: the hardware block of a controller, typed to the fields this plugin reads. Every field is optional for the same reason the firmware entry's
+// are: a controller that is offline or not linked to the account can answer with a partial block, and typing off the one healthy capture would make that a crash.
+export interface HydrawiseV2HardwareBlock {
+
+  firmware?: HydrawiseV2FirmwareEntry[];
+  model?: HydrawiseV2ModelBlock;
+}
+
+/* Hydrawise v2 API: one controller as the whole-account hardware query returns it. The id is the correlation key that matches a v2 controller to the v1 controller
+ * this plugin discovered - the live capture shows it carrying the same number as v1's controller_id, while the sibling deviceId is a different number entirely, so
+ * keying on deviceId would silently match nothing.
+ */
+export interface HydrawiseV2ControllerHardware {
+
+  hardware?: HydrawiseV2HardwareBlock;
+  id?: number;
+}
+
+// Hydrawise v2 API: the data half of the whole-account hardware query. One query answers for every controller on the account, which is what lets the platform fetch
+// once and distribute rather than spending a call per controller against a budget measured in single digits.
+export interface HydrawiseV2AccountHardware {
+
+  me?: { controllers?: HydrawiseV2ControllerHardware[] };
+}
+
+// Hydrawise v2 API: the firmware list's `type` value naming the controller's own firmware, as opposed to the per-module versions the same hardware block reports
+// separately. The selection rule reads this constant, so the entry that counts as the controller's firmware is named in exactly one place.
+export const HYDRAWISE_V2_CONTROLLER_FIRMWARE = "controller";
+
+/* The hardware facts of a single irrigation controller: the model name and the firmware version, as HomeKit's AccessoryInformation service shows them.
+ *
+ * This shape is IN MEMORY only, and deliberately so. It is composed from one wire answer, carried as far as the characteristic writes, and then dropped - HAP
+ * already retains characteristic values across restarts through Homebridge's accessory cache, so persisting these fields anywhere else would be a second store of
+ * the same displayed state, and two stores of one fact eventually disagree. The characteristics ARE the store.
+ *
+ * Both fields are required strings, which is the whole point of the compose helper below returning null on a partial answer: a half-populated shape would put a
+ * real model beside an empty firmware and leave HomeKit showing a fact this plugin never learned.
+ */
+export interface HydrawiseControllerHardware {
+
+  firmware: string;
+  model: string;
+}
+
+/* Project a wire hardware block onto the displayed shape, or answer null when the wire did not carry enough to populate it. This is the one home for both selection
+ * rules, so what "the model" and "the firmware" mean is decided once rather than at each read site.
+ *
+ * The model is the wire's own description, the full name a user recognizes. The firmware is the version of the list entry whose type names the controller itself,
+ * which is why the walk searches by type instead of taking the first entry - a controller reports its modules' firmware in the same list, in no guaranteed order.
+ *
+ * Answering null rather than a partial shape is deliberate. A controller whose hardware block is incomplete is simply not enriched, and the placeholder stands,
+ * which is a truthful display; populating one field and leaving the other empty would not be.
+ */
+export function controllerHardware(hardware: HydrawiseV2HardwareBlock | undefined): Nullable<HydrawiseControllerHardware> {
+
+  const model = hardware?.model?.description;
+  const firmware = hardware?.firmware?.find(entry => entry.type === HYDRAWISE_V2_CONTROLLER_FIRMWARE)?.version;
+
+  if(!model?.length || !firmware?.length) {
+
+    return null;
+  }
+
+  return { firmware, model };
+}
+
+/* The v2 client's OAuth token state, as a discriminated union so the access token, its expiry, and any refresh in flight can never disagree with one another. One
+ * shape and one mutation point is what makes that structural rather than a convention each write site has to honor.
+ *
+ * The three states are the whole lifecycle. "none" is no usable token, which is both the starting state and where a failed acquisition returns to. "valid" carries
+ * a token and the instant it expires. "refreshing" carries the in-flight acquisition, and it is the single-flight mechanism itself: both paths that reach the
+ * network - a first acquisition and a renewal - transition here synchronously before their first await, so concurrent callers join the one promise rather than each
+ * firing a grant of their own. There is deliberately no separate "acquiring" state; an acquisition and a renewal are the same wait to every caller.
+ */
+export type HydrawiseV2TokenState =
+  { state: "none" } |
+  { accessToken: string; expiresAt: number; refreshToken: Nullable<string>; state: "valid" } |
+  { pending: Promise<Nullable<string>>; state: "refreshing" };
 
 // The persisted identity of a single irrigation controller. This is the denormalized, wire-independent shape the runtime writes into the accessory context and the
 // webUI reads back from the accessory cache and the /refreshControllers response, so a stopped plugin's controller list stays answerable without any cloud call. It

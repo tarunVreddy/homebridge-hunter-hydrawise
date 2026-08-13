@@ -3,13 +3,13 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop }
-  from "homebridge-plugin-utils";
+import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, guardedDispatch, loopFaultReporter, retry, sanitizeName,
+  superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity } from "./types.ts";
 import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
-  PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_ZONE_ACCESSORY_CATEGORY,
+  HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
@@ -17,6 +17,7 @@ import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sam
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
+import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
 import util from "node:util";
 
@@ -37,6 +38,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
   public readonly timers: TimerRegistry;
+  private readonly v2Budget: RateBudget;
+  private readonly v2Client?: HydrawiseV2Client;
 
   /* Everything shutdown has to undo, declared in one place and disposed in one call. A DisposableStack runs its registered work in reverse registration order, so
    * the ordering teardown depends on is expressed by the order things are registered rather than by a handler body that has to be read to be trusted, and the
@@ -47,6 +50,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * platform global, which the entry point's polyfill import guarantees exists on every runtime this package supports.
    */
   private readonly teardown = new DisposableStack();
+
+  /* Whether the one-shot whole-account hardware enrichment has been dispatched. Discovery is re-enterable - a second DID_FINISH_LAUNCHING runs it again, and the
+   * supervisor can re-enter it - while the hardware a controller reports is static, so the query is worth spending exactly once for the life of the plugin. The
+   * flag is raised before the dispatch rather than after it, so a re-entry while the first fetch is still in flight cannot fire a second.
+   */
+  private hardwareEnriched = false;
 
   /* The wire-absence grace state behind reconcileZoneAccessories, keyed by zone-accessory UUID and holding that accessory's count of consecutive polls whose report
    * omitted its zone. It lives in memory only and is deliberately not persisted: a restart clears it, which errs toward RETAINING a HomeKit identity the user
@@ -76,12 +85,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.shutdownController = new AbortController();
     this.signal = this.shutdownController.signal;
 
-    // Make the two ceilings Hydrawise publishes structural rather than advisory. Each window is stated in seconds by its own constant and converted to the
-    // milliseconds a RateBudget takes right here, so the conversion sits once, immediately beside the constant it applies to. Both budgets carry the platform's
-    // shutdown signal, so a caller still waiting for a slot when Homebridge stops is rejected rather than left pending forever. Construction schedules nothing, so
-    // both are built here alongside the signal, ahead of the missing-API-key return below that leaves the rest of the platform unbuilt.
+    /* Make the ceilings this plugin honors structural rather than advisory. Each window is stated in seconds by its own constant and converted to the milliseconds a
+     * RateBudget takes right here, so the conversion sits once, immediately beside the constant it applies to. Every budget carries the platform's shutdown signal,
+     * so a caller still waiting for a slot when Homebridge stops is rejected rather than left pending forever. Construction schedules nothing, so they are built
+     * here alongside the signal, ahead of the missing-API-key return below that leaves the rest of the platform unbuilt.
+     *
+     * The first two are the ceilings Hydrawise publishes for its key-based API. The third paces the optional account-credentialed API, which publishes no ceiling
+     * at all and throttles hard, so its budget is an envelope chosen to stay clear of trouble rather than a documented limit made enforceable.
+     */
     this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
     this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
+    this.v2Budget = new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
 
     // The one home for every deferred HomeKit write this plugin arms, shared by every controller the platform builds. Construction schedules nothing, so it is
     // built here beside the budgets, ahead of the missing-API-key return below. Its lifetime IS the shutdown signal - the abort drains whatever is pending and
@@ -96,7 +110,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       debug: this.consolidatedFlag("Log.Debug", typeof config?.["debug"] === "boolean" ? config["debug"] : undefined),
       mqttTopic: this.consolidatedValue("Mqtt.Topic", config?.["mqttTopic"] as string | undefined),
       mqttUrl: this.consolidatedValue("Mqtt.Url", config?.["mqttUrl"] as string | undefined),
-      options
+      options,
+
+      // The account credentials have no legacy configuration property of their own, so they resolve from the feature option alone. The resolver's legacy argument
+      // is passed as undefined rather than omitted, which is what says that plainly at the call site.
+      password: this.consolidatedValue("Account.Password", undefined),
+      username: this.consolidatedValue("Account.Username", undefined)
     };
 
     // No Hydrawise API key, we're done.
@@ -109,6 +128,18 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     // Initialize our network connectivity.
     this.initNetworking();
+
+    /* Build the optional account-credentialed client, and only when BOTH credentials are configured. The gate is an AND rather than an OR because a grant needs the
+     * pair: half a login cannot authenticate, so building a client on one of them would spend calls failing. With no client there is no second connection pool, no
+     * token grant, and no enhanced-features call of any kind - the plugin runs exactly as it does for a user who has configured nothing but an API key.
+     */
+    if(this.config.username?.length && this.config.password?.length) {
+
+      this.v2Client = new HydrawiseV2Client({ budget: this.v2Budget, log: this.log, password: this.config.password, signal: this.signal,
+        username: this.config.username });
+
+      this.log.info("Enhanced features are enabled using your Hydrawise account login.");
+    }
 
     /* Initialize MQTT, if needed. The guarded factory answers null for both of the ways MQTT can fail to start - a broker URL or topic prefix that resolves to
      * nothing, and a URL the client cannot parse - so a mistyped MQTT setting degrades to MQTT being off rather than keeping the rest of the plugin from
@@ -128,15 +159,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // registered teardown, synchronously, inside this frame.
     api.on(APIEvent.SHUTDOWN, () => this.teardown.dispose());
 
-    /* Register that teardown work last, once everything it undoes has actually been built. Disposal is reverse registration order, so the dispatcher destroy named
-     * first here runs LAST and the signal abort named second runs FIRST: the abort cancels every signal-aware resource we own - the MQTT client, the retry waits,
-     * the polling loops, the rate-budget waits - and the destroy then closes the keep-alive Pool connection so it does not outlive us.
+    /* Register that teardown work last, once everything it undoes has actually been built. Disposal is reverse registration order, so the dispatcher destroys named
+     * first here run LAST and the signal abort named last runs FIRST: the abort cancels every signal-aware resource we own - the MQTT client, the retry waits, the
+     * polling loops, the rate-budget waits - and the destroys then close the keep-alive Pool connections so they do not outlive us.
      *
-     * The dispatcher is read live at disposal time rather than captured here, which keeps this registration correct across initNetworking's destroy-and-rearm. The
-     * MQTT client gets no registration of its own: its lifetime IS the composed shutdown signal the abort above already ends, so registering it here would tear it
-     * down a second time.
+     * Each dispatcher is read live at disposal time rather than captured here, which keeps these registrations correct across the destroy-and-rearm both transports
+     * perform when a request times out. The v2 client registers only its dispatcher, because that pool is the whole of what it holds: its token renewal is lazy, so
+     * there is no timer to drain. The MQTT client gets no registration of its own: its lifetime IS the composed shutdown signal the abort already ends, so
+     * registering it here would tear it down a second time.
      */
     this.teardown.defer(() => void this.dispatcher?.destroy());
+    this.teardown.defer(() => void this.v2Client?.dispatcher.destroy());
     this.teardown.defer(() => this.shutdownController.abort("shutdown"));
   }
 
@@ -200,6 +233,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.configureController(controller, roster);
     }
 
+    // Enrich what HomeKit shows for each controller, if the user has configured the account credentials that make it possible. Every controller is already built by
+    // this point, so the enrichment is dispatched rather than awaited: discovery finishes on the v1 timings it always has, and the detail lands when it lands.
+    this.enrichControllerHardware();
+
     // Find all the orphaned accessories this account does not claim and remove them, clearing any grace state a removed accessory carried. We walk a filtered
     // SNAPSHOT of the tracked array so the removal splice never races the walk that drives it.
     for(const accessory of this.accessories.filter(entry => this.isOrphanedAccessory(entry))) {
@@ -207,6 +244,49 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.zoneAccessoryGrace.delete(accessory.UUID);
       this.removeAccessory(accessory);
     }
+  }
+
+  /* Populate every configured controller's HomeKit model and firmware from ONE whole-account query, once for the life of the plugin.
+   *
+   * One query for the whole account rather than one per controller is what the v2 ceiling demands - it admits a handful of calls per half hour, so a per-controller
+   * query would spend the whole allowance on a multi-controller install - and it is also the shape v1 discovery already uses: fetch the account once, then hand
+   * each controller its own share.
+   *
+   * The work is detached rather than awaited. Hardware is presentational, the credentials are optional, and the call carries an authentication round trip, so
+   * nothing about discovery should wait on it; guardedDispatch is what keeps a rejection out of the unhandled-rejection path. A failed or empty answer enriches
+   * nothing and leaves every placeholder standing, which is exactly the display a user without credentials sees.
+   */
+  private enrichControllerHardware(): void {
+
+    if(!this.v2Client || this.hardwareEnriched) {
+
+      return;
+    }
+
+    this.hardwareEnriched = true;
+
+    guardedDispatch({ handler: async (): Promise<void> => {
+
+      const hardware = await this.v2Client?.fetchHardware();
+
+      if(!hardware) {
+
+        return;
+      }
+
+      /* Hand each controller its own hardware, matched on the id v2 and v1 agree about. The walk is over the CONFIGURED controllers rather than over the fetched
+       * map, so a controller the user disabled, or one the account reports that this plugin never built, is simply skipped rather than looked up and dropped.
+       */
+      for(const controller of this.account.controllers) {
+
+        const facts = hardware.get(controller.controller_id);
+
+        if(facts) {
+
+          this.configuredDevices[this.hap.uuid.generate(controller.controller_id.toString())]?.applyHardware(facts);
+        }
+      }
+    }, label: "controller hardware enrichment", log: this.log });
   }
 
   /* Whether discovery should sweep an accessory away, dispatched by accessory KIND. Each kind answers to a different authority, which is the whole reason this is
@@ -232,6 +312,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     }
 
     return !this.account.controllers.some(controller => this.hap.uuid.generate(controller.controller_id.toString()) === accessory.UUID);
+  }
+
+  /* Whether the optional account-credentialed features are available. A controller asks this to decide whether the hardware facts its accessory cache carries are
+   * still worth honoring: with a client they are last-known values a refresh is already on its way to confirm, and without one they are stale facts nothing will
+   * ever update again, which is why removing the credentials returns the display to the placeholder rather than leaving yesterday's answer on screen.
+   */
+  public get hasV2Client(): boolean {
+
+    return this.v2Client !== undefined;
   }
 
   // Whether the user has left a controller enabled. The controller-wide Device gate is keyed on the serial number in the canonical controller position, with the

@@ -9,8 +9,9 @@ import { mqttFeatureOptions } from "homebridge-plugin-utils";
 /* The plugin's effective configuration, assembled once by the platform constructor. Each consolidated setting resolves there - the configured feature option
  * first, the legacy configuration property as its fallback - so this describes what the plugin actually runs on rather than mirroring the shape of config.json.
  *
- * The two MQTT fields carry the feature-option engine's own tri-state answer: a string when a value resolves, null when the option is explicitly disabled, and
- * undefined when an entry exists carrying no value. Both absences mean the same thing to the MQTT client factory, which is that MQTT is off.
+ * The MQTT and account-credential fields carry the feature-option engine's own tri-state answer: a string when a value resolves, null when the option is explicitly
+ * disabled, and undefined when an entry exists carrying no value. Every absence means the same thing to the reader downstream - MQTT is off, and the optional
+ * enhanced features stay dormant - which is why each is declared optional as well as nullable: the question mark is what admits the resolver's undefined arm.
  */
 export interface HydrawiseOptions {
 
@@ -19,6 +20,8 @@ export interface HydrawiseOptions {
   mqttTopic?: Nullable<string>;
   mqttUrl?: Nullable<string>;
   options?: string[];
+  password?: Nullable<string>;
+  username?: Nullable<string>;
 }
 
 /* A feature option entry for this plugin's catalog. Scope levels are the framework's own vocabulary: "controller" addresses a whole controller and every zone beneath
@@ -48,11 +51,11 @@ export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.SyncN
 // so asking for a boolean option's value, or for a value option the zone level does not admit, is a type error.
 export type HydrawiseZoneValueOption = "Device.Name";
 
-// The globally-scoped value-centric option names - the account credential and the two MQTT settings the plugin resolves once at startup. The platform's
+// The globally-scoped value-centric option names - the account credentials and the two MQTT settings the plugin resolves once at startup. The platform's
 // consolidated resolver narrows against this, so asking it for an option that carries no global value is a type error. The two Mqtt members name the library
 // factory's published entries and are bound to them by convention exactly as the unions above are bound to the catalog entries below; renaming either of those
 // entries is a breaking change on the library's side.
-export type HydrawiseGlobalValueOption = "Account.ApiKey" | "Mqtt.Topic" | "Mqtt.Url";
+export type HydrawiseGlobalValueOption = "Account.ApiKey" | "Account.Password" | "Account.Username" | "Mqtt.Topic" | "Mqtt.Url";
 
 // The globally-scoped boolean option names - the settings the plugin resolves once at startup as a simple on or off. The platform's flag resolver narrows against
 // this, so asking it for a value-bearing option, or for one no global lookup admits, is a type error. This is the boolean counterpart of the union above, and it is
@@ -76,11 +79,25 @@ export const featureOptionCategories = [
 
 /* eslint-disable @stylistic/max-len */
 
-// Account options. The API key is a value option rather than a schema property so that every setting this plugin has lives in one substrate, and it is global
-// because one key addresses the whole Hydrawise account.
+/* Account options. Each is a value option rather than a schema property so that every setting this plugin has lives in one substrate, and each is global because one
+ * account addresses every controller beneath it.
+ *
+ * The key and the login are different credentials answering to different halves of the Hydrawise API, and only the key is required. The API key drives everything
+ * the plugin schedules and controls; the account login unlocks a second, read-only surface that reports details the key-based API does not carry, so leaving the
+ * login unset costs nothing beyond those details.
+ *
+ * The key and the password declare themselves secret, so the settings page renders them masked behind a reveal the user operates. The username does not: it is an
+ * email address, it is not a credential on its own, and masking it would only make a field the user needs to read back harder to check. Masking is a presentation
+ * choice about who can read the screen, not protection at rest - all three land in config.json as plain text like every other option value.
+ *
+ * The catalog order is the settings page's render order, so it is deliberate rather than alphabetical: the key first as the required credential, then the login
+ * pair in the order a sign-in form reads - username, then password.
+ */
 const accountOptions: HydrawiseFeatureOption[] = [
 
-  { default: false, defaultValue: "", description: "The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website.", inputSize: 19, name: "ApiKey", scopes: ["global"] }
+  { default: false, defaultValue: "", description: "The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website.", inputSize: 19, name: "ApiKey", scopes: ["global"], secret: true },
+  { default: false, defaultValue: "", description: "The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features, currently the real model name and firmware version of each controller in HomeKit.", inputSize: 30, name: "Username", scopes: ["global"] },
+  { default: false, defaultValue: "", description: "The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features, currently the real model name and firmware version of each controller in HomeKit.", inputSize: 20, name: "Password", scopes: ["global"], secret: true }
 ];
 
 // Device options.

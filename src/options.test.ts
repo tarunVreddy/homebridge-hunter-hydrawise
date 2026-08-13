@@ -85,8 +85,41 @@ describe("hydrawise feature options", () => {
 
     // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
     // zone, so it resolves at the zone alone.
-    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Debug", "Log.Zone",
-      "Mqtt.Topic", "Mqtt.Url" ], "the zone name override is the only option that does not resolve globally");
+    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend",
+      "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ], "the zone name override is the only option that does not resolve globally");
+  });
+
+  test("the account login options are value-centric and unset by default", () => {
+
+    const password = optionEntry("Account", "Password");
+    const username = optionEntry("Account", "Username");
+
+    assert.ok(password && username, "both halves of the optional account login should exist");
+
+    // Off with an empty registered value is what makes these optional in the only way that matters: an install that never touches them resolves nothing, so the
+    // enhanced features stay dormant and the plugin runs on its API key alone.
+    assert.equal(password.default, false, "the account password defaults to unconfigured");
+    assert.equal(password.defaultValue, "", "the account password is value-centric and defaults to empty");
+    assert.equal(username.default, false, "the account username defaults to unconfigured");
+    assert.equal(username.defaultValue, "", "the account username is value-centric and defaults to empty");
+  });
+
+  test("the account credentials declare themselves secret, and the username does not", () => {
+
+    const apiKey = optionEntry("Account", "ApiKey");
+    const password = optionEntry("Account", "Password");
+    const username = optionEntry("Account", "Username");
+
+    assert.ok(apiKey && password && username, "every account entry should exist");
+
+    /* The flag is what makes the settings page render these masked behind a reveal, and nothing else in this repo asserts it, so without this pin the masking could
+     * be dropped in a routine edit and no gate would notice - the page would simply start showing the values in clear text.
+     */
+    assert.equal(apiKey.secret, true, "the API key is masked on the settings page");
+    assert.equal(password.secret, true, "the account password is masked on the settings page");
+
+    // The username is an email address rather than a credential of its own, and masking a field the user needs to read back would cost legibility for no protection.
+    assert.equal(username.secret, undefined, "the account username is not masked");
   });
 
   test("describeOptionScope renders the multi-scope prose", () => {

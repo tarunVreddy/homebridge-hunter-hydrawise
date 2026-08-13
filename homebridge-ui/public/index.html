@@ -1,18 +1,131 @@
 <style>
-  .hbhh-blockquote {
-    background-color: rgb(201, 218, 224);
-    border-left: 5px solid rgb(10, 110, 147);
-    font-size: 0.9rem;
-    font-weight: 550;
+  /* This page's own canvas, and the reason it has to have one. Homebridge paints a plugin frame's body when the frame loads and pins it with !important, and it
+   * never repaints it afterwards, so a page that lets the body show through its own content is frozen in whichever mode it loaded in however the user changes
+   * the theme later. The framework's settings view is not frozen because it does not show that body at all: it forces the body surface itself. This is the same
+   * answer for the pages this file owns.
+   *
+   * The surface and the text color are forced together, never one alone. This frame's body carries Bootstrap's modal-content class, so text left to inherit
+   * resolves through the host's modal color rather than the surface's own, which is how a forced background ends up carrying text nobody can read.
+   *
+   * Neither color is chosen here. Each mirrors the framework's own surface token and defers to that token wherever the token sheet is in force, so this page and
+   * the framework can never disagree about what a surface looks like. The dark values key on the class Homebridge itself toggles on our body, which is the signal
+   * that follows a theme the user picks and a system flip an auto-detecting install inherits alike.
+   */
+  body {
+    --hbhh-control-border: var(--fo-form-control-border, var(--bs-border-color, #dee2e6));
+    --hbhh-on-surface: var(--fo-text-on-elevated, var(--bs-body-color, #212529));
+    --hbhh-surface: var(--fo-surface-bg, #ffffff);
+    background-color: var(--hbhh-surface) !important;
+    color: var(--hbhh-on-surface) !important;
+  }
+
+  /* The dark half of the pair. Only the colors move: the paint above stays one declaration at the weight and specificity the framework uses for its own, so on
+   * the framework's page its rule still governs and this one governs first run.
+   */
+  body.dark-mode {
+    --hbhh-control-border: var(--fo-form-control-border, #444);
+    --hbhh-on-surface: var(--fo-text-on-elevated, #F8F9FA);
+    --hbhh-surface: var(--fo-surface-bg, #242424);
+  }
+
+  /* The plugin's logo, sized as a modest banner above the page rather than as its centerpiece, so the content below it leads. */
+  .hbhh-logo {
+    width: 33%;
+  }
+
+  /* A first-run card: one soft frame around one group of credentials, wearing the accent-derived frame the framework gives every outer container so the page reads
+   * as part of the plugin's webUI rather than as something beside it. Where the framework's own container token is in force it decides the color; on this page it
+   * is not, because first run paints before the feature-options view adopts the token sheet, so the softened accent is composed here from the color the page
+   * probes off a rendered Homebridge button and republishes. The formula is the framework's own, applied to the same accent the framework would probe.
+   *
+   * The system accent stands in only for the instant before that probe answers, which is the same window the framework itself leaves open. One declaration serves
+   * either host theme: the page re-probes when Homebridge announces a theme change, so the color follows the theme rather than a rule keyed on a theme signal.
+   */
+  .hbhh-card {
+    border: 1px solid var(--fo-border-accent, color-mix(in srgb, var(--hbhh-accent, AccentColor) 50%, transparent));
+    border-radius: var(--fo-radius-md, 0.5rem);
+  }
+
+  /* A credential's masked field and its reveal toggle, mirroring the framework's own secret-field composition: the two sit side by side in a flex wrapper, and
+   * the toggle carries none of the native button chrome and inherits the surrounding text color, so the eye glyph - drawn in currentColor - takes whatever color
+   * the page's text carries in either mode. The values restate the framework's .fo-secret-field and .fo-secret-toggle rules, so this page and the settings page
+   * render one identical control.
+   */
+  .hbhh-secret-field {
+    align-items: center;
+    display: flex;
+    gap: var(--fo-space-xs, 0.25rem);
+    max-width: 100%;
+  }
+
+  .hbhh-reveal {
+    align-items: center;
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    line-height: 1;
+    padding: 0;
+  }
+
+  /* The credential fields wear the same monospace the framework gives every value-bearing option input, so a key or a login reads here exactly as it does on the
+   * settings page. The token is not in force on first run, since the page paints before the feature-options view adopts the token sheet, so the fallback restates
+   * the framework's own stack verbatim rather than inventing one.
+   */
+  #pageFirstRun .form-control {
+    font-family: var(--fo-font-monospace, ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "Courier New", monospace);
+  }
+
+  /* The credential fields in dark mode. Light is left alone deliberately: Bootstrap's own form-control styling is right there, which is exactly how the framework
+   * treats its own fields - it declares dark overrides and nothing for light. The host is the reason the overrides are needed at all, since it retints a plugin
+   * frame's theme classes but never restyles a plain form control, so an unthemed field stays white on a dark page.
+   *
+   * Surface, text, and border move together, and the placeholder and the focus state come with them, so a field cannot flash a light background the moment it
+   * takes focus. Every value defers to the framework's own form-control token and falls back to the framework's own dark literal, and the focus glow composes the
+   * framework's dark formula over the accent this page probes, since the token that formula normally reads is not in force here.
+   */
+  body.dark-mode #pageFirstRun .form-control {
+    background-color: var(--fo-form-control-bg, #1A1A1A);
+    border-color: var(--hbhh-control-border);
+    color: var(--hbhh-on-surface);
+  }
+
+  body.dark-mode #pageFirstRun .form-control::placeholder {
+    color: var(--fo-form-control-placeholder, #999);
+  }
+
+  body.dark-mode #pageFirstRun .form-control:focus {
+    background-color: var(--fo-form-control-bg, #1A1A1A);
+    border-color: var(--fo-form-control-focus-border, #666);
+    box-shadow: var(--fo-focus-ring, 0 0 0 0.2rem color-mix(in srgb, var(--hbhh-accent, AccentColor) 25%, transparent));
+    color: var(--hbhh-on-surface);
+  }
+
+  /* The muted annotation line in dark mode. Bootstrap's text-muted utility pins its grey directly on the element with its own !important, so it escapes the
+   * forced body text above, and that grey is calibrated for a light canvas - it is unreadable on the dark surface. The host retints a frame's theme classes but
+   * never touches Bootstrap's text utilities, so the correction lives here, deferring to the framework's muted token with the framework's own dark literal
+   * behind it. Light is left alone deliberately: the framework's light muted value is Bootstrap's own grey, so there is nothing to correct.
+   */
+  body.dark-mode #pageFirstRun .text-muted {
+    color: var(--fo-text-muted, #999) !important;
+  }
+
+  /* A credential validation's result line. It holds its own height whether or not it is saying anything, so a card does not shift under the user's eye as a
+   * validation answers.
+   */
+  .hbhh-result {
+    min-height: 1.25em;
   }
 
   /* The sidebar column is pinned to the same fixed width the framework gives #sidebar, so the refresh control it anchors can never float with flex pressure from
-   * the options pane or with the sidebar region's visibility. The framework exports no design token for this width, so the value mirrors its #sidebar rule.
+   * the options pane or with the sidebar region's visibility. It reads the framework's own width token, which is the same value #sidebar itself resolves, so the
+   * two cannot drift apart.
    */
   #hbhhSidebarColumn {
-    max-width: 200px;
-    min-width: 200px;
-    width: 200px;
+    max-width: var(--fo-sidebar-width);
+    min-width: var(--fo-sidebar-width);
+    width: var(--fo-sidebar-width);
   }
 
   /* The refresh control renders at the sidebar section headings' own type scale and rhythm, referencing the framework's design tokens so the two cannot drift
@@ -96,45 +209,81 @@
   }
 </style>
 <p class="text-center">
-  <img src="https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg" alt="homebridge-hunter-hydrawise logo" class="w-50" />
+  <img src="https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg" alt="homebridge-hunter-hydrawise logo" class="hbhh-logo" />
 </p>
 <div id="pageFirstRun" style="display: none;">
-  <div class="mx-auto text-left" style="width: 90%;">
-    <p>Welcome to <strong>homebridge-hunter-hydrawise</strong>. To get started:
-      <ol>
-        <li>Ensure you have a <a href="https://app.hydrawise.com">Hydrawise account</a>.</li>
-        <li><a hred="https://app.hydrawise.com/config/account-details">Generate a Hydrawise API key</a>, should you need one, from the account details section of the Hydrawise site and enter it below.</li>
-      </ol>
-    </p>
-    <table class="table table-sm table-borderless">
-      <tr>
-        <td class="text-center">
-          <input type="text" placeholder="Hydrawise API Key" size="30" id="apiKey"></input>
-        </td>
-      </tr>
-      <tr>
-        <td class="m-0 p-2 text-center font-weight-bold text-danger" id="loginError">
-          &nbsp;
-        </td>
-      </tr>
-    </table>
-    <blockquote class="blockquote hbhh-blockquote mb-0 mt-0 pb-0 pt-0">
-      Things to keep in mind regarding the Hydrawise API:
-      <ul dir="auto">
-        <li>The Hydrawise API is rate-limited with the following constraints:</li>
-          <ul dir="auto">
-            <li>A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.</li>
-            <li>An additional limit across the entire API of no more than 30 calls in any 5 minute period.</li>
-          </ul>
-        <li>While the API provides the ability to suspend a zone, it does not provide the ability to resume a schedule.</li>
-      </ul>
-    </blockquote>
+  <!-- The eye glyph every credential reveal on this page wears, drawn once here and referenced by each toggle so the controls cannot drift into different marks.
+       Every stroke draws in currentColor and each instance sizes itself in em, so a glyph takes the color and the scale of the button hosting it. -->
+  <svg aria-hidden="true" class="d-none">
+    <symbol id="hbhhEyeGlyph" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.25" viewBox="0 0 16 16">
+      <path d="M1 8c2-3.2 4.3-4.8 7-4.8s5 1.6 7 4.8c-2 3.2-4.3 4.8-7 4.8S3 11.2 1 8Z"></path>
+      <circle cx="8" cy="8" r="2.1"></circle>
+    </symbol>
+  </svg>
+  <div class="mx-auto text-start" style="width: 90%;">
+    <p class="mb-2">Welcome to <strong>homebridge-hunter-hydrawise</strong>. To get started:</p>
+    <ol>
+      <li>Ensure you have a <a target="_blank" href="https://app.hydrawise.com">Hydrawise account</a>.</li>
+      <li><a target="_blank" href="https://app.hydrawise.com/config/account-details">Generate a Hydrawise API key</a>, should you need one, from the account details section of the Hydrawise site and enter it below.</li>
+    </ol>
+    <!-- The API key card. The key is the plugin's whole requirement, so it leads the page and carries a validation of its own: pressing it tells the user whether
+         the key works before they commit a configuration, and the submit below validates it again in any case. -->
+    <div class="hbhh-card mb-3 p-3">
+      <h6 class="mb-1">API key</h6>
+      <p class="small mb-3">Your API key is all this plugin needs to discover your controllers and run your zones.</p>
+      <label class="form-label mb-1" for="apiKey">Hydrawise API key</label>
+      <div class="hbhh-secret-field">
+        <input type="password" class="form-control" id="apiKey" autocomplete="new-password">
+        <button type="button" class="hbhh-reveal" id="revealApiKey" aria-label="Show the API key." aria-pressed="false" data-reveal="apiKey"
+          data-reveal-subject="API key">
+          <svg aria-hidden="true" height="1em" width="1em"><use href="#hbhhEyeGlyph"></use></svg>
+        </button>
+      </div>
+      <button type="button" class="btn btn-primary btn-sm mt-2" id="validateApiKey">Validate API Key</button>
+      <div class="hbhh-result small mt-2" id="apiKeyResult"></div>
+      <div class="small text-danger" id="loginError"></div>
+      <details class="small mt-2">
+        <summary>About this API's limits</summary>
+        <ul class="mb-0 mt-2" dir="auto">
+          <li>A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.</li>
+          <li>An additional limit across the entire API of no more than 30 calls in any 5 minute period.</li>
+          <li>Suspending every zone is an account-wide action, and so is lifting it: a resume also clears the suspension on any individual zone.</li>
+        </ul>
+      </details>
+    </div>
+    <!-- The optional account login. It is always visible rather than revealed by a toggle, so the capability is discoverable to someone who has never heard of it,
+         and it is validated by its own button so a user can confirm the credentials work before committing anything. Leaving it blank is a supported outcome: the
+         plugin's full irrigation feature set runs on the API key alone. -->
+    <div class="hbhh-card mb-3 p-3">
+      <h6 class="mb-1">Enhanced features &middot; optional</h6>
+      <p class="small mb-2">Signing in with your Hydrawise account adds accurate rain and suspension state for every zone, a suspend switch for each individual zone, the full zone and controller names your account carries, whether each controller is reachable, and each controller's real model and firmware.</p>
+      <p class="small mb-3">Your login is stored in the Homebridge configuration on this server. This part of the Hydrawise API is unofficial, so the plugin asks little of it and treats what it returns as a bonus: leave these blank and everything else still runs on the API key alone.</p>
+      <label class="form-label mb-1" for="hydrawiseUsername">Hydrawise username</label>
+      <input type="email" class="form-control" id="hydrawiseUsername" autocomplete="email" placeholder="you@example.com">
+      <label class="form-label mb-1 mt-3" for="hydrawisePassword">Hydrawise password</label>
+      <div class="hbhh-secret-field">
+        <input type="password" class="form-control" id="hydrawisePassword" autocomplete="current-password">
+        <button type="button" class="hbhh-reveal" id="revealPassword" aria-label="Show the password." aria-pressed="false"
+          data-reveal="hydrawisePassword" data-reveal-subject="password">
+          <svg aria-hidden="true" height="1em" width="1em"><use href="#hbhhEyeGlyph"></use></svg>
+        </button>
+      </div>
+      <button type="button" class="btn btn-primary btn-sm mt-2" id="validateV2">Validate Account Login</button>
+      <div class="hbhh-result small mt-2" id="validateV2Result"></div>
+      <details class="small mt-2">
+        <summary>About this API's limits</summary>
+        <ul class="mb-0 mt-2" dir="auto">
+          <li>Hydrawise publishes no limits for this API, so the plugin sets its own and stays well inside them.</li>
+          <li>The account details refresh every 15 minutes.</li>
+          <li>Zone suspensions are capped at 10 commands an hour. A command the plugin holds back puts its switch straight back where it was and says why in the Homebridge log.</li>
+          <li>This API suspends and resumes an individual zone, which is what the per-zone suspend switches run on.</li>
+        </ul>
+      </details>
+    </div>
   </div>
   <div class="text-center">
-    <br>
-      <button type="button" class="btn btn-primary" id="firstRun">Configure Plugin &rarr;</button>
-    <br>
-      To optimize performance and responsiveness, make this plugin a <a target="_blank" href="https://github.com/homebridge/homebridge/wiki/Child-Bridges">child bridge</a> once you've completed configuration.
+    <button type="button" class="btn btn-primary" id="firstRun">Configure Plugin &rarr;</button>
+    <p class="small text-muted mb-0 mt-3">To optimize performance and responsiveness, make this plugin a <a target="_blank" href="https://github.com/homebridge/homebridge/wiki/Child-Bridges">child bridge</a> once you've completed configuration.</p>
   </div>
 </div>
 <div id="menuWrapper" class="btn-group w-100 mb-0" role="group" aria-label="UI Menu" style="display: none;">
@@ -222,7 +371,7 @@
           <li>A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.</li>
           <li>An additional limit across the entire API of no more than 30 calls in any 5 minute period.</li>
         </ul>
-      <li>While the API provides the ability to suspend a zone, it does not provide the ability to resume a schedule.</li>
+      <li>Suspending every zone is an account-wide action, and so is lifting it: a resume also clears the suspension on any individual zone. With account credentials configured, an individual zone can be suspended and resumed on its own.</li>
     </ul>
 
   <h5>Support</h5>
@@ -246,6 +395,7 @@
     <p data-boot-bucket="browser" style="display: none;">Your browser doesn't support features this interface requires. Please use a current version of Safari or Chrome.</p>
     <p data-boot-bucket="delivery" style="display: none;">The interface files couldn't be retrieved from the Homebridge server. Reload the page to try again. If this keeps happening, log out of the Homebridge interface and log back in.</p>
     <p data-boot-bucket="generic" style="display: none;">An unexpected error occurred while starting the interface.</p>
+    <p data-boot-bucket="reload" style="display: none;">The settings interface was updated while this page was open, so this page is pinned to a version that is no longer installed. Reload the page to load the current version.</p>
   </div>
   <details open>
     <summary>Technical details</summary>
@@ -278,6 +428,9 @@
     let settled = false;
     let watchdog;
 
+    // The bundle stamp the first successful boot in this window pinned its importmap to. Undefined until a boot reports one; see checkStamp below.
+    let pinnedStamp;
+
     // Set an element's display by id, tolerating an absent node so a stamped region missing a panel element never throws from the monitor.
     const setDisplay = (id, value) => {
 
@@ -286,6 +439,44 @@
       if(element) {
 
         element.style.display = value;
+      }
+    };
+
+    // Reveal exactly one of the pre-rendered bucket messages, hiding the rest first so a second reveal in the same window cannot leave two messages stacked. The
+    // bucket keys are internal constants, never user input, so the selector is safe.
+    const showBucket = (bucket) => {
+
+      for(const message of document.querySelectorAll("#bootErrorMessage [data-boot-bucket]")) {
+
+        message.style.display = "none";
+      }
+
+      const chosen = document.querySelector("#bootErrorMessage [data-boot-bucket='" + bucket + "']");
+
+      if(chosen) {
+
+        chosen.style.display = "block";
+      }
+    };
+
+    // Write the technical-details lines, each assigned as plain text so untrusted content is never parsed as markup.
+    const writeDetails = (lines) => {
+
+      const details = document.getElementById("bootErrorDetails");
+
+      if(!details) {
+
+        return;
+      }
+
+      details.textContent = "";
+
+      for(const line of lines) {
+
+        const row = document.createElement("div");
+
+        row.textContent = line;
+        details.appendChild(row);
       }
     };
 
@@ -312,31 +503,9 @@
 
       stop();
 
-      // Reveal the one pre-rendered message the failing stage's bucket names; the bucket keys are internal constants, never user input, so the selector is safe.
-      const chosen = document.querySelector("#bootErrorMessage [data-boot-bucket='" + (buckets[stage] ?? "generic") + "']");
-
-      if(chosen) {
-
-        chosen.style.display = "block";
-      }
-
-      const details = document.getElementById("bootErrorDetails");
-
-      if(details) {
-
-        // The error text is untrusted, so each detail line is assigned as plain text through textContent and is never parsed as markup.
-        const lines = [ "Stage: " + stage, "Error: " + ((error instanceof Error) ? error.message : String(error)), "Browser: " + navigator.userAgent ];
-
-        details.textContent = "";
-
-        for(const line of lines) {
-
-          const row = document.createElement("div");
-
-          row.textContent = line;
-          details.appendChild(row);
-        }
-      }
+      // Reveal the one pre-rendered message the failing stage's bucket names.
+      showBucket(buckets[stage] ?? "generic");
+      writeDetails([ "Stage: " + stage, "Error: " + ((error instanceof Error) ? error.message : String(error)), "Browser: " + navigator.userAgent ]);
 
       setDisplay("bootSlowNotice", "none");
       setDisplay("pageBootError", "block");
@@ -356,10 +525,50 @@
       setDisplay("pageBootError", "none");
     };
 
+    /* Compare this boot's bundle stamp against the one an earlier boot in this window pinned its importmap to, and answer whether the boot may proceed.
+     *
+     * The settings frame outlives a single boot: a panel re-open runs the loader again in the same window, while the importmap the FIRST run injected is the one
+     * still in force - a browser applies the first map and every bare specifier resolves through it for the document's life. That is harmless until the bundle is
+     * regenerated underneath the page, at which point the pinned subdir no longer exists on disk: the re-run would fetch the new manifest, inject a map nothing
+     * consults, and import an entry whose every bare-specifier request 404s, leaving the user on the previous bundle's already-loaded code with no sign anything
+     * was wrong. Stopping here is the only honest outcome, because no amount of retrying inside this document can reach the current bundle.
+     *
+     * The first call pins and proceeds; a later call matching the pin proceeds too, which is the ordinary re-open. A later call that differs is terminal, and it
+     * deliberately overrides settled: the earlier boot's ready() is exactly what settles a window that then goes stale, so honoring it would suppress the one
+     * message the user needs.
+     */
+    const checkStamp = (stamp) => {
+
+      if(pinnedStamp === undefined) {
+
+        pinnedStamp = stamp;
+
+        return true;
+      }
+
+      if(pinnedStamp === stamp) {
+
+        return true;
+      }
+
+      settled = true;
+
+      stop();
+
+      showBucket("reload");
+      writeDetails([ "Loaded: " + pinnedStamp, "Available: " + stamp ]);
+
+      setDisplay("bootSlowNotice", "none");
+      setDisplay("pageBootError", "block");
+      globalThis.homebridge?.hideSpinner?.();
+
+      return false;
+    };
+
     const onError = (event) => fail("uncaught error", event.error ?? event.message);
     const onRejection = (event) => fail("unhandled rejection", event.reason);
 
-    window.webUiBoot = Object.freeze({ fail, ready });
+    window.webUiBoot = Object.freeze({ checkStamp, fail, ready });
 
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
@@ -400,26 +609,32 @@
 
     const manifest = await response.json();
 
-    const importMap = {
+    // Hand the monitor this boot's bundle stamp before injecting anything. In a window that already booted, the importmap in force is the first run's, so a stamp
+    // that no longer matches means the bundle was regenerated underneath this document and nothing injected now could reach it; the monitor shows the
+    // needs-reload state and this boot stops rather than half-loading against a subdir that is gone.
+    if(window.webUiBoot.checkStamp(manifest.subdir)) {
 
-      imports: {
+      const importMap = {
 
-        "./hydrawise-config.mjs": bust("./hydrawise-config.mjs"),
-        "./hydrawise-display.mjs": bust("./hydrawise-display.mjs"),
-        "./ui.mjs": bust("./ui.mjs"),
-        "homebridge-plugin-utils/": new URL("./lib/" + manifest.subdir + "/", import.meta.url).href
-      }
-    };
+        imports: {
 
-    const mapScript = document.createElement("script");
+          "./hydrawise-config.mjs": bust("./hydrawise-config.mjs"),
+          "./hydrawise-display.mjs": bust("./hydrawise-display.mjs"),
+          "./ui.mjs": bust("./ui.mjs"),
+          "homebridge-plugin-utils/": new URL("./lib/" + manifest.subdir + "/", import.meta.url).href
+        }
+      };
 
-    mapScript.type = "importmap";
-    mapScript.textContent = JSON.stringify(importMap);
-    document.head.appendChild(mapScript);
+      const mapScript = document.createElement("script");
 
-    stage = "import";
+      mapScript.type = "importmap";
+      mapScript.textContent = JSON.stringify(importMap);
+      document.head.appendChild(mapScript);
 
-    await import("./ui.mjs");
+      stage = "import";
+
+      await import("./ui.mjs");
+    }
   } catch(error) {
 
     // The monitor owns the on-page display, so after classifying we report and swallow: rethrowing would only add a duplicate uncaught error to the console the

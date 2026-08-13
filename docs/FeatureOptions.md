@@ -46,9 +46,11 @@ Options whose key ends in `=<value>` take a value - replace `=<value>` with your
 
 #### <A NAME="account"></A>Account feature options.
 
-| Option                                                 | Description
-|--------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Account.ApiKey"></A>`Account.ApiKey=<value>`  | The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website. **(default: none)**. <BR>*Configurable at globally, across every controller.*
+| Option                                                     | Description
+|------------------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Account.ApiKey"></A>`Account.ApiKey=<value>`      | The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website. **(default: none)**. <BR>*Configurable at globally, across every controller.*
+| <A NAME="Account.Username"></A>`Account.Username=<value>`  | The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features, currently the real model name and firmware version of each controller in HomeKit. **(default: none)**. <BR>*Configurable at globally, across every controller.*
+| <A NAME="Account.Password"></A>`Account.Password=<value>`  | The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features, currently the real model name and firmware version of each controller in HomeKit. **(default: none)**. <BR>*Configurable at globally, across every controller.*
 
 #### <A NAME="device"></A>Device feature options.
 
