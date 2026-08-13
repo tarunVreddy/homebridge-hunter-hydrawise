@@ -26,8 +26,8 @@ import util from "node:util";
  * suspendedUntil is a DateTime object rather than a scalar, so it takes a subselection; its timestamp is the absolute instant a suspension lifts. Availability
  * is read from the controller's nested status block, leaving the flat sibling field of the same name unread.
  */
-const ACCOUNT_QUERY = "query { me { controllers { id status { online } hardware { model { description } firmware { type version } } " +
-  "zones { id status { suspendedUntil { timestamp } } } sensors { model { sensorType } status { active } zones { id } } } } }";
+const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hardware { model { description } firmware { type version } } " +
+  "zones { id name status { suspendedUntil { timestamp } } } sensors { model { sensorType } status { active } zones { id } } } } }";
 
 // The sentence every failure of the whole-account read is reported under. Both sites that can report one - the pacing wait and the transport itself - read it from
 // here, so the operator sees the same words whichever of them failed.

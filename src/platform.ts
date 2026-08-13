@@ -328,9 +328,27 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       if(entry) {
 
-        this.configuredDevices[this.hap.uuid.generate(controller.controller_id.toString())]?.applyFacts({ facts: entry, fetchedAt });
+        this.configuredController(controller)?.applyFacts({ facts: entry, fetchedAt });
       }
     }
+
+    /* Recompose the denormalized account roster now that every controller has this tick's facts, and hand it to each of them. A configured controller answers for
+     * its own name - the account's where it has one - while a controller this plugin never built can only be described by the wire, and the roster carries both
+     * kinds because the webUI lists the whole account from any one accessory. Each controller writes and flushes only when its own copy actually moved.
+     */
+    const roster = this.account.controllers.map(controller => this.configuredController(controller)?.identity ?? controllerIdentity(controller));
+
+    for(const controller of this.account.controllers) {
+
+      this.configuredController(controller)?.applyRoster(roster);
+    }
+  }
+
+  // The controller this plugin built for a wire controller, or undefined for one the user disabled or that discovery never reached. The UUID derivation is the
+  // controller accessory's own, stated here once so every cadence that reaches from a wire controller to its runtime object agrees on how they correlate.
+  private configuredController(controller: HydrawiseControllerConfig): HydrawiseController | undefined {
+
+    return this.configuredDevices[this.hap.uuid.generate(controller.controller_id.toString())];
   }
 
   /* Whether discovery should sweep an accessory away, dispatched by accessory KIND. Each kind answers to a different authority, which is the whole reason this is
@@ -458,8 +476,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return null;
     }
 
+    /* The name a FRESH accessory is created under: the user's Name option when they set one, and the name Hydrawise reports otherwise. A cached accessory keeps
+     * whatever display name it came back with, which is what keeps discovery from renaming a controller behind the synchronization opt-out's back.
+     *
+     * The read presents the serial and nothing else, which is the single-id rule every runtime reader of this option keeps: the option resolves at the controller
+     * and the zone alike, so a read carrying a second id would answer with something written for another scope.
+     */
+    const nameOverride = this.featureOptions.value("Device.Name", controller.serial_number)?.trim();
+
     // It's a new device - let's add it to HomeKit.
-    accessory ??= this.addAccessory(controller.name, uuid);
+    accessory ??= this.addAccessory(sanitizeName(nameOverride?.length ? nameOverride : controller.name), uuid);
 
     // Inform the user.
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
@@ -620,7 +646,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
          * differ every poll and flush every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache
          * entry heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write.
          */
-        const ownerController = controllerIdentity(controller);
+        // The owner stamp reads the controller's own identity where this plugin built one, so a zone accessory names its owner exactly as that owner names itself
+        // - the account's full name included. The wire projection is the floor for a controller no runtime object answers for.
+        const ownerController = this.configuredController(controller)?.identity ?? controllerIdentity(controller);
         const context = accessory.context;
 
         if(!isZoneAccessoryContext(context) || !sameControllerIdentity(context.ownerController, ownerController) ||

@@ -562,7 +562,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
      */
     const cells = [ { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: undefined }), label: "an undefined suspension" },
       { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: null }), label: "a null suspension" },
-      { expected: "suspended", facts: { sensorStopped: null, suspendedUntil: 0 }, label: "a suspension at epoch zero" } ];
+      { expected: "suspended", facts: { name: null, sensorStopped: null, suspendedUntil: 0 }, label: "a suspension at epoch zero" } ];
 
     for(const { expected, facts, label } of cells) {
 
@@ -600,7 +600,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
     // The precedence pin. Suspension is the longer-lived, user-created fact, and the sensor's claim returns on its own the moment the suspension clears.
     const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
-      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, { sensorStopped: true, suspendedUntil: SUSPENDED_UNTIL } ]] }) });
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, { name: null, sensorStopped: true, suspendedUntil: SUSPENDED_UNTIL } ]] }) });
 
     assert.equal(projection.zones[0]?.state, "suspended", "suspension outranks the sensor claim when both apply to one zone");
   });

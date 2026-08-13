@@ -414,7 +414,7 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
   // The facts one refresh reports for the single covered zone: what the sensor says, and whether a suspension stands.
   function facts(sensorStopped: boolean, suspendedUntil: number | null): HydrawiseControllerV2Facts {
 
-    return makeV2Facts({ zones: [[ 700001, { sensorStopped, suspendedUntil } ]] });
+    return makeV2Facts({ zones: [[ 700001, { name: null, sensorStopped, suspendedUntil } ]] });
   }
 
   /* Drive a controller whose single zone is covered by a rain sensor and carries the sentinel, hand it a first facts snapshot, let a poll settle, then hand it a

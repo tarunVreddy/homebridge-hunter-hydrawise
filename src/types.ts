@@ -185,6 +185,7 @@ export interface HydrawiseV2HardwareBlock {
 export interface HydrawiseV2Zone {
 
   id?: number;
+  name?: string;
   status?: { suspendedUntil?: Nullable<{ timestamp?: number }> };
 }
 
@@ -212,6 +213,7 @@ export interface HydrawiseV2Controller {
 
   hardware?: HydrawiseV2HardwareBlock;
   id?: number;
+  name?: Nullable<string>;
   sensors?: HydrawiseV2Sensor[];
   status?: { online?: boolean };
   zones?: HydrawiseV2Zone[];
@@ -316,22 +318,30 @@ export function controllerHardware(hardware: HydrawiseV2HardwareBlock | undefine
   return { firmware, model };
 }
 
-/* What the account-credentialed API knows about a single zone that the key-based API cannot express: whether a rain-class sensor is stopping it right now, and
- * the instant any suspension on it lifts.
+/* What the account-credentialed API knows about a single zone that the key-based API cannot express: the zone's full name, whether a rain-class sensor is stopping
+ * it right now, and the instant any suspension on it lifts.
  *
- * Both fields distinguish three answers rather than two, and the null arm is the one that carries the weight. A null sensorStopped means the account read
+ * Each field distinguishes three answers rather than two, and the null arm is the one that carries the weight. A null sensorStopped means the account read
  * carried no usable sensor answer for this zone, which routes the zone back to the v1 group inference; a false means the sensors are live and quiet, which
  * retires that inference outright. Reading either as a plain boolean would turn "we do not know" into "it is not stopped" and silently suppress a real rain
  * delay. suspendedUntil is an absolute epoch instant so it holds still between polls, and null simply means no suspension stands.
+ *
+ * The name is the one field that is not about state at all. The key-based API truncates a zone name at roughly fifteen characters - "Backyard Plante" for a zone
+ * the account calls "Backyard Planters Drip" - and the account API carries it whole, so a null here means only that no usable name arrived and the wire's own
+ * truncated form still stands.
  */
 export interface HydrawiseZoneV2Facts {
 
+  name: Nullable<string>;
   sensorStopped: Nullable<boolean>;
   suspendedUntil: Nullable<number>;
 }
 
-/* What the account-credentialed API knows about a whole controller: its hardware, whether Hydrawise can currently reach it, and the per-zone facts above keyed
- * by the zone id v1 and v2 agree about.
+/* What the account-credentialed API knows about a whole controller: its hardware, its own full name, whether Hydrawise can currently reach it, and the per-zone
+ * facts above keyed by the zone id v1 and v2 agree about.
+ *
+ * The name follows the zone name's rule at the controller grain, and the null arm means the same thing: no usable name arrived, so whatever the key-based wire
+ * reported still stands. Reading it as an empty string instead would blank a controller's label on an answer that simply said nothing.
  *
  * This shape is IN MEMORY only, on the same terms and for the same reason as the hardware shape above. What gets persisted is the CLASSIFIED projection these
  * facts feed, never the facts themselves - one store for a zone's state rather than two that eventually disagree about it.
@@ -339,6 +349,7 @@ export interface HydrawiseZoneV2Facts {
 export interface HydrawiseControllerV2Facts {
 
   hardware: Nullable<HydrawiseControllerHardware>;
+  name: Nullable<string>;
   online: Nullable<boolean>;
   zones: Map<number, HydrawiseZoneV2Facts>;
 }
@@ -369,11 +380,19 @@ export function controllerV2Facts(controller: HydrawiseV2Controller): HydrawiseC
     // where a present one is a real answer that clears or reasserts a zone's state.
     const covering = sensors.filter(sensor => (sensor.zones ?? []).some(covered => covered.id === zone.id));
 
-    zones.set(zone.id, { sensorStopped: sensors.length ? covering.some(sensor => sensor.status?.active === true) : null,
+    // A name is trimmed and then required to be non-empty, because an empty or whitespace-only answer is not a name the display can use - it composes null, which
+    // leaves the wire's own name standing rather than blanking a zone's label.
+    const name = zone.name?.trim();
+
+    zones.set(zone.id, { name: name?.length ? name : null, sensorStopped: sensors.length ? covering.some(sensor => sensor.status?.active === true) : null,
       suspendedUntil: zone.status?.suspendedUntil?.timestamp ?? null });
   }
 
-  return { hardware: controllerHardware(controller.hardware), online: controller.status?.online ?? null, zones };
+  // The controller's own name normalizes exactly as a zone's does above: trimmed, and required to be non-empty, so an answer with nothing usable in it composes
+  // null and leaves the wire's name standing rather than blanking the controller's label.
+  const name = controller.name?.trim();
+
+  return { hardware: controllerHardware(controller.hardware), name: name?.length ? name : null, online: controller.status?.online ?? null, zones };
 }
 
 /* The v2 client's OAuth token state, as a discriminated union so the access token, its expiry, and any refresh in flight can never disagree with one another. One

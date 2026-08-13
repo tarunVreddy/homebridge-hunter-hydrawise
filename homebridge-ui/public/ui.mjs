@@ -23,9 +23,9 @@ const DEVICE_OPTION_KEY = expandOption(DEVICE_CATEGORY, "").toLowerCase();
 // The two floor-entry prefixes the Device option can carry: an explicit enable or an explicit disable of a whole controller.
 const DEVICE_FLOOR_PREFIXES = [ "disable." + DEVICE_OPTION_KEY + ".", "enable." + DEVICE_OPTION_KEY + "." ];
 
-// The canonical option name of the zone-scoped name override, derived through the engine's own grammar for the same reason the floor key is: a rename of the
-// option cannot silently break the lookup.
-const ZONE_NAME_OPTION = expandOption(DEVICE_CATEGORY, "Name");
+// The canonical option name of the custom-name override, derived through the engine's own grammar for the same reason the floor key is: a rename of the option
+// cannot silently break the lookup. One option answers at both grains - a controller and a zone alike - so one constant names it.
+const NAME_OPTION = expandOption(DEVICE_CATEGORY, "Name");
 
 // The guidance sentences the controller notice states render through the infoPanel. Complete sentences, shown verbatim to the user.
 const NOTICE_DISABLED = "This controller is disabled in your Homebridge configuration, so its zones are not listed. " +
@@ -142,6 +142,20 @@ const getEngine = async (config) => {
 // Ask the feature-option engine whether the runtime publishes a controller, using the runtime's exact gate call so the webUI and the plugin cannot disagree
 // about a controller's enabled state.
 const isControllerEnabled = async (config, serialNumber) => (await getEngine(config)).test(DEVICE_CATEGORY, undefined, serialNumber);
+
+/* Read the name a user configured for one thing - a controller named by its serial, or a zone named by its relay id - normalizing an unset, empty, or
+ * whitespace-only value to undefined so a caller can default with ??, exactly as the runtime's own readers normalize.
+ *
+ * The id is the WHOLE lookup, deliberately. The Name option resolves at the controller and the zone alike, so a read that presented both a zone id and its
+ * controller's serial would answer an unnamed zone with the controller's name, and the sidebar would show every zone renamed. One id per read is what makes that
+ * impossible here and in the runtime both.
+ */
+const readOverride = (engine, id) => {
+
+  const value = engine.value(NAME_OPTION, id);
+
+  return ((typeof value === "string") && value.trim().length) ? value.trim() : undefined;
+};
 
 // Case-fold a serial for cross-source identity comparison, matching the runtime feature-option engine's serial lowercasing so the webUI and the plugin agree on a
 // controller's identity.
@@ -687,7 +701,24 @@ const getDevices = async (controller, { config } = {}) => {
         notice = NOTICE_UNPUBLISHED;
       }
 
-      return { devices: [{ kind: "controller", name: controller.name, notice, serialNumber: controller.serialNumber, sidebarGroup: "hidden" }], error: "" };
+      /* The controller's own name reads the configured override first here exactly as the healthy listing below reads it, so a controller the plugin cannot list
+       * zones for is still shown under the name its owner gave it.
+       *
+       * The read takes a try/catch of ITS OWN rather than joining the branch's. This branch escalates an engine failure to the error channel, which is the right
+       * answer for the classification above it - a notice derived from a failed gate read would be a guess. A name is different: falling back to the identity
+       * name is a truthful answer, so a failure here must not turn a calm listing into a connection-error view.
+       */
+      let name;
+
+      try {
+
+        name = readOverride(await getEngine(config), controller.serialNumber);
+      } catch {
+
+        name = undefined;
+      }
+
+      return { devices: [{ kind: "controller", name: name ?? controller.name, notice, serialNumber: controller.serialNumber, sidebarGroup: "hidden" }], error: "" };
     } catch(error) {
 
       return { devices: [], error: (error instanceof Error) ? error.message : String(error) };
@@ -695,11 +726,12 @@ const getDevices = async (controller, { config } = {}) => {
   }
 
   /* One consult answers every question this listing asks of the configuration: whether the controller is published, whether each zone is published, and what name
-   * the user has set for each zone. A disabled controller can still list zones (a refresh stored them, or its accessory survives until the next restart), so the
-   * listing carries the disabled notice alongside the zone count. The whole consult is best-effort and all-or-nothing: a catalog or engine failure is treated as no
-   * consult at all - the controller and every zone read as enabled, and every zone label falls through to the arms below - so a failure can never break a healthy
-   * listing, and the consumers cannot end up disagreeing about whether the engine answered.
+   * the user has set for the controller and for each zone. A disabled controller can still list zones (a refresh stored them, or its accessory survives until the
+   * next restart), so the listing carries the disabled notice alongside the zone count. The whole consult is best-effort and all-or-nothing: a catalog or engine
+   * failure is treated as no consult at all - the controller and every zone read as enabled, and every label falls through to the arms below - so a failure can
+   * never break a healthy listing, and the consumers cannot end up disagreeing about whether the engine answered.
    */
+  let controllerOverride;
   let enabled = true;
   const overrides = new Map();
   const zoneEnabled = new Map();
@@ -710,13 +742,17 @@ const getDevices = async (controller, { config } = {}) => {
 
     enabled = engine.test(DEVICE_CATEGORY, undefined, controller.serialNumber);
 
+    controllerOverride = readOverride(engine, controller.serialNumber);
+
     for(const zone of zones) {
 
-      const override = engine.value(ZONE_NAME_OPTION, zone.relayId.toString(), controller.serialNumber);
+      // The zone's own name, asked with the relay id and NOTHING else. The Name option resolves at the controller as well as the zone, so a read that also
+      // presented the serial would answer every unnamed zone with its controller's name - the runtime's readers keep the same single-id rule for the same reason.
+      const override = readOverride(engine, zone.relayId.toString());
 
-      if((typeof override === "string") && override.trim().length) {
+      if(override) {
 
-        overrides.set(zone.relayId, override.trim());
+        overrides.set(zone.relayId, override);
       }
 
       // The zone-scope gate, asked with the relay id in the device position and the controller serial in the controller position - the runtime's own scoping
@@ -725,6 +761,7 @@ const getDevices = async (controller, { config } = {}) => {
     }
   } catch {
 
+    controllerOverride = undefined;
     enabled = true;
     overrides.clear();
     zoneEnabled.clear();
@@ -775,7 +812,11 @@ const getDevices = async (controller, { config } = {}) => {
   // never enriched, and the panel renders those cells only when it is present.
   const hardware = cachedControllerHardware(matched);
 
-  const controllerEntry = { hardware, kind: "controller", name: controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
+  /* The controller row's own name: the user's configured override when set, and the identity name otherwise. There is deliberately no cached-name arm between
+   * them, unlike a zone's label above - the runtime resyncs the persisted identity in the same pass that renames the accessory, so the identity IS the name
+   * HomeKit last showed, and a middle arm reading it a second way could only disagree.
+   */
+  const controllerEntry = { hardware, kind: "controller", name: controllerOverride ?? controller.name, ...(enabled ? {} : { notice: NOTICE_DISABLED_LISTED }),
     schedule: schedule ?? undefined, serialNumber: controller.serialNumber, sidebarGroup: "hidden", zoneCount: zoneRows.length,
     zoneNames: Object.fromEntries(zones.map((zone) => [ zone.relayId.toString(), displayNames.get(zone.relayId) ])) };
 

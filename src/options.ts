@@ -51,6 +51,11 @@ export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.Suspe
 // so asking for a boolean option's value, or for a value option the zone level does not admit, is a type error.
 export type HydrawiseZoneValueOption = "Device.Name";
 
+// The controller-scopable value-centric option names, the controller grain's mirror of the union above. The two readers are separate for the same reason the two
+// boolean readers are: each narrows against the grain it addresses, so handing a zone id where a controller serial belongs is a type error rather than a lookup
+// that quietly resolves the wrong entry.
+export type HydrawiseControllerValueOption = "Device.Name";
+
 // The globally-scoped value-centric option names - the account credentials and the two MQTT settings the plugin resolves once at startup. The platform's
 // consolidated resolver narrows against this, so asking it for an option that carries no global value is a type error. The two Mqtt members name the library
 // factory's published entries and are bound to them by convention exactly as the unions above are bound to the catalog entries below; renaming either of those
@@ -104,11 +109,11 @@ const accountOptions: HydrawiseFeatureOption[] = [
 const deviceOptions: HydrawiseFeatureOption[] = [
 
   { default: true, description: "Make this device available in HomeKit.", name: "", scopes: [ "controller", "device", "global" ] },
-  { default: false, defaultValue: "", description: "Custom HomeKit name for this zone. When unset, the name reported by Hydrawise is used.", inputSize: 30, name: "Name", scopes: ["device"] },
+  { default: false, defaultValue: "", description: "Custom HomeKit name for this zone or controller. When unset, the name reported by Hydrawise is used.", inputSize: 30, name: "Name", scopes: [ "controller", "device" ] },
   { default: false, description: "Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated.", name: "Standalone", scopes: [ "controller", "device", "global" ] },
   { default: false, description: "Enable a switch accessory that suspends and resumes every zone on the controller at once.", name: "Suspend.All", scopes: [ "controller", "global" ] },
   { default: false, description: "Enable a switch accessory that suspends and resumes an individual zone. Requires your Hydrawise account login (enhanced features).", name: "Suspend.Zone", scopes: [ "controller", "device", "global" ] },
-  { default: true, description: "Synchronize zone names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
+  { default: true, description: "Synchronize zone and controller names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
 ];
 
 // Logging options.

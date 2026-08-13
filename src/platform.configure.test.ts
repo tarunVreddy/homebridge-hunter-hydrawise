@@ -42,6 +42,51 @@ describe("HydrawisePlatform configure", () => {
     assert.ok(loggedAt(lines(), "info", "Discovered irrigation controller"), "discovery should log the controller it found");
   });
 
+  test("registers a fresh accessory under the user's configured name", async (t) => {
+
+    /* Discovery mints the accessory's display name, so it is the only cadence that can establish it - a synchronization opt-out means the runtime never renames
+     * the accessory afterwards, and the configured name would otherwise be unreachable for the life of that accessory.
+     *
+     * The read presents the serial alone, which is the single-id rule every runtime reader of this option keeps.
+     */
+    const { emit, registered } = buildPlatform({ options: ["Enable.Device.Name.SN0A1B2C3D4=Garden Controller"] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (registered.length >= 1) ? true : undefined);
+
+    assert.equal(registered[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
+  });
+
+  test("leaves a cached accessory's display name alone at discovery, whatever the Name option says", async (t) => {
+
+    /* Discovery establishes a name, it never corrects one. A cached accessory comes back under the name it was flushed with, and bringing it into line is the
+     * rename step's job on the poll cadence, under the synchronization gate the user controls.
+     *
+     * Synchronization is turned OFF here so that gate can never fire, which leaves discovery's own behavior as the only thing the assertions can be reading.
+     * With it on, a poll landing mid-assertion could rename the accessory for an entirely legitimate reason and the pin would be reading the clock.
+     */
+    const { emit, platform, registered } = buildPlatform({ options: [ "Enable.Device.Name.SN0A1B2C3D4=Garden Controller",
+      "Disable.Device.SyncName.SN0A1B2C3D4" ] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+    const cached = seedAccessory(platform, "Test Controller", "500001");
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (cached.getService(Service.IrrigationSystem) !== undefined) ? true : undefined);
+
+    assert.equal(registered.length, 0, "the cached accessory is reused rather than registered anew");
+    assert.equal(cached.displayName, "Test Controller", "and discovery does not rename it");
+  });
+
   test("short-circuits a second discovery pass without re-registering the controller", async (t) => {
 
     const { emit, lines, registered } = buildPlatform();

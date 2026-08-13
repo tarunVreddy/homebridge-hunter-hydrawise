@@ -404,8 +404,10 @@ describe("HydrawiseController program mode reads the sensor, not the classificat
 
     t.after(() => h.abort());
 
-    h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id,
-      { sensorStopped: true, suspendedUntil: (zone.relay_id === 700019) ? SUSPENDED_UNTIL : null } ]) }), fetchedAt: Math.floor(Date.now() / 1000) });
+    const zones = sentinelZoneMatrix.map(zone => [ zone.relay_id,
+      { name: null, sensorStopped: true, suspendedUntil: (zone.relay_id === 700019) ? SUSPENDED_UNTIL : null } ] as const);
+
+    h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt: Math.floor(Date.now() / 1000) });
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
     await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);

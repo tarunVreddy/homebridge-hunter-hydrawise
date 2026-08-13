@@ -79,8 +79,9 @@ const REFUSAL_SUMMARY = "This zone cannot be suspended right now.";
 
 // The zone block as the account query returns it: one zone under a suspension, one under none. The unsuspended zone answers a NULL suspendedUntil rather than
 // omitting the field, which is the shape the live capture records and the one that has to read as "not suspended" rather than as "unknown".
-const CAPTURED_ZONES = [ { id: QUIET_ZONE_ID, status: { suspendedUntil: null } },
-  { id: SUSPENDED_ZONE_ID, status: { suspendedUntil: { timestamp: SUSPENDED_UNTIL, value: "Wed, 01 May 30 23:59:59 -0500" } } } ];
+const CAPTURED_ZONES = [ { id: QUIET_ZONE_ID, name: "Parkway North", status: { suspendedUntil: null } },
+  { id: SUSPENDED_ZONE_ID, name: "Sideyard Vegetable Garden",
+    status: { suspendedUntil: { timestamp: SUSPENDED_UNTIL, value: "Wed, 01 May 30 23:59:59 -0500" } } } ];
 
 /* The sensor block as the live sensors capture records it, including the unread fields. The sensorType value is the live one - the owner's rain and freeze sensor
  * reports LEVEL_CLOSED - so a filter that matched some other spelling would compose nothing here rather than passing against a fixture trimmed to the right answer.
@@ -376,9 +377,12 @@ describe("HydrawiseV2Client account facts", () => {
 
     await harness.client.fetchAccountFacts();
 
-    // Every selection the enrichment actually consumes, named individually so dropping one is a failure here rather than a field that silently reads as absent.
-    for(const selection of [ "id", "status { online }", "model { description }", "firmware { type version }", "suspendedUntil { timestamp }",
-      "model { sensorType }", "status { active }" ]) {
+    /* Every selection the enrichment actually consumes, named individually so dropping one is a failure here rather than a field that silently reads as absent.
+     * The two name selections are named with the block that carries each, because a bare "name" would be satisfied by either one and could not tell a dropped
+     * controller name from a dropped zone name.
+     */
+    for(const selection of [ "id", "controllers { id name", "zones { id name", "status { online }", "model { description }", "firmware { type version }",
+      "suspendedUntil { timestamp }", "model { sensorType }", "status { active }" ]) {
 
       assert.ok(asked.includes(selection), "the account query asks for " + selection);
     }
@@ -391,6 +395,26 @@ describe("HydrawiseV2Client account facts", () => {
      */
     assert.ok(!(/\bmode\b/).test(asked), "the sensor mode that answers a server error is never selected");
     assert.ok(!asked.includes("lastRun") && !asked.includes("nextRun"), "the unproven run fields are never selected");
+  });
+
+  test("asks the controller itself for its name, in the selection the live capture proves is a plain scalar there", async () => {
+
+    const queries: string[] = [];
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programGraph(agent, record, ACCOUNT_BODY, queries);
+    });
+
+    await harness.client.fetchAccountFacts();
+
+    /* The controller selection as it goes on the wire, pinned as text. The name is what the key-based API truncates, and the 2026-08-09 capture records it at the
+     * controller level as a plain scalar - so it takes no subselection, and asking for it with one would fail the whole query rather than just this field. A
+     * substring naming the block is what tells this selection from the zone block's own name a few characters later.
+     */
+    assert.equal(queries.length, 1, "one account query goes on the wire");
+    assert.ok(queries[0]?.includes("controllers { id name status { online }"), "the controller selection asks for its own name beside its id");
   });
 
   test("parses the captured whole-account answer into the facts shape", async () => {
@@ -422,6 +446,97 @@ describe("HydrawiseV2Client account facts", () => {
     // The covered zone is the one the sensor names, and the sensor reads tripped, so exactly that zone is sensor-stopped while its uncovered sibling is not.
     assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "the zone the tripped sensor covers reads as stopped");
     assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.sensorStopped, false, "a zone no tripped sensor covers reads as not stopped, rather than as unknown");
+  });
+
+  test("carries each zone's full name, and composes null for any answer that is not one", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    const entry = (await harness.client.fetchAccountFacts())?.get(1058515);
+
+    // The account's own name for each zone, landing on that zone's own entry. The key-based wire truncates these at roughly fifteen characters, which is the whole
+    // reason the enrichment reaches for them.
+    assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.name, "Parkway North", "a zone carries the name the account reports for it");
+    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.name, "Sideyard Vegetable Garden", "including one longer than the key-based API can express");
+  });
+
+  test("carries the controller's own name, trimmed, and composes null for any answer that is not one", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    // The name the live capture records for the owner's controller, landing on that controller's own facts entry.
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.name, "Home", "a controller carries the name the account reports for it");
+
+    /* Every way an answer can carry no usable controller name, plus the incidental whitespace one that IS usable once trimmed. They degrade exactly as a zone's
+     * name does, and for the same two reasons: null leaves the wire's own name standing where an empty string would blank the controller's label, and trimming
+     * keeps the account and key-based answers comparing equal rather than churning the accessory cache on every refresh.
+     *
+     * The absent case states the name as undefined, which never survives serialization to the wire - the reply the client parses simply carries no name field.
+     */
+    const cases = [ { expected: null, label: "an absent name", name: undefined }, { expected: null, label: "an empty name", name: "" },
+      { expected: null, label: "a whitespace-only name", name: "   " }, { expected: "Home", label: "a padded name", name: "  Home  " } ];
+
+    for(const scenario of cases) {
+
+      const scenarioHarness = makeV2Harness((agent, record) => {
+
+        programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+        programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, name: scenario.name, sensors: CAPTURED_SENSORS,
+          status: { online: true }, zones: CAPTURED_ZONES }] } } });
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const facts = await scenarioHarness.client.fetchAccountFacts();
+
+      assert.equal(facts?.get(1058515)?.name, scenario.expected, scenario.label + " composes " + JSON.stringify(scenario.expected));
+    }
+  });
+
+  test("a name the account cannot usefully answer composes null rather than an empty display", async () => {
+
+    /* Every way an answer can carry no usable name, asserted together because they have to degrade identically: no name field at all, an empty string, and one
+     * that is nothing but whitespace. Each composes null, which leaves the wire's own name standing - where an empty string would blank a zone's label outright.
+     */
+    const cases = [ { label: "an absent name", zone: { id: QUIET_ZONE_ID, status: { suspendedUntil: null } } },
+      { label: "an empty name", zone: { id: QUIET_ZONE_ID, name: "", status: { suspendedUntil: null } } },
+      { label: "a whitespace-only name", zone: { id: QUIET_ZONE_ID, name: "   ", status: { suspendedUntil: null } } } ];
+
+    for(const scenario of cases) {
+
+      const harness = makeV2Harness((agent, record) => {
+
+        programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+        programReply(agent, record, GRAPH_PATH,
+          { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: CAPTURED_SENSORS, status: { online: true }, zones: [scenario.zone] }] } } });
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const facts = await harness.client.fetchAccountFacts();
+
+      assert.equal(facts?.get(1058515)?.zones.get(QUIET_ZONE_ID)?.name, null, scenario.label + " composes null");
+    }
+  });
+
+  test("a name carrying incidental whitespace is trimmed to what the display will use", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, { data: { me: { controllers: [{ ...CAPTURED_CONTROLLER, sensors: CAPTURED_SENSORS, status: { online: true },
+        zones: [{ id: QUIET_ZONE_ID, name: "  Parkway North  ", status: { suspendedUntil: null } }] }] } } });
+    });
+
+    // The key-based path trims the names it receives, so the account path trims too - otherwise the same zone would compare unequal between the two and churn the
+    // accessory cache on every refresh.
+    assert.equal((await harness.client.fetchAccountFacts())?.get(1058515)?.zones.get(QUIET_ZONE_ID)?.name, "Parkway North", "a name arrives trimmed");
   });
 
   test("a sensor reporting itself quiet composes a definite NOT-stopped rather than an unknown", async () => {

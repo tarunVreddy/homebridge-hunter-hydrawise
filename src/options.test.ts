@@ -60,8 +60,8 @@ describe("hydrawise feature options", () => {
 
     assert.ok(device && name && suspend && suspendZone && syncName && logZone, "every catalog entry the runtime names should exist");
     assert.equal(device.default, true, "the base Device option defaults to enabled");
-    assert.equal(name.default, false, "the zone name option defaults to disabled, so an unconfigured zone resolves no override at all");
-    assert.equal(name.defaultValue, "", "the zone name option is value-centric and defaults to empty, which the runtime reads as no override");
+    assert.equal(name.default, false, "the name option defaults to disabled, so an unconfigured controller or zone resolves no override at all");
+    assert.equal(name.defaultValue, "", "the name option is value-centric and defaults to empty, which the runtime reads as no override");
     assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
     assert.equal(suspendZone.default, false, "the per-zone suspension switches default to disabled");
     assert.equal(syncName.default, true, "name synchronization defaults to enabled");
@@ -75,10 +75,12 @@ describe("hydrawise feature options", () => {
 
   test("the controller-scopable options match the controller option-name union", () => {
 
-    // This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time HydrawiseControllerOption union.
-    // A catalog scope change that is not mirrored in the union surfaces here.
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName", "Log.Zone" ],
-      "every controller-scoped option should be named in the controller union");
+    /* This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time controller unions - the boolean
+     * HydrawiseControllerOption plus the value-centric HydrawiseControllerValueOption, which is where the name override is named. A catalog scope change that is
+     * not mirrored in either surfaces here.
+     */
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName",
+      "Log.Zone" ], "every controller-scoped option should be named in one of the controller unions");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
@@ -89,13 +91,26 @@ describe("hydrawise feature options", () => {
       "every zone-scoped option should be named in one of the zone unions");
   });
 
+  test("the name override declares exactly the two levels a name is meaningful at", () => {
+
+    const name = optionEntry("Device", "Name");
+
+    assert.ok(name, "the name option should exist");
+
+    /* The scopes array itself, pinned as a value rather than only through the derived sets above. The two levels are what the whole naming contract rests on: the
+     * webUI renders the row on a controller view because "controller" is declared here, the runtime's two readers each address one of these grains, and the global
+     * level is deliberately absent because one name cannot be right for everything on an account.
+     */
+    assert.deepEqual(name.scopes, [ "controller", "device" ], "a custom name is configurable at a controller and at a zone, and nowhere else");
+  });
+
   test("the globally-scopable options are the account-wide ones", () => {
 
-    // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
-    // zone, so it resolves at the zone alone.
+    // A globally-scoped option applies across every controller on the account. The name override is deliberately absent: one name cannot be right for every
+    // controller and zone at once, so it resolves at those grains alone.
     assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
       "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
-    "the zone name override is the only option that does not resolve globally");
+    "the name override is the only option that does not resolve globally");
   });
 
   test("the per-zone suspension option is named in BOTH unions its scopes declare", () => {
@@ -163,10 +178,12 @@ describe("hydrawise feature options", () => {
 
   test("describeOptionScope renders the single-scope prose", () => {
 
-    const name = optionEntry("Device", "Name");
+    // The API key is the catalog's own single-level entry: an account credential belongs to the account, so it declares the global level and nothing else, and its
+    // rendered suffix names that one level with no list joiner at all.
+    const apiKey = optionEntry("Account", "ApiKey");
 
-    assert.ok(name, "the zone name option should exist");
-    assert.equal(describeOptionScope(name), " <BR>*Configurable at each zone.*", "a zone-only option lists just the zone level");
+    assert.ok(apiKey, "the API key option should exist");
+    assert.equal(describeOptionScope(apiKey), " <BR>*Configurable at globally, across every controller.*", "a global-only option lists just the global level");
   });
 
   test("describeOptionScope omits the suffix when an option declares no scope", () => {

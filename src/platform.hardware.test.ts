@@ -16,13 +16,14 @@
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import type { CharacteristicType, TestAccessory } from "./testing/hap.helpers.ts";
 import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS } from "./settings.ts";
+import type { HydrawiseAccessoryContext, HydrawiseControllerHardware } from "./types.ts";
 import { buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce, v2BudgetOf,
   waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import type { HydrawiseControllerHardware } from "./types.ts";
+import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
+import { zoneAccessoryId } from "./types.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";
@@ -38,11 +39,30 @@ const SECOND_CONTROLLER = { ...syntheticController, controller_id: 500002, name:
 const FIRST_HARDWARE: HydrawiseControllerHardware = { firmware: "4.76", model: "HCC 38 Zones" };
 const SECOND_HARDWARE: HydrawiseControllerHardware = { firmware: "2.11", model: "Pro-HC 12 Zones" };
 
+// The name the account API reports for the synthetic controller, differing from the wire's in every word so no identity assertion can pass by coincidence, and
+// the zone promoted to an accessory of its own, whose owner stamp is the third surface that name has to reach.
+const ACCOUNT_CONTROLLER_NAME = "Backyard Irrigation System";
+
+const STANDALONE_RELAY_ID = 700001;
+
 // One accessory's information characteristic, which is what HomeKit shows the user for it. Every assertion below reads through here, so no test body has to
 // re-derive where a model or a firmware version lives.
 function informationValue(accessory: TestAccessory, characteristic: CharacteristicType): unknown {
 
   return accessory.getService(Service.AccessoryInformation)?.getCharacteristic(characteristic).value;
+}
+
+// The name carried by one of the two single-controller identities a persisted context can hold - a controller accessory's own, or a zone accessory's owner stamp
+// - read through the same confined cast every context reader in this suite's siblings uses.
+function identityName(accessory: TestAccessory | undefined, field: "controller" | "ownerController"): string | undefined {
+
+  return (accessory?.context as HydrawiseAccessoryContext | undefined)?.[field]?.name;
+}
+
+// The names in the denormalized account roster a controller accessory carries, in the account's own order.
+function rosterNames(accessory: TestAccessory | undefined): string[] {
+
+  return ((accessory?.context as HydrawiseAccessoryContext | undefined)?.controllers ?? []).map(entry => entry.name);
 }
 
 describe("HydrawisePlatform hardware enrichment gate", () => {
@@ -122,6 +142,37 @@ describe("HydrawisePlatform hardware distribution", () => {
     // them straight back.
     assert.ok(updated.some(batch => batch.includes(first)), "the first controller's accessory was flushed to the disk cache");
     assert.ok(updated.some(batch => batch.includes(second)), "the second controller's accessory was flushed to the disk cache");
+  });
+
+  test("the account's controller name reaches every persisted identity at once", async (t) => {
+
+    /* Three surfaces persist a controller's identity, each written by a different cadence: the controller's own context (the poll), the denormalized account
+     * roster every accessory carries (the refresh tick), and a standalone zone accessory's owner stamp (the poll's reconcile). They answer one question, so a
+     * name that reached only some of them would leave the webUI listing one controller under two names depending on which entry it happened to read.
+     */
+    const { emit, platform, registered } = buildPlatform({ options: [ ...CREDENTIAL_OPTIONS, "Enable.Device.Standalone." + STANDALONE_RELAY_ID.toString() ] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    installV2Client(platform, makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ name: ACCOUNT_CONTROLLER_NAME }) ]])).client);
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", fastPolling(normalSchedule()));
+
+    emit(DID_FINISH_LAUNCHING);
+
+    const zoneUuid = zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID);
+    const controllerAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()));
+    const zoneAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === zoneUuid));
+
+    // Each surface is waited on where it is written, so a slower cadence cannot make a faster one's assertion read a value that had not landed yet.
+    await waitFor(() => (identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME) ? true : undefined);
+    await waitFor(() => (identityName(zoneAccessory, "ownerController") === ACCOUNT_CONTROLLER_NAME) ? true : undefined);
+
+    assert.equal(identityName(controllerAccessory, "controller"), ACCOUNT_CONTROLLER_NAME, "the controller persists the account's name as its own identity");
+    assert.deepEqual(rosterNames(controllerAccessory), [ACCOUNT_CONTROLLER_NAME], "the account roster carries it for this controller");
+    assert.equal(identityName(zoneAccessory, "ownerController"), ACCOUNT_CONTROLLER_NAME, "and the zone accessory stamps its owner with the same name");
   });
 
   test("a failed fetch enriches nothing and leaves every placeholder standing", async (t) => {

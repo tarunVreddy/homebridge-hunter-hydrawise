@@ -419,6 +419,12 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
 export interface BuildControllerOptions extends MakeTestPlatformOptions {
 
+  /* The display name the accessory is created under. The platform's discovery path composes this from the user's Name option where one is configured, so a
+   * scenario about creation states it here rather than letting the harness diverge from the shape production actually mints. It defaults to the controller's
+   * wire name, which is what discovery composes when no override is set.
+   */
+  accessoryName?: string;
+
   controller?: Partial<HydrawiseControllerConfig>;
 
   // Program the retrieve recorder before the controller is constructed. The controller's polling loop issues its first retrieve synchronously during
@@ -451,7 +457,7 @@ export function buildController(options: BuildControllerOptions = {}): BuildCont
 
   const platformResult = makeTestPlatform(options);
   const controllerConfig: HydrawiseControllerConfig = { ...syntheticController, ...options.controller };
-  const accessory = makeTestAccessory(controllerConfig.name, testHap.uuid.generate(controllerConfig.controller_id.toString()));
+  const accessory = makeTestAccessory(options.accessoryName ?? controllerConfig.name, testHap.uuid.generate(controllerConfig.controller_id.toString()));
   const roster: HydrawiseControllerIdentity[] = options.roster ?? [{ controllerId: controllerConfig.controller_id, name: controllerConfig.name,
     serialNumber: controllerConfig.serial_number }];
 
@@ -731,10 +737,10 @@ export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseController
  *
  * @returns A fresh facts value.
  */
-export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseControllerHardware>; online?: Nullable<boolean>;
+export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseControllerHardware>; name?: Nullable<string>; online?: Nullable<boolean>;
   zones?: Iterable<readonly [ number, HydrawiseZoneV2Facts ]>; } = {}): HydrawiseControllerV2Facts {
 
-  return { hardware: overrides.hardware ?? null, online: overrides.online ?? null, zones: new Map(overrides.zones ?? []) };
+  return { hardware: overrides.hardware ?? null, name: overrides.name ?? null, online: overrides.online ?? null, zones: new Map(overrides.zones ?? []) };
 }
 
 /**
@@ -746,7 +752,7 @@ export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseController
  */
 export function makeZoneV2Facts(overrides: Partial<HydrawiseZoneV2Facts> = {}): HydrawiseZoneV2Facts {
 
-  return { sensorStopped: overrides.sensorStopped ?? null, suspendedUntil: overrides.suspendedUntil ?? null };
+  return { name: overrides.name ?? null, sensorStopped: overrides.sensorStopped ?? null, suspendedUntil: overrides.suspendedUntil ?? null };
 }
 
 // Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter. The account credentials travel as feature
