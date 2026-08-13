@@ -43,6 +43,18 @@ const CREDENTIAL_SETTINGS = {
 // degraded-mode reader and its write compose against this, so the two agree on the entry form by construction rather than by two hand-typed strings matching.
 const enabledPrefix = (option) => "enable." + option.toLowerCase() + "=";
 
+// The two action prefixes the entry grammar admits, lowercased for the same case-insensitive matching every other scan here uses.
+const ACTION_PREFIXES = [ "disable.", "enable." ];
+
+/* Feature options this plugin has RETIRED, paired with the name that supersedes each. A configured entry addressing a retired name is rewritten to its
+ * replacement once, losslessly, so a user who configured the retired name keeps the behavior they chose without touching their configuration.
+ *
+ * The table is deliberately a plain map of names rather than anything cleverer: a rename is a fact about this plugin's history, and the catalog is what decides
+ * everything else. It stays here after the transition because a configuration that has never been opened in the webUI can still be carrying the retired name years
+ * later, and an entry that has already been rewritten costs nothing to re-examine.
+ */
+const RETIRED_OPTION_RENAMES = new Map([[ "device.suspend", "Device.Suspend.All" ]]);
+
 /* Build the interpreter over an injected feature-option engine class and the option catalog the plugin's own UI server publishes. Injecting both is what keeps
  * this module import-free and testable under node against the real engine and the real catalog, rather than against a stand-in that could drift from either.
  *
@@ -75,6 +87,99 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
     }
 
     return undefined;
+  };
+
+  /* Every option key the SERVED catalog currently declares, lowercased. The composition is the feature-option engine's own rule - a category name joined to an
+   * option name by a dot, with a nameless option addressing its category alone - stated here rather than imported because this module is deliberately
+   * import-free and receives the catalog as data.
+   *
+   * This set is what makes the rename below catalog-anchored instead of hand-rolled string surgery, and it is the same composition the registered-default walk
+   * above performs, so the two readings of the catalog cannot drift.
+   */
+  const currentOptionKeys = () => {
+
+    const keys = new Set();
+
+    for(const [ category, entries ] of Object.entries(catalog?.options ?? {})) {
+
+      for(const entry of entries) {
+
+        keys.add((entry.name ? category + "." + entry.name : category).toLowerCase());
+      }
+    }
+
+    return keys;
+  };
+
+  /* Rewrite any configured entry that addresses a RETIRED option name to the name that superseded it, and answer the new array - or null when nothing needed
+   * rewriting, so a caller can tell a pass that changed something from one that did not.
+   *
+   * The matching order is what keeps a family from eating its own members. An entry that addresses a name the catalog CURRENTLY declares is always left alone,
+   * whether it addresses that option globally or at a scope, and only an entry that matches nothing current is considered for a rename. Without that ordering the
+   * naive reading - a retired name plus one trailing segment - would misread `Enable.Device.Suspend.All` as the retired option scoped to a device called "All"
+   * and rewrite it to nonsense; anchoring on the catalog means the new family's own members are recognized as themselves.
+   *
+   * A rewrite is lossless in both directions it can carry information: the action prefix is preserved as written, and so is any scope identifier, in the casing
+   * the user typed. Running twice is a no-op by construction rather than by a guard - the first pass leaves entries addressing a current key, which the first
+   * rule passes straight through.
+   */
+  const renameRetiredOptions = (options) => {
+
+    const current = currentOptionKeys();
+    let rewritten = false;
+
+    const migrated = options.map((entry) => {
+
+      if(typeof entry !== "string") {
+
+        return entry;
+      }
+
+      const lower = entry.toLowerCase();
+      const action = ACTION_PREFIXES.find((prefix) => lower.startsWith(prefix));
+
+      if(!action) {
+
+        return entry;
+      }
+
+      // The addressed key is the tail up to any value payload, since a value never participates in naming the option.
+      const tail = entry.slice(action.length);
+      const delimiter = tail.indexOf("=");
+      const key = ((delimiter === -1) ? tail : tail.slice(0, delimiter));
+      const payload = (delimiter === -1) ? "" : tail.slice(delimiter);
+      const lowerKey = key.toLowerCase();
+      const lastDot = lowerKey.lastIndexOf(".");
+      const head = (lastDot === -1) ? "" : lowerKey.slice(0, lastDot);
+
+      /* An entry addressing a current option globally is this catalog's own and passes through - the rule that recognizes the new family's members as themselves.
+       *
+       * A retired name is then matched EXACTLY, ahead of the scoped-entry reading below, because the two readings genuinely collide: every option name in this
+       * catalog sits under a category that is itself an option, so `Enable.Device.Suspend` is readable both as the retired `Device.Suspend` and as the `Device`
+       * option scoped to something called "Suspend". The retired table is what settles it, exactly as the engine's own resolution lets the catalog settle which
+       * of two candidate names a key addresses.
+       */
+      if(current.has(lowerKey)) {
+
+        return entry;
+      }
+
+      const globalRename = RETIRED_OPTION_RENAMES.get(lowerKey);
+      const scopedRename = ((head.length > 0) && !current.has(head)) ? RETIRED_OPTION_RENAMES.get(head) : undefined;
+
+      // Anything else addressing a current option at a scope, or addressing nothing this plugin knows, is left exactly as the user wrote it.
+      if((globalRename === undefined) && (scopedRename === undefined)) {
+
+        return entry;
+      }
+
+      rewritten = true;
+
+      // A global rewrite carries the replacement alone; a scoped one carries the identifier the entry named, sliced from the original so its casing survives.
+      return entry.slice(0, action.length) + (globalRename ?? (scopedRename + key.slice(lastDot))) + payload;
+    });
+
+    return rewritten ? migrated : null;
   };
 
   return {
@@ -131,14 +236,21 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
         return null;
       }
 
+      /* The retired-name rewrite is its OWN step and runs on every pass, deliberately ahead of the property scan and outside its preconditions. The property
+       * migration answers null the moment a configuration carries no legacy properties, which is true of nearly every installation that has already been through
+       * it once - gating the rename behind that scan would leave exactly those configurations carrying the retired name forever.
+       */
+      const renamed = renameRetiredOptions(Array.isArray(config.options) ? config.options : []);
       const carried = Object.entries(CONSOLIDATED_SETTINGS).filter(([property]) => config[property] !== undefined);
 
       if(!carried.length) {
 
-        return null;
+        return renamed ? { options: renamed } : null;
       }
 
-      const engine = engineFor(config);
+      // The engine reads the RENAMED array, so a pass carrying both a legacy property and a retired option name composes one array holding both migrations rather
+      // than two writers each producing a whole array and the last one winning.
+      const engine = engineFor(renamed ? { ...config, options: renamed } : config);
       const patch = {};
       let composed = false;
 
@@ -172,10 +284,14 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
         composed = true;
       }
 
-      // The entries ride the patch only when this pass actually composed one, so a config whose properties all decline stages a pure deletion.
+      // The entries ride the patch when this pass composed one, and otherwise whenever the rename rewrote something, so a config whose properties all decline
+      // stages a pure deletion and one whose only work was the rename still carries it.
       if(composed) {
 
         patch.options = engine.configuredOptions;
+      } else if(renamed) {
+
+        patch.options = renamed;
       }
 
       return patch;

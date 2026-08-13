@@ -279,7 +279,7 @@ export class HydrawiseController {
   // Configure controller-specific settings.
   private configureHints(): boolean {
 
-    this.hints.suspendAll = this.hasFeature("Device.Suspend");
+    this.hints.suspendAll = this.hasFeature("Device.Suspend.All");
 
     // Surface a name-synchronization opt-out at startup. Synchronization is read live on each poll rather than cached in a hint, since a zone can opt out
     // independently of its controller; this line reports the controller-scope answer, which is the one that governs when no zone says otherwise.
@@ -717,7 +717,7 @@ export class HydrawiseController {
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
 
-    this.platform.featureOptions.logFeature("Device.Suspend", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
+    this.platform.featureOptions.logFeature("Device.Suspend.All", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
 
     return true;
   }

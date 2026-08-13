@@ -52,7 +52,7 @@ describe("hydrawise feature options", () => {
 
     const device = optionEntry("Device", "");
     const name = optionEntry("Device", "Name");
-    const suspend = optionEntry("Device", "Suspend");
+    const suspend = optionEntry("Device", "Suspend.All");
     const syncName = optionEntry("Device", "SyncName");
     const logZone = optionEntry("Log", "Zone");
 
@@ -69,7 +69,7 @@ describe("hydrawise feature options", () => {
 
     // This is the runtime half of the scope-union contract: the set derived from the catalog's scopes must equal the compile-time HydrawiseControllerOption union.
     // A catalog scope change that is not mirrored in the union surfaces here.
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Standalone", "Device.Suspend.All", "Device.SyncName", "Log.Zone" ],
       "every controller-scoped option should be named in the controller union");
   });
 
@@ -85,7 +85,7 @@ describe("hydrawise feature options", () => {
 
     // A globally-scoped option applies across every controller on the account. The zone name override is deliberately absent: one name cannot be right for every
     // zone, so it resolves at the zone alone.
-    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend",
+    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
       "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ], "the zone name override is the only option that does not resolve globally");
   });
 
@@ -133,7 +133,7 @@ describe("hydrawise feature options", () => {
 
   test("describeOptionScope renders the two-scope prose", () => {
 
-    const suspend = optionEntry("Device", "Suspend");
+    const suspend = optionEntry("Device", "Suspend.All");
 
     assert.ok(suspend, "the suspend option should exist");
     assert.equal(describeOptionScope(suspend), " <BR>*Configurable at the whole controller and globally, across every controller.*",

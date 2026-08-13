@@ -41,10 +41,10 @@ export interface HydrawiseFeatureOption extends Omit<FeatureOptionEntry, "scopes
 // The controller-scopable option names, mirroring at compile time the entries whose scopes declaration includes "controller". This is the runtime's narrowed lookup
 // key: a call to hasFeature must name one of these, so passing a zone-only option to the controller-level lookup is a type error. A catalog this small makes a derived
 // mapping overkill, so we keep this compile-time mirror explicit and bind it by convention to the entries' scopes declarations below.
-export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend" | "Device.SyncName" | "Log.Zone";
+export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.SyncName" | "Log.Zone";
 
 // The zone-scopable option names, mirroring at compile time the entries whose scopes declaration includes "device" - the level this plugin projects as a zone. A call
-// to hasZoneFeature must name one of these, so passing Device.Suspend (controller-only) with a zone id is a type error rather than a latent scope violation.
+// to hasZoneFeature must name one of these, so passing Device.Suspend.All (controller-only) with a zone id is a type error rather than a latent scope violation.
 export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.SyncName" | "Log.Zone";
 
 // The zone-scopable value-centric option names, mirroring at compile time the value-bearing entries the zone level admits. The value accessor narrows against this,
@@ -106,7 +106,7 @@ const deviceOptions: HydrawiseFeatureOption[] = [
   { default: true, description: "Make this device available in HomeKit.", name: "", scopes: [ "controller", "device", "global" ] },
   { default: false, defaultValue: "", description: "Custom HomeKit name for this zone. When unset, the name reported by Hydrawise is used.", inputSize: 30, name: "Name", scopes: ["device"] },
   { default: false, description: "Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated.", name: "Standalone", scopes: [ "controller", "device", "global" ] },
-  { default: false, description: "Enable a switch accessory to control suspending all zones.", name: "Suspend", scopes: [ "controller", "global" ] },
+  { default: false, description: "Enable a switch accessory that suspends and resumes every zone on the controller at once.", name: "Suspend.All", scopes: [ "controller", "global" ] },
   { default: true, description: "Synchronize zone names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
 ];
 

@@ -54,10 +54,10 @@ describe("HydrawiseController construction", () => {
 
   test("adds the suspend switch and logs the deviation when the feature is enabled", () => {
 
-    const { accessory, controllerConfig, lines } = buildController({ userOptions: ["Enable.Device.Suspend." + controllerConfigSerial()] });
+    const { accessory, controllerConfig, lines } = buildController({ userOptions: ["Enable.Device.Suspend.All." + controllerConfigSerial()] });
     const suspend = accessory.getServiceById(Service.Switch, "All");
 
-    assert.ok(suspend, "a suspend switch should exist when Device.Suspend is enabled");
+    assert.ok(suspend, "a suspend switch should exist when Device.Suspend.All is enabled");
 
     // Before the first poll the status carries an empty relay list, so isAllSuspended is vacuously true (an empty some() is false, negated to true) and the
     // switch rests on. This is the construction-time reading; the first poll replaces it with the reported zone state.

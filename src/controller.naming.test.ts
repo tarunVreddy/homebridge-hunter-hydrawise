@@ -355,7 +355,7 @@ describe("the zone name option's declared scope", () => {
 
     // The compile-time half of the scope contract: these literals only typecheck against the unions that admit them, so an option that changes scope without its
     // union changing fails here at build time rather than at a call site.
-    const controllerOptions: HydrawiseControllerOption[] = [ "Device", "Device.Suspend", "Device.SyncName", "Log.Zone" ];
+    const controllerOptions: HydrawiseControllerOption[] = [ "Device", "Device.Suspend.All", "Device.SyncName", "Log.Zone" ];
     const zoneOptions: HydrawiseZoneOption[] = [ "Device", "Device.SyncName", "Log.Zone" ];
     const zoneValueOptions: HydrawiseZoneValueOption[] = ["Device.Name"];
 

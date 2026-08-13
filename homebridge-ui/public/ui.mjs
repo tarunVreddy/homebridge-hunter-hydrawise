@@ -212,9 +212,11 @@ const matchControllerAccessory = (cached, targetSerial) => cached.find((accessor
   (foldSerial(accessory.context.controller.serialNumber) === targetSerial));
 
 /* Extract the controller serials named by the config floor. A floor entry names a whole controller as "Enable/Disable.Device.<serial>"; the same grammar also carries
- * a zone-scope disable ("Disable.Device.<relayId>") and the distinct suspend option ("Disable.Device.Suspend.<serial>"), so we keep only single-segment ids and let the
- * caller drop any id that matches a known zone. The action prefixes and the Device key are derived through the engine's own expandOption grammar, so a rename of the
- * option cannot silently break the match; the walk over the entries is a hand scan, because the engine exports no enumeration primitive to delegate it to.
+ * a zone-scope disable ("Disable.Device.<relayId>") and the suspend family's own entries ("Disable.Device.Suspend.All.<serial>"), so we keep only single-segment
+ * ids and let the caller drop any id that matches a known zone. A multi-segment option name therefore excludes itself here: its trailing segment can never be
+ * mistaken for a serial, because the id it would yield still carries a dot. The action prefixes and the Device key are derived through the engine's own
+ * expandOption grammar, so a rename of the option cannot silently break the match; the walk over the entries is a hand scan, because the engine exports no
+ * enumeration primitive to delegate it to.
  *
  * excludedNames carries the lowercased Device-category option names the catalog declares, and any candidate id it names is dropped. Such an entry is that option's
  * global-scope entry - the raw-tail lookup key the engine's own config index stores for it - rather than a Device-scoped serial, so honoring the exclusion is what

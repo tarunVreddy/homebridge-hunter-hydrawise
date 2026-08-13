@@ -414,3 +414,106 @@ describe("hydrawise webUI config interpreters", () => {
     assert.equal(built.platform.hasV2Client, true, "and builds the account-credentialed client from them");
   });
 });
+
+describe("hydrawise webUI retired-option rename migration", () => {
+
+  const SERIAL = "SN0A1B2C3D4";
+
+  // The options array a patch carries, failing the test rather than returning undefined so no assertion below passes vacuously against an absent write.
+  function migratedOptions(source: { apiKey?: string; options?: string[] }): string[] {
+
+    const patch = config.migrate(source);
+
+    assert.ok(patch, "the migration should stage a patch");
+    assert.ok(patch.options, "the patch should carry the rewritten options array");
+
+    return patch.options;
+  }
+
+  test("every shape of a retired entry is rewritten losslessly", () => {
+
+    /* The four shapes the grammar admits, each carrying information the rewrite must preserve: the action prefix says what the user chose, and the trailing
+     * identifier says which controller they chose it for, in the casing they typed.
+     */
+    const cells = [
+
+      { expected: "Enable.Device.Suspend.All", label: "enabled globally", source: "Enable.Device.Suspend" },
+      { expected: "Disable.Device.Suspend.All", label: "disabled globally", source: "Disable.Device.Suspend" },
+      { expected: "Enable.Device.Suspend.All." + SERIAL, label: "enabled at a controller", source: "Enable.Device.Suspend." + SERIAL },
+      { expected: "Disable.Device.Suspend.All." + SERIAL, label: "disabled at a controller", source: "Disable.Device.Suspend." + SERIAL }
+    ];
+
+    for(const { expected, label, source } of cells) {
+
+      assert.deepEqual(migratedOptions({ options: [source] }), [expected], "an entry " + label + " keeps its action and its scope");
+    }
+  });
+
+  test("an entry already addressing the new family passes through untouched", () => {
+
+    /* The collision the catalog anchoring exists to prevent. A naive "retired name plus one trailing segment" match would read `Enable.Device.Suspend.All` as the
+     * retired option scoped to a device called "All" and rewrite it to nonsense, and would do the same to every sibling the family later grows.
+     */
+    const family = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories,
+      options: { ...featureOptions, ["Device"]: [ ...(featureOptions["Device"] ?? []),
+        { default: false, description: "Suspend one zone.", name: "Suspend.Zone", scopes: [ "controller", "device", "global" ] } ] } } });
+
+    const untouched = [ "Enable.Device.Suspend.All", "Disable.Device.Suspend.All." + SERIAL, "Enable.Device.Suspend.Zone", "Enable.Device.Suspend.Zone.700001" ];
+
+    assert.equal(family.migrate({ options: untouched }), null, "a configuration already speaking the new vocabulary needs no migration at all");
+  });
+
+  test("the rename runs on a configuration that carries no legacy properties at all", () => {
+
+    /* The gating pin, and the one that decides whether this migration reaches anybody. The property scan answers null the moment a configuration carries no legacy
+     * properties, which is true of nearly every install that has already been migrated once - so a rename gated behind it would never run for them.
+     */
+    assert.deepEqual(migratedOptions({ options: [ "Enable.Device.Suspend." + SERIAL, "Enable.Log.Zone" ] }),
+      [ "Enable.Device.Suspend.All." + SERIAL, "Enable.Log.Zone" ], "the rename lands and every unrelated entry is left exactly as it was");
+  });
+
+  test("running the migration twice changes nothing the second time", () => {
+
+    const once = migratedOptions({ options: [ "Enable.Device.Suspend", "Disable.Device.Suspend." + SERIAL ] });
+
+    // Run-twice is a no-op by construction rather than by a guard: the rewritten entries address a current catalog key, which the first rule passes through.
+    assert.equal(config.migrate({ options: once }), null, "a second pass finds nothing left to rename");
+  });
+
+  test("a configuration with no retired entries is left alone", () => {
+
+    assert.equal(config.migrate({ options: [ "Enable.Device.Standalone.700001", "Disable.Device.ABC123" ] }), null, "nothing to rename means nothing to stage");
+    assert.equal(config.migrate({}), null, "and neither does an empty configuration");
+  });
+
+  test("a legacy property and a retired option name both migrate in ONE pass", () => {
+
+    /* The same-pass pin. Both migrations compose one options array, so neither write can clobber the other - which is exactly what two independent writers each
+     * answering a whole array would do under the session's shallow merge.
+     */
+    const patch = config.migrate({ apiKey: LEGACY_KEY, options: ["Enable.Device.Suspend." + SERIAL] }) as { apiKey?: string; options?: string[] } | null;
+
+    assert.ok(patch, "the migration should stage a patch");
+    assert.ok(Object.hasOwn(patch, "apiKey"), "the legacy key is staged for deletion");
+    assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + LEGACY_KEY], "the key became its option entry");
+    assert.deepEqual(entriesFor(patch.options, "Device.Suspend.All"), ["Enable.Device.Suspend.All." + SERIAL], "and the retired name was renamed in the same array");
+  });
+
+  test("the module's catalog anchoring agrees with the engine's own composition for every served option", () => {
+
+    /* The matching-parity pin. The module composes its current-key set from the served catalog by hand, because it is import-free and can consume no engine
+     * export; this asserts that hand composition against the engine's own expandOption for every option the catalog declares, which is the drift this rule would
+     * otherwise be exposed to. An entry addressing a current key must always pass through, and passing through is observable as "nothing staged".
+     */
+    const engine = new FeatureOptions(featureOptionCategories, featureOptions, []);
+    const keys = Object.entries(featureOptions).flatMap(([ category, entries ]) => entries.map((entry) => engine.expandOption(category, entry.name)));
+
+    assert.ok(keys.length > 5, "the catalog should carry enough options for this sweep to mean something");
+
+    for(const key of keys) {
+
+      assert.equal(config.migrate({ options: [ "Enable." + key, "Disable." + key + "." + SERIAL ] }), null,
+        "an entry addressing the current option " + key + " is never rewritten");
+    }
+  });
+});

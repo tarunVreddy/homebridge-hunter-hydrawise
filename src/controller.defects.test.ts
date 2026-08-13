@@ -159,7 +159,7 @@ describe("HydrawiseController updateState defect pins", () => {
   test("all zones suspended aggregates to program-scheduled with the suspend switch on", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -178,7 +178,7 @@ describe("HydrawiseController updateState defect pins", () => {
   test("all zones rain-stopped aggregates to no-program-scheduled with the suspend switch off", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -293,7 +293,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -316,7 +316,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(relays), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -331,7 +331,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -356,7 +356,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
       recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" });
       recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -380,7 +380,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     // The parity restatement: with no credentials nothing above applies at all, and the heuristic answers exactly as it always has for both topologies.
     const suspended = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()),
-      kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+      kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => suspended.abort());
 

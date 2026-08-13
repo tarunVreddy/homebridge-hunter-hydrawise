@@ -284,7 +284,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
       recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -322,7 +322,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
       recorder.programDefault("setzone.php", { body: { message: "denied", message_type: "error" }, kind: "response" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -345,7 +345,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
       recorder.programDefault("setzone.php", { kind: "malformed" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
@@ -367,7 +367,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
       recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.SN0A1B2C3D4"] });
+    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
