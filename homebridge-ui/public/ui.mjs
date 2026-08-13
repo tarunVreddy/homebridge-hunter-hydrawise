@@ -310,39 +310,6 @@ const renderResultRow = ({ id, text, tone }) => {
   row.textContent = text;
 };
 
-// The property the first-run cards read their frame color from. It is ours rather than the framework's, so writing it can never disturb the accent the framework
-// manages for its own page.
-const ACCENT_PROPERTY = "--hbhh-accent";
-
-/* Read the accent Homebridge is actually rendering and publish it for the first-run cards.
- *
- * The accent cannot be read from a Bootstrap custom property. The host themes its buttons by rule, so --bs-primary carries stock Bootstrap blue rather than the
- * color the user picked, which is why the framework learns the accent by probing what a .btn-primary actually renders. This is that same probe, kept here because
- * first run paints before the framework's token sheet and its probe exist: a hidden button, one computed read, one property write.
- *
- * A probe that runs before the host's stylesheet applies reads an empty or fully transparent color. Writing that would replace a sensible default with a useless
- * value, so such a reading is discarded and whatever is already in force stands - the probe may improve the page's color, never degrade it.
- */
-const probeAccent = () => {
-
-  const probe = document.createElement("button");
-
-  probe.className = "btn btn-primary";
-  probe.style.display = "none";
-  document.body.appendChild(probe);
-
-  const background = getComputedStyle(probe).backgroundColor;
-
-  probe.remove();
-
-  if(!background.length || (background === "transparent") || background.replace(/\s+/g, "").startsWith("rgba(0,0,0,0")) {
-
-    return;
-  }
-
-  document.documentElement.style.setProperty(ACCENT_PROPERTY, background);
-};
-
 // Discard any validated account login and blank the result the validation showed for it. This runs when a field is edited and when first run opens, so the
 // indicator on screen and the pair that would be committed always describe the same thing.
 const clearValidatedCredentials = () => {
@@ -370,9 +337,6 @@ const firstRunOnStart = ({ config }) => {
   document.getElementById("hydrawisePassword").value = hydrawiseConfig.password(config);
 
   clearValidatedCredentials();
-
-  // Publish the host's rendered accent before the page is revealed, so the cards paint in the theme's own color from their first frame.
-  probeAccent();
 
   return true;
 };
@@ -1286,6 +1250,13 @@ const webUiParams = {
 // Instantiate the webUI.
 const ui = new webUi(webUiParams);
 
+/* Adopt the framework's theming for this page - the design tokens, the themed canvas, the dark-mode corrections, the page-kit classes, and the host's own accent -
+ * with one call that holds for as long as this module copy owns the window. Theming is a page concern rather than a view one, so first run, the settings form, and
+ * support all wear it from here. The promise is voided rather than awaited because the framework owns its rejection posture: a failed initial lighting-mode read
+ * still leaves the sheets adopted and the host's theme signals followed, so the next announcement the host makes brings the page into step.
+ */
+void ui.registerTheming();
+
 /* The HBHH-owned refresh handler. This is the webUI's only on-demand cloud touch: on click it fetches a fresh controller list, then - only for controllers it cannot
  * resolve from the accessory cache (the disabled ones) - fetches their zones, storing both in the session stores the read hooks consult. A fresh controller list is
  * one Hydrawise call; the zones fetch adds one request that loops server-side over the context-less controllers, so a successful refresh drives 1 + K upstream calls,
@@ -1459,10 +1430,10 @@ const onRefreshControllers = async () => {
 };
 
 /* Wire the HBHH-owned refresh control. The button lives in index.html, present before this module loads, while the settings panel re-imports this module on each
- * open - so the binding is per module copy, and it joins the page epoch: a superseded copy's handler dies when a newer copy claims the window, leaving exactly
- * one dispatch per click no matter how many times the panel has been reopened.
+ * open - so the binding is per module copy, and the facade's registration joins it to the page epoch: a superseded copy's handler dies when a newer copy claims
+ * the window, leaving exactly one dispatch per click no matter how many times the panel has been reopened.
  */
-document.getElementById("hbhhRefreshControllers")?.addEventListener("click", () => void onRefreshControllers(), { signal: ui.epochSignal });
+ui.on(document.getElementById("hbhhRefreshControllers"), "click", () => void onRefreshControllers());
 
 /* Validate the Hydrawise API key on demand, during first run. It is early feedback and nothing else: the submit validates the key through this same endpoint before
  * it commits anything, so a user who never presses the button is no worse off, and one who does learns whether their key works before committing a configuration.
@@ -1593,51 +1564,25 @@ const toggleReveal = (toggle) => {
   toggle.setAttribute("aria-pressed", revealed ? "true" : "false");
 };
 
-// Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding joins the page epoch exactly as
-// the refresh control does, so a superseded module copy's handlers die when a newer copy claims the window.
-document.getElementById("validateApiKey")?.addEventListener("click", () => void onValidateApiKey(), { signal: ui.epochSignal });
-document.getElementById("validateV2")?.addEventListener("click", () => void onValidateV2(), { signal: ui.epochSignal });
-document.getElementById("apiKey")?.addEventListener("input", () => renderResultRow({ id: "apiKeyResult", text: "", tone: "" }), { signal: ui.epochSignal });
+/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding registers through the facade
+ * exactly as the refresh control does, so a superseded module copy's handlers die when a newer copy claims the window.
+ *
+ * The lookups hand their result straight to the facade: a nullish target declares that surface absent, so registering against a control this page's markup omits
+ * is the facade's own documented no-op and costs that control's wiring alone.
+ */
+ui.on(document.getElementById("validateApiKey"), "click", () => void onValidateApiKey());
+ui.on(document.getElementById("validateV2"), "click", () => void onValidateV2());
+ui.on(document.getElementById("apiKey"), "input", () => renderResultRow({ id: "apiKeyResult", text: "", tone: "" }));
 
 // Each masked credential's reveal, bound from the markup itself: a toggle declares the field it serves, so the page grows a reveal without this wiring changing.
 for(const toggle of document.querySelectorAll("[data-reveal]")) {
 
-  toggle.addEventListener("click", () => toggleReveal(toggle), { signal: ui.epochSignal });
+  ui.on(toggle, "click", () => toggleReveal(toggle));
 }
-
-/* Follow the host's theme while the page is open, by the routes Homebridge uses to announce a change into a plugin frame: it retints our document by swapping
- * the theme classes on our own body element, and it posts a message to the frame. Each arrives whether the user picked a mode by hand or the system flipped one
- * underneath an auto-detecting install, because every route runs the same retint. Watching our own body is the arm that settles the ordering, since a class
- * change IS the retint rather than an announcement of one, and mutation records are delivered after the change has landed.
- *
- * The system color-scheme query is deliberately not among them. It answers before the host has retinted anything, so a probe driven by it would read the colors
- * that are on their way out, and on an install pinned to one mode it would fire when nothing about the page has changed at all.
- *
- * Re-probing the accent is the whole of the work. Every other color this page wears comes from the host's own themed stylesheet, which re-matches the moment
- * those classes change, so those colors follow with no help. The message payload is read for nothing but its type, so traffic from anywhere else costs one
- * string comparison.
- */
-const followThemeChange = () => probeAccent();
-
-window.addEventListener("message", (event) => {
-
-  if(event.data?.type === "theme-update") {
-
-    followThemeChange();
-  }
-}, { signal: ui.epochSignal });
-
-const themeClassObserver = new window.MutationObserver(followThemeChange);
-
-themeClassObserver.observe(document.body, { attributeFilter: ["class"], attributes: true });
-
-// A MutationObserver takes no abort signal of its own, so it joins the page epoch the way the schedule ticker's interval does: one explicit teardown, registered
-// once, so a superseded copy of this module leaves no observer watching the document on behalf of a page nobody is looking at.
-ui.epochSignal.addEventListener("abort", () => themeClassObserver.disconnect(), { once: true });
 
 for(const id of [ "hydrawisePassword", "hydrawiseUsername" ]) {
 
-  document.getElementById(id)?.addEventListener("input", clearValidatedCredentials, { signal: ui.epochSignal });
+  ui.on(document.getElementById(id), "input", clearValidatedCredentials);
 }
 
 /* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
@@ -1649,11 +1594,12 @@ const WIRING_DEADLINE = 5;
 // stage anything after the fact.
 const wiringController = new AbortController();
 
-/* The signal the wiring's cancellation points read, composed from the envelope's own controller and this module copy's claim on the window. The epoch half
- * matters because a reopened settings panel mints a successor copy and retires this one: composing the two aborts a superseded copy's wiring at the same
- * chokepoints the deadline uses, rather than letting a retired copy write config underneath the copy the user is looking at.
+/* The signal the wiring's cancellation points read: the envelope's own controller, bounded by this module copy's claim on the window through the facade's
+ * composition surface. The epoch half matters because a reopened settings panel mints a successor copy and retires this one: whichever of the two aborts first
+ * cancels a superseded copy's wiring at the same chokepoints the deadline uses, rather than letting a retired copy write config underneath the copy the user is
+ * looking at.
  */
-const wiringSignal = AbortSignal.any([ wiringController.signal, ui.epochSignal ]);
+const wiringSignal = ui.epochBounded(wiringController.signal);
 
 /* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
  *
