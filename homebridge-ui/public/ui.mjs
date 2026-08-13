@@ -310,13 +310,64 @@ const renderResultRow = ({ id, text, tone }) => {
   row.textContent = text;
 };
 
-// Discard any validated account login and blank the result the validation showed for it. This runs when a field is edited and when first run opens, so the
-// indicator on screen and the pair that would be committed always describe the same thing.
-const clearValidatedCredentials = () => {
+/* Build one validation surface: the generation that says which invocation the page is still listening to, and the cleanup that runs whenever the surface is retired.
+ *
+ * A validation spends a cloud call and paints what it learns when the call answers, and the bridge request it rides carries no way to abort - so an edit made while
+ * a call is in flight cannot stop the call, only decide that its answer no longer describes anything on screen. The generation is what carries that decision across
+ * the await: an invocation captures the value begin() hands it, and anything it would do afterward is conditioned on that value still being the live one.
+ */
+const makeValidationScope = ({ inputs, onInvalidate }) => {
 
-  validatedCredentials = null;
+  let generation = 0;
 
-  renderResultRow({ id: "validateV2Result", text: "", tone: "" });
+  // Retire whatever this surface is currently showing or holding. Advancing the generation is what disowns an invocation still in flight, and the cleanup is what
+  // takes the retired verdict off screen...both halves are the same act, so no caller can perform one without the other.
+  const invalidate = () => {
+
+    generation++;
+
+    onInvalidate();
+  };
+
+  return {
+
+    // Start a validation and hand back this invocation's claim on the surface. Starting retires whatever came before it, which is the same clearing the surface
+    // does on an edit, so one bump covers both the retirement and the claim.
+    begin: () => {
+
+      invalidate();
+
+      return generation;
+    },
+    inputs,
+    invalidate,
+    isCurrent: (captured) => captured === generation
+  };
+};
+
+/* The first-run screen's validation surfaces, one per endpoint it can call. This declaration is the whole mapping's single source of truth: each surface names the
+ * inputs whose edits retire it and the cleanup that retirement runs, and both the handlers and the input wiring derive from here rather than restating it.
+ *
+ * The surfaces count separately on purpose. Each validation rides its own endpoint and its own rate budget, so an edit to the API key must not throw away an
+ * account-login answer the user already paid a call for, nor the reverse.
+ */
+const validationScopes = {
+
+  // The optional account login. Retiring it discards the staged pair as well as the verdict, so the indicator on screen and the pair the submit would commit always
+  // describe the same thing - what first run writes is a pair the cloud confirmed, never whatever was sitting in the fields when the button was pressed.
+  account: makeValidationScope({
+
+    inputs: [ "hydrawisePassword", "hydrawiseUsername" ],
+    onInvalidate: () => {
+
+      validatedCredentials = null;
+
+      renderResultRow({ id: "validateV2Result", text: "", tone: "" });
+    }
+  }),
+
+  // The API key. Nothing is staged for it - the submit reads the input itself - so retiring it is only a matter of taking the verdict off screen.
+  apiKey: makeValidationScope({ inputs: ["apiKey"], onInvalidate: () => renderResultRow({ id: "apiKeyResult", text: "", tone: "" }) })
 };
 
 // Initialize our first run screen with any information from our existing configuration. The key's length is a validation fact the interpreter module owns, so the
@@ -336,7 +387,7 @@ const firstRunOnStart = ({ config }) => {
   document.getElementById("hydrawiseUsername").value = hydrawiseConfig.username(config);
   document.getElementById("hydrawisePassword").value = hydrawiseConfig.password(config);
 
-  clearValidatedCredentials();
+  validationScopes.account.invalidate();
 
   return true;
 };
@@ -393,11 +444,12 @@ const firstRunOnSubmit = async ({ commit, config }) => {
   const apiKey = document.getElementById("apiKey").value;
   const loginError = document.getElementById("loginError");
 
-  /* Clear both of the key card's result lines before the call, each through textContent so no text is routed through a markup assignment. The button's own line is
-   * cleared alongside the submit's, because a verdict it left standing would otherwise sit beside a submit that has just failed, saying the opposite.
+  /* Clear both of the key card's result lines before the call, each through textContent so no text is routed through a markup assignment. The button's line clears
+   * through its validation surface, which also retires any key validation still in flight - a late verdict must not paint over the row this submit just blanked,
+   * and a verdict left standing would otherwise sit beside a submit that has just failed, saying the opposite.
    */
   loginError.textContent = "";
-  renderResultRow({ id: "apiKeyResult", text: "", tone: "" });
+  validationScopes.apiKey.invalidate();
 
   // The /login endpoint answers a shaped object: a result sentence ("success" or the failure reason) plus the controllers it parsed from the same customerdetails
   // body it already fetched. On failure we render the sentence inline through the DOM helper, so the user sees the specific reason on the form.
@@ -1454,8 +1506,8 @@ const onValidateApiKey = async () => {
   }
 
   // Whatever the last validation said is stale the moment a new one starts, so the line is blanked before the call rather than after it - a call that never
-  // resolves must not leave an older verdict standing beside newer input.
-  renderResultRow({ id: "apiKeyResult", text: "", tone: "" });
+  // resolves must not leave an older verdict standing beside newer input. Beginning the validation is what blanks it, and what hands this invocation its claim.
+  const generation = validationScopes.apiKey.begin();
 
   button.disabled = true;
 
@@ -1463,9 +1515,13 @@ const onValidateApiKey = async () => {
 
     const { result } = await homebridge.request("/login", apiKey);
 
-    // The epoch signal is read after the await for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired
-    // copy must not paint over what the copy the user is looking at is showing.
-    if(ui.epochSignal.aborted) {
+    /* Every way this invocation can have been superseded while the call was out is answered here, and a verdict lands only when none of them happened. The epoch
+     * signal answers the module copy, for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired copy must
+     * not paint over what the copy the user is looking at is showing. The generation answers the surface: an edit to the key, or a newer validation of it, retires
+     * this call, and its verdict would otherwise land beside a key it never described. A superseded invocation discards silently - the surface has already
+     * cleared itself.
+     */
+    if(ui.epochSignal.aborted || !validationScopes.apiKey.isCurrent(generation)) {
 
       return;
     }
@@ -1500,8 +1556,8 @@ const onValidateV2 = async () => {
   const password = document.getElementById("hydrawisePassword").value;
 
   // Anything already staged is stale the moment a new validation starts, so it is cleared before the call rather than after it - a call that never resolves must
-  // not leave an older result standing beside newer input.
-  clearValidatedCredentials();
+  // not leave an older result standing beside newer input. Beginning the validation is what clears it, and what hands this invocation its claim.
+  const generation = validationScopes.account.begin();
 
   if(!username.length || !password.length) {
 
@@ -1516,9 +1572,14 @@ const onValidateV2 = async () => {
 
     const { result: outcome } = await homebridge.request("/loginV2", { password, username });
 
-    // The epoch signal is read after the await for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired
-    // copy must not paint over what the copy the user is looking at is showing.
-    if(ui.epochSignal.aborted) {
+    /* Every way this invocation can have been superseded while the call was out is answered here, and neither a verdict nor a staged pair lands unless the guard
+     * says this is still the invocation the page is listening to. The epoch signal answers the module copy, for the reason the refresh handler states: a reopened
+     * panel mints a successor copy of this module, and a retired copy must not paint over what the copy the user is looking at is showing. The generation answers
+     * the surface, and it is what makes the button's meaning honest across the await: a user who edits either field while the call is out has retired this pair,
+     * so staging it here would commit a login the cloud confirmed for input that is no longer on screen. A superseded invocation discards silently - the surface
+     * has already cleared itself, and there is no wire to cancel.
+     */
+    if(ui.epochSignal.aborted || !validationScopes.account.isCurrent(generation)) {
 
       return;
     }
@@ -1572,17 +1633,21 @@ const toggleReveal = (toggle) => {
  */
 ui.on(document.getElementById("validateApiKey"), "click", () => void onValidateApiKey());
 ui.on(document.getElementById("validateV2"), "click", () => void onValidateV2());
-ui.on(document.getElementById("apiKey"), "input", () => renderResultRow({ id: "apiKeyResult", text: "", tone: "" }));
+
+// The edits that retire a verdict, derived from the surface declarations rather than restated here: a field earns its invalidation by being named in its surface's
+// inputs, so the mapping of which field retires which validation is stated once and read everywhere.
+for(const scope of Object.values(validationScopes)) {
+
+  for(const id of scope.inputs) {
+
+    ui.on(document.getElementById(id), "input", scope.invalidate);
+  }
+}
 
 // Each masked credential's reveal, bound from the markup itself: a toggle declares the field it serves, so the page grows a reveal without this wiring changing.
 for(const toggle of document.querySelectorAll("[data-reveal]")) {
 
   ui.on(toggle, "click", () => toggleReveal(toggle));
-}
-
-for(const id of [ "hydrawisePassword", "hydrawiseUsername" ]) {
-
-  ui.on(document.getElementById(id), "input", clearValidatedCredentials);
 }
 
 /* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
