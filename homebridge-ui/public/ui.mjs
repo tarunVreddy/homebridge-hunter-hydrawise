@@ -29,15 +29,12 @@ const NAME_OPTION = expandOption(DEVICE_CATEGORY, "Name");
 
 // The guidance sentences the controller notice states render through the infoPanel. Complete sentences, shown verbatim to the user.
 const NOTICE_DISABLED = "This controller is disabled in your Homebridge configuration, so its zones are not listed. " +
-  "Use the Refresh from Hydrawise button above the controller list to retrieve them.";
+  "Use the refresh action on the Controllers heading to retrieve them.";
 const NOTICE_DISABLED_LISTED = "This controller is disabled in your Homebridge configuration, so it is not published to HomeKit. " +
   "Its zones are listed for reference.";
 const NOTICE_UNPUBLISHED = "The plugin has not published this controller's details yet. " +
   "Restart Homebridge, and its zones will appear here after the first update from Hydrawise completes.";
 const NOTICE_UNDISCOVERED = "The plugin has not discovered this controller yet. Restart Homebridge to discover it.";
-
-// The upper bound in milliseconds on how long the refresh control stays held after a recovery re-entry, covering a re-entered cycle that dies before rendering.
-const REFRESH_REBUILD_WAIT = 10000;
 
 /* The schedule ticker's cadence in milliseconds, one nominal poll interval. In the steady state a tick's cache read reaches the server fresh, because the browser's
  * own thirty-second cache has expired between ticks; interleaved page activity can instead serve a tick from that window, which bounds that tick's extra staleness
@@ -1277,7 +1274,116 @@ const featureOptionsParams = {
   sidebar: {
 
     deviceContent: renderDeviceContent,
-    deviceLabel: "Zones"
+    deviceLabel: "Zones",
+
+    /* The refresh action the framework docks on the Controllers heading, and this page's ONE on-demand cloud touch. Every read hook here answers from the accessory
+     * cache, the configuration, and the session stores without reaching Hydrawise at all, so asking a server to re-read - the framework's whole contract for this
+     * handler - means the cloud fetch itself: it re-reads the account and seeds the session stores those hooks consult, and the framework then re-enters through its
+     * own show() so the refreshed roster renders. Nothing here disables a control or repaints a view, because the framework owns the button's in-flight state, the
+     * re-entry, and the toast a rejection surfaces through.
+     *
+     * A refreshed roster costs one Hydrawise call, plus one request that loops server-side over the controllers with no live accessory - the disabled ones, whose
+     * zones nothing else on this page can resolve - so a successful refresh drives 1 + K upstream calls for K disabled controllers.
+     *
+     * The failure postures differ by what has already succeeded. A failed controller fetch throws, which is what leaves the page exactly as it stands: the framework
+     * declines to re-enter, so a refresh that learned nothing cannot present as one that did. The partial failures after the roster is seeded resolve instead, and
+     * report through a toast of their own - the fresh roster is real by then, and rejecting would withhold the very re-entry that puts it on screen.
+     *
+     * The epoch guard after each await answers the module copy. A reopened settings panel mints a successor copy of this module and retires this one, and a retired
+     * copy must not toast, seed a store the live copy reads, or spend another call against the account's rate budget. Resolving on a dead mount is inert, since the
+     * re-entry that follows answers to that mount's own aborted signal.
+     */
+    refresh: {
+
+      label: "Refresh from Hydrawise",
+      onRefresh: async () => {
+
+        const apiKey = hydrawiseConfig.apiKey((await homebridge.getPluginConfig())?.[0]);
+
+        if(ui.epochSignal.aborted) {
+
+          return;
+        }
+
+        const { controllers, error } = await homebridge.request("/refreshControllers", { apiKey });
+
+        if(ui.epochSignal.aborted) {
+
+          return;
+        }
+
+        if(error) {
+
+          throw new Error(error);
+        }
+
+        // Update the session roster from the refreshed controllers.
+        const identities = Array.isArray(controllers) ? controllers.filter(isControllerIdentity) : [];
+
+        seedSessionControllers(identities);
+
+        // Determine which refreshed controllers have no live accessory. A cache-read failure here leaves the list empty, so we skip the zones fetch rather than
+        // fetch every controller's zones; the roster refresh above still stands.
+        let contextless = [];
+
+        try {
+
+          const cached = await homebridge.getCachedAccessories();
+
+          if(ui.epochSignal.aborted) {
+
+            return;
+          }
+
+          const contextSerials = new Set();
+
+          for(const accessory of cached) {
+
+            if(isControllerIdentity(accessory?.context?.controller)) {
+
+              contextSerials.add(foldSerial(accessory.context.controller.serialNumber));
+            }
+          }
+
+          contextless = identities.filter((identity) => !contextSerials.has(foldSerial(identity.serialNumber)));
+        } catch(err) {
+
+          if(ui.epochSignal.aborted) {
+
+            return;
+          }
+
+          notifyError((err instanceof Error) ? err.message : String(err));
+        }
+
+        // Fetch the zones for the context-less controllers - the owner-ruled explicit fetch that keeps a disabled controller's zones listable - and store them by
+        // serial.
+        if(contextless.length > 0) {
+
+          const { error: zonesError, zones } = await homebridge.request("/refreshZones", { apiKey,
+            controllers: contextless.map((identity) => ({ controllerId: identity.controllerId, serialNumber: identity.serialNumber })) });
+
+          if(ui.epochSignal.aborted) {
+
+            return;
+          }
+
+          if(zonesError) {
+
+            notifyError(zonesError);
+          } else if(zones && (typeof zones === "object")) {
+
+            for(const [ serial, zoneList ] of Object.entries(zones)) {
+
+              if(Array.isArray(zoneList) && zoneList.every(isZoneIdentity)) {
+
+                sessionZones.set(foldSerial(serial), zoneList);
+              }
+            }
+          }
+        }
+      }
+    }
   },
   ui: {
 
@@ -1308,184 +1414,6 @@ const ui = new webUi(webUiParams);
  * still leaves the sheets adopted and the host's theme signals followed, so the next announcement the host makes brings the page into step.
  */
 void ui.registerTheming();
-
-/* The HBHH-owned refresh handler. This is the webUI's only on-demand cloud touch: on click it fetches a fresh controller list, then - only for controllers it cannot
- * resolve from the accessory cache (the disabled ones) - fetches their zones, storing both in the session stores the read hooks consult. A fresh controller list is
- * one Hydrawise call; the zones fetch adds one request that loops server-side over the context-less controllers, so a successful refresh drives 1 + K upstream calls,
- * K being the number of disabled controllers (possibly zero). A failed controllers fetch stops at that one call and changes nothing - the cached view stands. The
- * in-flight guard disables the control across the whole handler and the try/finally restores it on every exit path, so a click cannot overlap itself.
- *
- * The refreshed roster reaches the view along one of two paths, chosen by what the sidebar actually rendered. A rendered listing takes the framework's surgical
- * repaint, which rebuilds the controller list alone and leaves the rest of the view standing. A listing the framework never rendered - it showed its no-controllers
- * message instead - has no model for that repaint to act on, so the handler re-enters the page through the menu affordance and holds the in-flight guard until the
- * rebuilt list lands in the container, or until the bounded wait expires for a re-entered cycle that dies before rendering.
- */
-const onRefreshControllers = async () => {
-
-  const button = document.getElementById("hbhhRefreshControllers");
-
-  if(button) {
-
-    button.disabled = true;
-  }
-
-  try {
-
-    const apiKey = hydrawiseConfig.apiKey((await homebridge.getPluginConfig())?.[0]);
-
-    /* Every step this handler resumes on bails out when the module copy that owns it has been superseded. The epoch signal is captured at the copy's
-     * construction, so a reopened panel's newer copy aborts this one permanently: checking it here, and after each awaited step below, is what keeps a retired
-     * copy from toasting, seeding the session stores, re-entering the rendering path, or spending another cloud call against the account's rate budget.
-     */
-    if(ui.epochSignal.aborted) {
-
-      return;
-    }
-
-    const { controllers, error } = await homebridge.request("/refreshControllers", { apiKey });
-
-    if(ui.epochSignal.aborted) {
-
-      return;
-    }
-
-    // A failed refresh surfaces its reason and changes nothing: the context view stands rather than being masked by a failure.
-    if(error) {
-
-      notifyError(error);
-
-      return;
-    }
-
-    // Update the session roster from the refreshed controllers.
-    const identities = Array.isArray(controllers) ? controllers.filter(isControllerIdentity) : [];
-
-    seedSessionControllers(identities);
-
-    // Determine which refreshed controllers have no live accessory. A cache-read failure here leaves the list empty, so we skip the zones fetch rather than fetch
-    // every controller's zones; the roster refresh above still stands.
-    let contextless = [];
-
-    try {
-
-      const cached = await homebridge.getCachedAccessories();
-
-      if(ui.epochSignal.aborted) {
-
-        return;
-      }
-
-      const contextSerials = new Set();
-
-      for(const accessory of cached) {
-
-        if(isControllerIdentity(accessory?.context?.controller)) {
-
-          contextSerials.add(foldSerial(accessory.context.controller.serialNumber));
-        }
-      }
-
-      contextless = identities.filter((identity) => !contextSerials.has(foldSerial(identity.serialNumber)));
-    } catch(err) {
-
-      if(ui.epochSignal.aborted) {
-
-        return;
-      }
-
-      notifyError((err instanceof Error) ? err.message : String(err));
-    }
-
-    // Fetch the zones for the context-less controllers - the owner-ruled explicit fetch that keeps a disabled controller's zones listable - and store them by serial.
-    if(contextless.length > 0) {
-
-      const { error: zonesError, zones } = await homebridge.request("/refreshZones", { apiKey,
-        controllers: contextless.map((identity) => ({ controllerId: identity.controllerId, serialNumber: identity.serialNumber })) });
-
-      if(ui.epochSignal.aborted) {
-
-        return;
-      }
-
-      if(zonesError) {
-
-        notifyError(zonesError);
-      } else if(zones && (typeof zones === "object")) {
-
-        for(const [ serial, zoneList ] of Object.entries(zones)) {
-
-          if(Array.isArray(zoneList) && zoneList.every(isZoneIdentity)) {
-
-            sessionZones.set(foldSerial(serial), zoneList);
-          }
-        }
-      }
-    }
-
-    if(ui.epochSignal.aborted) {
-
-      return;
-    }
-
-    /* A rendered controllers container always carries at least the Global Options link, so an empty container means the framework showed its no-controllers
-     * message and never dispatched its model - the surgical sidebar repaint cannot render in that state, because the nav view yields until the model loads.
-     * Re-enter through the framework's own menu affordance, which re-runs the full show cycle against the freshly seeded session stores, and hold the
-     * in-flight guard until the rebuilt controller list lands (or the bounded wait expires, when the re-entered cycle dies before rendering - the
-     * connection-error retry governs there), so a second click cannot spend cloud calls against a rebuild already in flight. In every other case, repaint
-     * the sidebar surgically without disturbing the rendered view.
-     */
-    const container = document.getElementById("controllersContainer");
-
-    if(container && (container.childElementCount === 0)) {
-
-      const rebuilt = new Promise((resolve) => {
-
-        let expiry = null;
-
-        const observer = new MutationObserver(() => {
-
-          if(container.childElementCount > 0) {
-
-            observer.disconnect();
-            clearTimeout(expiry);
-            resolve();
-          }
-        });
-
-        expiry = setTimeout(() => {
-
-          observer.disconnect();
-          resolve();
-        }, REFRESH_REBUILD_WAIT);
-
-        observer.observe(container, { childList: true });
-      });
-
-      document.getElementById("menuFeatureOptions")?.click();
-      await rebuilt;
-    } else {
-
-      await ui.featureOptions.refreshControllers();
-    }
-  } finally {
-
-    /* The re-enable is unconditional, superseded copy or not: the invocation that disabled the control is the only thing that can balance its own disable. The
-     * button element persists across panel opens, so a copy that bailed out without re-enabling would leave the control disabled with no other owner of that
-     * duty. Holding the disable until this runs is also what keeps the copies from overlapping - a new copy's refresh cannot start while an older copy's is
-     * still in flight.
-     */
-    if(button) {
-
-      button.disabled = false;
-    }
-  }
-};
-
-/* Wire the HBHH-owned refresh control. The button lives in index.html, present before this module loads, while the settings panel re-imports this module on each
- * open - so the binding is per module copy, and the facade's registration joins it to the page epoch: a superseded copy's handler dies when a newer copy claims
- * the window, leaving exactly one dispatch per click no matter how many times the panel has been reopened.
- */
-ui.on(document.getElementById("hbhhRefreshControllers"), "click", () => void onRefreshControllers());
 
 /* Validate the Hydrawise API key on demand, during first run. It is early feedback and nothing else: the submit validates the key through this same endpoint before
  * it commits anything, so a user who never presses the button is no worse off, and one who does learns whether their key works before committing a configuration.
@@ -1536,8 +1464,8 @@ const onValidateApiKey = async () => {
     renderResultRow({ id: "apiKeyResult", text: "Your Hydrawise API key is valid.", tone: "text-success" });
   } finally {
 
-    /* The re-enable is unconditional, superseded copy or not, for the reason the refresh control's own finally states: the invocation that disabled the control is
-     * the only thing that can balance its own disable, and the button element outlives any one module copy.
+    /* The re-enable is unconditional, superseded copy or not: the invocation that disabled the control is the only thing that can balance its own disable, and the
+     * button element outlives any one module copy, so a copy that bailed out without re-enabling would leave the control disabled with no other owner of that duty.
      */
     button.disabled = false;
   }
@@ -1596,8 +1524,8 @@ const onValidateV2 = async () => {
     renderResultRow({ id: "validateV2Result", text: "Your Hydrawise account login is valid.", tone: "text-success" });
   } finally {
 
-    /* The re-enable is unconditional, superseded copy or not, for the reason the refresh control's own finally states: the invocation that disabled the control is
-     * the only thing that can balance its own disable, and the button element outlives any one module copy.
+    /* The re-enable is unconditional, superseded copy or not, for the reason the API key validation's own finally states: the invocation that disabled the control
+     * is the only thing that can balance its own disable, and the button element outlives any one module copy.
      */
     button.disabled = false;
   }
@@ -1625,8 +1553,8 @@ const toggleReveal = (toggle) => {
   toggle.setAttribute("aria-pressed", revealed ? "true" : "false");
 };
 
-/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding registers through the facade
- * exactly as the refresh control does, so a superseded module copy's handlers die when a newer copy claims the window.
+/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding registers through the facade,
+ * whose registration joins it to the page epoch, so a superseded module copy's handlers die when a newer copy claims the window.
  *
  * The lookups hand their result straight to the facade: a nullish target declares that surface absent, so registering against a control this page's markup omits
  * is the facade's own documented no-op and costs that control's wiring alone.
@@ -1668,7 +1596,7 @@ const wiringSignal = ui.epochBounded(wiringController.signal);
 
 /* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
  *
- * The envelope is awaited here rather than at module top, so the page's chrome and the refresh control arm immediately instead of waiting on a bridge round
+ * The envelope is awaited here rather than at module top, so the page's chrome and its first-run controls arm immediately instead of waiting on a bridge round
  * trip. ui.show() runs only after the envelope settles, which is the ordering that matters: the framework opens its own configuration session inside the
  * launch path that ui.show() starts, so every replica it hands to a hook - the first-run config, the options page's persist path - is read after the migration
  * has settled, and none of them can commit a pre-migration snapshot over it.
@@ -1685,8 +1613,8 @@ const wiringSignal = ui.epochBounded(wiringController.signal);
  * Reopening the panel is convergent rather than racing. The settings frame is reused and each open imports a fresh copy of this module whose wiring runs
  * independently, but a second copy reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely
  * simultaneous wirings read the same configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state.
- * A refresh click that lands before the envelope settles reads the degraded interpreter, whose canonical-prefix option scan answers for a migrated install,
- * and that window closes at settlement.
+ * The sidebar's refresh handler reads the interpreter too, and it cannot outrun the envelope: the framework builds that action inside ui.show(), which this
+ * module reaches only once the envelope has settled, so what the handler reads is always whatever the wiring left behind.
  *
  * One bound stated honestly: the check before the commit is the last cancellation point. A commit whose bridge round trip is already in flight cannot be
  * recalled - the session takes no signal, and the deadline bounds only the await - so composing the epoch into the signal narrows the stale-write window to
