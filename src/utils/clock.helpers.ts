@@ -6,7 +6,8 @@
  * inner promise unchanged (so the operation's own resolve/throw drives the outcome); now() returns 0. Tests that need different behavior pass overrides for
  * the specific method they want to control - e.g., a raceWithTimeout that throws synchronously to simulate the timer winning the race.
  *
- * Excluded from the build emit by the *.helpers.ts pattern in tsconfig.build.json.
+ * Excluded from the build emit by tsconfig.build.json's dedicated src/utils entry, which carves out this whole directory; the *.helpers.ts glob there
+ * matches this file too, but the directory-level entry already covers it.
  */
 import type { Clock } from "./clock.ts";
 

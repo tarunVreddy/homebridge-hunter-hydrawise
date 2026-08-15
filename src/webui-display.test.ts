@@ -1,11 +1,11 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * webui-display.test.ts: The webUI's pure schedule-display derivations, exercised against the very module ui.mjs renders from. Covers the zone classification
- * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, and the two formatters.
+ * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, and the formatters.
  *
- * Two disciplines bind every pin here. Every instant is derived from one fixed anchor rather than a live clock, so a run of this suite means the same thing at
- * any hour. And every expected string a formatter produces is computed through the identical Intl call the formatter itself makes, so a host whose locale or
- * timezone differs moves both sides together rather than reddening a correct implementation.
+ * This suite holds to disciplines that keep it deterministic: every instant is derived from one fixed anchor rather than a live clock, so a run of this suite
+ * means the same thing at any hour, and every expected string a formatter produces is computed through the identical Intl call the formatter itself makes, so a
+ * host whose locale or timezone differs moves both sides together rather than reddening a correct implementation.
  */
 import type { HydrawiseScheduleMeta, HydrawiseScheduleProjection, HydrawiseZoneScheduleEntry } from "../homebridge-ui/public/hydrawise-display.mjs";
 import { STALE_GRACE, ZONE_STATE_LABELS, deriveControllerDisplay, deriveZoneDisplay, formatMinutes, formatRunTime, zoneScheduleState }
@@ -49,7 +49,7 @@ function projection(zones: HydrawiseZoneScheduleEntry[], activeWindowSeconds: nu
   return { activeWindowSeconds, asOf: NOW, zones };
 }
 
-// The status word a projection folds to, which is always the first row of the controller rendering.
+// The status word a projection folds to, returned apart from the detail rows rather than as one of them.
 function statusOf(zones: HydrawiseZoneScheduleEntry[]): string | undefined {
 
   return deriveControllerDisplay(projection(zones), {}, NOW).status ?? undefined;
@@ -124,7 +124,7 @@ describe("hydrawise webUI schedule display derivations", () => {
       "a scheduled zone shows its status, its next run, and how long that run lasts");
     assert.equal(derived.stale, false, "a next run still ahead of the render is not stale");
 
-    // The imminent arm renders the same three rows and differs only in the word above them.
+    // The imminent arm renders the same rows and differs only in the word above them.
     const soon = deriveZoneDisplay(scheduledEntry(1, NOW + WINDOW), meta(), NOW);
 
     assert.deepEqual(soon.rows, [ [ "Status", ZONE_STATE_LABELS["starting-soon"] ], [ "Next Run", clockOf(NOW + WINDOW) ], [ "Duration", "8 minutes" ] ],
@@ -271,12 +271,12 @@ describe("hydrawise webUI suspension and availability display", () => {
 
   test("the formatter's third tier renders an instant beyond a week as a locale date", () => {
 
-    /* The tier a near-term fixture can never reach. Every instant the display handled before a suspension existed sits inside the schedule horizon, so without a
-     * far-future fixture the new branch would go unexecuted and a weekday alone would name a day four hundred days out as though it were this week.
+    /* The far-future fixture is the only one that reaches the date tier; a near-term fixture leaves it unexecuted and a weekday alone would misname a day four
+     * hundred days out as though it were this week. The same-day and within-week tiers are exercised below.
      */
     assert.equal(formatRunTime(FAR_FUTURE, NOW), dateOf(FAR_FUTURE), "a far-future instant renders as a date");
 
-    // The first two tiers are unchanged, which is what makes this an extension rather than a replacement.
+    // Confirmed against the same-day and within-week fixtures used throughout this suite.
     assert.equal(formatRunTime(SAME_DAY, NOW), clockOf(SAME_DAY), "an instant today still renders as the clock alone");
     assert.equal(formatRunTime(NEXT_DAY, NOW), weekdayOf(NEXT_DAY) + " " + clockOf(NEXT_DAY), "and one within the week still carries its weekday");
   });
@@ -307,7 +307,7 @@ describe("hydrawise webUI suspension and availability display", () => {
 
   test("a reachable controller, and one whose availability is unknown, both fold exactly as they always have", () => {
 
-    // The parity half: the availability arm must not disturb the fold for the two cases every existing install presents.
+    // The parity half: the availability arm must not disturb the fold for an install that reports itself reachable or one that carries no availability at all.
     const reachable: HydrawiseScheduleProjection = { activeWindowSeconds: WINDOW, asOf: NOW, online: true, zones: [runningEntry(1, SAME_DAY)] };
 
     assert.equal(deriveControllerDisplay(reachable, {}, NOW).status, "Watering", "a reachable controller folds on its zones alone");

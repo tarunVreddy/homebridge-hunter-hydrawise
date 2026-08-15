@@ -1,8 +1,8 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * runtime-floor.test.ts: The engines-keyed conformance guard for this plugin's explicit-resource-management gesture. While the package's `engines.node` floor sits
- * below the Node release that ships DisposableStack, AsyncDisposableStack, and SuppressedError as platform globals, this suite asserts two things: that the entry
- * point installs them as its FIRST import, ahead of anything that could construct a stack, and that the test harness mirrors the same install for the suites that
+ * below the Node release that ships DisposableStack, AsyncDisposableStack, and SuppressedError as platform globals, this suite asserts that the entry point
+ * installs them as its FIRST import, ahead of anything that could construct a stack, and that the test harness mirrors the same install for the suites that
  * construct the platform without ever loading the entry point. The moment the floor is bumped to that release, the live assertion fails with an enumerated cleanup
  * list - the anti-forget mechanism that turns "delete the polyfill gesture" from a thing to remember into a thing the suite demands.
  *

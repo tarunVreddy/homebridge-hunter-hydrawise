@@ -38,28 +38,32 @@ export interface HydrawiseFeatureOption extends Omit<FeatureOptionEntry, "scopes
   readonly scopes: readonly [ FeatureOptionScope, ...FeatureOptionScope[] ];
 }
 
-// The controller-scopable option names, mirroring at compile time the entries whose scopes declaration includes "controller". This is the runtime's narrowed lookup
-// key: a call to hasFeature must name one of these, so passing a zone-only option to the controller-level lookup is a type error. A catalog this small makes a derived
-// mapping overkill, so we keep this compile-time mirror explicit and bind it by convention to the entries' scopes declarations below.
+// The controller-scopable boolean option names, mirroring at compile time the boolean-tested entries whose scopes declaration includes "controller". The
+// value-centric Name entry carries "controller" too, but it resolves instead through the value-centric HydrawiseControllerValueOption union below, so this
+// type covers only the boolean half of the controller-scoped catalog. This is the runtime's narrowed lookup key: a call to hasFeature must name one of
+// these, so passing a zone-only option to the controller-level lookup is a type error. A catalog this small makes a derived mapping overkill, so we keep
+// this compile-time mirror explicit and bind it by convention to the entries' scopes declarations below.
 export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone";
 
-// The zone-scopable option names, mirroring at compile time the entries whose scopes declaration includes "device" - the level this plugin projects as a zone. A call
-// to hasZoneFeature must name one of these, so passing Device.Suspend.All (controller-only) with a zone id is a type error rather than a latent scope violation.
+// The zone-scopable boolean option names, mirroring at compile time the boolean-tested entries whose scopes declaration includes "device" - the level this
+// plugin projects as a zone. The value-centric Name entry carries "device" too, but it resolves instead through the value-centric HydrawiseZoneValueOption
+// union below, so this type covers only the boolean half of the zone-scoped catalog. A call to hasZoneFeature must name one of these, so passing
+// Device.Suspend.All (controller-only) with a zone id is a type error rather than a latent scope violation.
 export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone";
 
 // The zone-scopable value-centric option names, mirroring at compile time the value-bearing entries the zone level admits. The value accessor narrows against this,
 // so asking for a boolean option's value, or for a value option the zone level does not admit, is a type error.
 export type HydrawiseZoneValueOption = "Device.Name";
 
-// The controller-scopable value-centric option names, the controller grain's mirror of the union above. The two readers are separate for the same reason the two
-// boolean readers are: each narrows against the grain it addresses, so handing a zone id where a controller serial belongs is a type error rather than a lookup
-// that quietly resolves the wrong entry.
+// The controller-scopable value-centric option names, the controller grain's mirror of the union above. Each value-centric reader is separate from the
+// others for the same reason the boolean readers are: it narrows against the grain it addresses, so handing a zone id where a controller serial belongs
+// is a type error rather than a lookup that quietly resolves the wrong entry.
 export type HydrawiseControllerValueOption = "Device.Name";
 
-// The globally-scoped value-centric option names - the account credentials and the two MQTT settings the plugin resolves once at startup. The platform's
-// consolidated resolver narrows against this, so asking it for an option that carries no global value is a type error. The two Mqtt members name the library
-// factory's published entries and are bound to them by convention exactly as the unions above are bound to the catalog entries below; renaming either of those
-// entries is a breaking change on the library's side.
+// The globally-scoped value-centric option names - the account credentials and the MQTT settings the plugin resolves once at startup. The platform's
+// consolidated resolver narrows against this, so asking it for an option that carries no global value is a type error. The Mqtt members name the library
+// factory's published entries and are bound to them by convention exactly as the unions above are bound to the catalog entries below; renaming any of
+// those entries is a breaking change on the library's side.
 export type HydrawiseGlobalValueOption = "Account.ApiKey" | "Account.Password" | "Account.Username" | "Mqtt.Topic" | "Mqtt.Url";
 
 // The globally-scoped boolean option names - the settings the plugin resolves once at startup as a simple on or off. The platform's flag resolver narrows against

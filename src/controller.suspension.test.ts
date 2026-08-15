@@ -3,10 +3,14 @@
  * controller.suspension.test.ts: The per-zone suspension switches - where they exist, where they must not, what they show, and what a tap on one does. Covers the
  * creation gate and the subtype the sweep depends on, the name resynchronization a zone rename drives, the optimistic command and its revert, the command guard
  * that keeps a snapshot older than the user's own tap from undoing it, the account-wide command's per-zone stamp, and the subtype-scoped sweep that must never
- * touch the account-wide switch it shares a service type with.
+ * touch the account-wide switch it shares a service type with. It also covers how a suspension command composes at once into the persisted schedule projection,
+ * the MQTT payload, and the log line, including the window a running zone's honest projection holds open against an accepted command and a restart's carried
+ * suspension reconciling against the first fresh facts to arrive.
  *
- * Every command runs against the platform double's recording suspension surface, so no test here reaches the account API or its client - the client's own
- * admission and transport behavior is pinned in its suite, and what this one pins is the projection above it.
+ * Every command but one runs against the platform double's recording suspension surface, so most of this file never reaches the account API or its client - the
+ * client's own admission and transport behavior is pinned in its own suite, and what these tests pin is the projection above it. The one exception drives a real
+ * account-credentialed client over a mocked transport, proving that a transport failure produces exactly one sentence for the user across every layer that could
+ * have spoken about it.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
@@ -419,7 +423,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
     await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
 
-    /* Reject-with-feedback, made legible. The two refusals ask the user for different things - wait a moment, against look at your account - so they must not
+    /* Reject-with-feedback, made legible. These two refusals ask the user for different things - wait a moment, against look at your account - so they must not
      * share a sentence, and a user who sees the pacing one knows their command was never sent.
      */
     assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. The Hydrawise account API is pacing requests"),
@@ -479,7 +483,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
   test("a command that finds no account client at all says what is missing", async (t) => {
 
-    /* The fourth answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is pinned
+    /* The missing-client answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is pinned
      * here all the same, because the handler answers to every outcome the surface declares - and an unnamed one would compile into a switch reverting in silence.
      */
     const h = buildController({ hasV2Client: true,

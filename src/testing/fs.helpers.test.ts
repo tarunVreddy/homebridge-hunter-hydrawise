@@ -57,6 +57,8 @@ describe("withTempDir", () => {
     await assert.rejects(() => access(captured), /ENOENT/, "directory should be gone even though callback rejected");
   });
 
+  // Distinct from the plain-directory cleanup above: this pins the recursive-removal behavior a populated directory requires, since a bare rmdir
+  // (or rm without recursive:true) would fail on a non-empty directory with ENOTEMPTY.
   test("cleans up a directory containing files", async () => {
 
     const dir = await withTempDir(async (d) => {

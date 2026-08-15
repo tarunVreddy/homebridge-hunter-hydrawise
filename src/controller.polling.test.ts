@@ -85,8 +85,8 @@ describe("HydrawiseController polling loop structure", () => {
       cleanup();
     });
 
-    /* This fixture throws inside the loop's wire half, at the name trim. Its sibling below throws inside the projection half instead, and the two assert the same
-     * three observables: the halves sit under one envelope, so a fault from either has to arrive at the same reporter and end the same loop. Covering only one
+    /* This fixture throws inside the loop's wire half, at the name trim. Its sibling below throws inside the projection half instead, and the two assert the
+     * same observables: the halves sit under one envelope, so a fault from either has to arrive at the same reporter and end the same loop. Covering only one
      * side would leave a regression that swallowed the other side's throw free to pass.
      */
     await waitFor(() => (countLogged(h.lines(), "error", "stopped unexpectedly") >= 1) ? true : undefined);

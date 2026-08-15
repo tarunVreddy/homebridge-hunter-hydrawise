@@ -27,7 +27,7 @@ export default hbPluginUtils({
    * We turn off only the rules needed for test infrastructure so the rest of the strict preset still applies. Mirrors the same admission unifi-protect uses.
    */
   extraConfigs: [
-    // server.js runs in Node, so it needs console and fetch declared as readonly globals - the js preset applied to that file pattern does not supply them on its own.
+    // server.js runs in Node and calls fetch directly, so this declares fetch as a readonly global - the js preset for this file pattern does not supply it on its own.
     { files: ["homebridge-ui/server.js"], languageOptions: { globals: { console: "readonly", fetch: "readonly" } } },
     {
 

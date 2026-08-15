@@ -4,9 +4,11 @@
  * production code against recorded wire traffic and never touch the live account API. Covers token acquisition, lazy renewal, the reset a failed grant performs,
  * the single-flight guarantee two concurrent callers rest on, the selection the account query asks for, the facts composition rules - hardware, availability,
  * per-zone suspension, and the sensor derivation - the rate-budget draws, and the failure classifications, including the one that matters most for a GraphQL
- * endpoint, an HTTP 200 whose body carries an errors array.
+ * endpoint, an HTTP 200 whose body carries an errors array. It also covers the zone-suspension command path in full: the admission a per-zone write takes on
+ * its own ceiling, the race that admission runs against a token grant shared with the scheduled reads, and the pool re-arm a timed-out call triggers along
+ * the way.
  *
- * Every fixture body below is taken from the live probe captures under the arc's own capture set, so a wrong field mapping fails here rather than in the field.
+ * Every fixture body below is taken from the live probe captures, so a wrong field mapping fails here rather than in the field.
  */
 // The OAuth and GraphQL wire shapes use snake_case keys such as access_token, so camelcase is disabled here to let the fixtures mirror the captured bodies verbatim.
 /* eslint-disable camelcase */
@@ -26,7 +28,7 @@ import util from "node:util";
 // The origin every v2 request targets, derived from the endpoint constant exactly as the client derives its own pool origin.
 const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
 
-// The two paths the client posts to, likewise derived so a changed endpoint constant moves the intercepts with it rather than silently matching nothing.
+// The paths the client posts to, likewise derived so a changed endpoint constant moves the intercepts with it rather than silently matching nothing.
 const GRAPH_PATH = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname;
 const TOKEN_PATH = new URL(HYDRAWISE_V2_TOKEN_ENDPOINT).pathname;
 
@@ -101,7 +103,8 @@ const GRAPH_ERRORS_BODY = { data: { me: { controllers: [] } },
     path: [ "me", "controllers", 0, "sensors", 0, "model", "mode" ] }] };
 
 // One recorded request the injected dispatcher served, in the order it was served. The path is what tells a token grant from a query, and the order is what a
-// budget-before-dispatch pin reads. BOTH ceilings are sampled, because a draw attributed to the wrong one is exactly what a split into two ceilings can get wrong.
+// budget-before-dispatch pin reads. Every ceiling the client draws against is sampled, because a draw attributed to the wrong one is exactly what a split
+// budget can get wrong.
 interface RecordedCall {
 
   budgetAvailableAtDispatch: number;
@@ -120,7 +123,8 @@ interface V2Harness {
 }
 
 /* Build a client over a MockAgent handed in through the constructor's dispatcher factory - the SAME parameter production leaves unset, so nothing here is a path
- * production does not have. The factory answers one agent for the life of the harness; a test that wants to observe the timeout self-heal would supply its own.
+ * production does not have. The factory answers one agent for the life of the harness; a test needing the timeout self-heal path constructs HydrawiseV2Client
+ * directly instead, since this harness offers no way to override the factory it builds.
  *
  * Each intercept records the call before it replies, capturing both ceilings' free slots AT DISPATCH. Those numbers are what prove the draw is awaited rather than
  * merely present: a call that reached the wire without waiting would be recorded with its ceiling untouched. Each capacity is settable on its own, which is what
@@ -913,8 +917,8 @@ describe("HydrawiseV2Client zone suspension", () => {
   test("reads the status word out of the field its OWN mutation answers under", async () => {
 
     /* The two mutations nest their answer under different field names, so a reader that looked at one field for both would pass every test written against that
-     * one shape and misread the other in the field. All four combinations are driven here, plus the pair that proves the correlation rather than the parsing: a
-     * body answering under the SIBLING mutation's name is not this command's answer at all, and reads as a refusal rather than as a success.
+     * one shape and misread the other in the field. Every combination of mutation and outcome is driven here, plus the pair that proves the correlation rather
+     * than the parsing: a body answering under the SIBLING mutation's name is not this command's answer at all, and reads as a refusal rather than as a success.
      */
     const cases = [
       { answer: { data: { suspendZone: { status: "OK" } } }, expected: { status: "done" }, until: PROBE_SUSPEND_UNTIL },
@@ -1062,7 +1066,7 @@ describe("HydrawiseV2Client zone suspension", () => {
 
     assert.deepEqual(await command, { status: "rejected" }, "the window closed on a grant still in flight, so the command is rejected");
 
-    // The three faces of the misclassification this structure exists to make unrepresentable. An admission abort that reached the failure classification would
+    // The faces of the misclassification this structure exists to make unrepresentable. An admission abort that reached the failure classification would
     // re-arm the pool, would report itself as a request that took too long, and - by way of the grant it aborted - would reset the token state.
     assert.equal(harness.client.dispatcher, pool, "an admission abort never re-arms the connection pool");
     assert.deepEqual(errorLines(harness.lines()), [], "and never narrates itself as a request timeout, or as anything else");

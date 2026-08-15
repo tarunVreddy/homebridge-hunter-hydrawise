@@ -4,7 +4,7 @@
  * MQTT client, the programmable retrieve recorder, the undici MockAgent installer, and the buildController / buildPlatform construction workhorses. Every cast
  * that bridges a double to a production constructor's parameter type is confined to a workhorse, so test bodies stay cast-free.
  *
- * Two wire boundaries by design. Controller tests never touch undici: the platform double's retrieve is a programmable recorder that records every call and
+ * The wire boundaries are by design. Controller tests never touch undici: the platform double's retrieve is a programmable recorder that records every call and
  * returns fixture-programmed response shapes. Platform tests construct a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the
  * global dispatcher after construction, so the real status-code classification and error taxonomy run unchanged.
  */
@@ -78,7 +78,8 @@ interface RecordedMqttSet {
   type: string;
 }
 
-// A recorded MQTT publish.
+// A recorded MQTT publish. Tests read these to assert on publish cadence - how many times a poll or command published - and to parse a specific payload for
+// the state it carries.
 interface RecordedMqttPublish {
 
   payload: string;
@@ -87,7 +88,9 @@ interface RecordedMqttPublish {
 
 /* A recording double of the homebridge-plugin-utils MqttClient surface the controller consumes: subscribeGet, subscribeSet, publish. It records every
  * subscription and publish so tests invoke a registered get / set handler and assert on the published topics and payloads, all without a live broker. The
- * per-subscription abort signal the controller passes is ignored - these tests assert on recorded traffic, not teardown.
+ * signal a set handler receives is normally composed by homebridge-plugin-utils's MqttClient itself, from its connection-level signal and any per-invocation
+ * timeout; the double stands in for that composition with a fresh AbortController per call rather than reproducing it - these tests assert on recorded
+ * traffic, not teardown.
  */
 export class TestMqttClient {
 
@@ -174,7 +177,7 @@ export class RetrieveRecorder {
     this.defaults.set(endpoint, response);
   }
 
-  // Count the recorded calls to a given endpoint.
+  // The recorded calls to a given endpoint, in call order.
   public callsTo(endpoint: string): RecordedRetrieveCall[] {
 
     return this.calls.filter(call => call.endpoint === endpoint);
@@ -212,8 +215,8 @@ export class RetrieveRecorder {
   }
 }
 
-// The HAP namespace shape both doubles expose: the Service / Characteristic test namespaces plus a deterministic uuid generator that echoes its input, so an
-// accessory's UUID is simply the controller id string production hands it.
+// The HAP namespace shape every double in this file exposes: the Service / Characteristic test namespaces plus a deterministic uuid generator that echoes
+// its input, so an accessory's UUID is simply the controller id string production hands it.
 interface TestHap {
 
   Characteristic: typeof Characteristic;
@@ -337,7 +340,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     suspensions.push(request);
 
     // With a real client supplied, this stands in only for the platform's mapping - which passes the client's answer through untouched - so the command runs the
-    // whole production path beneath it. The platform's own four-state mapping is pinned in its own suite.
+    // whole production path beneath it. The platform's own outcome mapping is pinned in its own suite.
     if(suspensionClient) {
 
       return suspensionClient.setZoneSuspension(request);
@@ -448,10 +451,10 @@ export interface BuildControllerResult extends MakeTestPlatformResult {
   controllerConfig: HydrawiseControllerConfig;
 }
 
-/* Construct a REAL HydrawiseController against the doubles - the controller-test workhorse. The two construction-boundary casts (platform, accessory) are the only
- * casts a controller test needs; everything the controller then does runs the real production code against the doubles. Returns the constructed controller plus
- * every handle a test asserts on: the TestAccessory (to read services and characteristics), the capture buffers, the recording MQTT double, and the retrieve
- * recorder.
+/* Construct a REAL HydrawiseController against the doubles - the controller-test workhorse. The construction-boundary casts (platform, accessory) bridge the
+ * doubles to the production constructor's parameter types; everything the controller then does runs the real production code against the doubles. Returns
+ * the constructed controller plus every handle a test asserts on: the TestAccessory (to read services and characteristics), the capture buffers, the
+ * recording MQTT double, and the retrieve recorder.
  */
 export function buildController(options: BuildControllerOptions = {}): BuildControllerResult {
 
@@ -467,15 +470,15 @@ export function buildController(options: BuildControllerOptions = {}): BuildCont
   // Seed the recorder before construction, because the controller's polling loop issues its first retrieve synchronously as the constructor runs.
   options.program?.(platformResult.retrieve);
 
-  // The construction-boundary casts (platform, accessory) bridge the doubles to the production constructor's parameter types - the only casts a controller test needs.
+  // The construction-boundary casts (platform, accessory) bridge the doubles to the production constructor's parameter types.
   const controller = new HydrawiseController(platformResult.platform as unknown as ConstructorParameters<typeof HydrawiseController>[0],
     accessory as unknown as ConstructorParameters<typeof HydrawiseController>[1], controllerConfig, roster);
 
   return { accessory, controller, controllerConfig, ...platformResult };
 }
 
-// A double of Homebridge's PlatformAccessory constructor: `new api.platformAccessory(name, uuid)` yields a TestAccessory, exactly what the real platform does on
-// its new-device branch.
+// A double of Homebridge's PlatformAccessory constructor: `new api.platformAccessory(name, uuid, category)` yields a TestAccessory, exactly what the real
+// platform's one accessory-creation path does.
 class TestPlatformAccessory extends TestAccessory {}
 
 // A recorded HAP event handler registered through api.on. The platform stores its DID_FINISH_LAUNCHING and SHUTDOWN handlers here; a test fires them explicitly.
@@ -747,7 +750,7 @@ export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseController
 /**
  * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually pinning.
  *
- * @param overrides - The facts to state: the hardware, the availability, and the per-zone entries keyed by relay id.
+ * @param overrides - The facts to state: the hardware, the name, the availability, and the per-zone entries keyed by relay id.
  *
  * @returns A fresh facts value.
  */
@@ -758,7 +761,7 @@ export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseController
 }
 
 /**
- * Compose one zone's account-credentialed facts, defaulting both fields to the answer that says nothing: no sensor reading, and no suspension.
+ * Compose one zone's account-credentialed facts, defaulting every field to the answer that says nothing: no name, no sensor reading, and no suspension.
  *
  * @param overrides - The facts to state.
  *
@@ -787,9 +790,10 @@ export interface BuildPlatformResult extends TestApiResult {
   platform: HydrawisePlatform;
 }
 
-/* Construct a REAL HydrawisePlatform against the API double - the platform-test workhorse. The two construction-boundary casts (log, api) are the only casts a
- * platform test needs: Homebridge's Logging is a callable with prefix / success / log members, so the plain-object capturing log bridges by cast rather than
- * being reshaped into a callable. The platform's constructor runs its full networking and MQTT setup; a test installs a MockAgent afterward to drive retrieve().
+/* Construct a REAL HydrawisePlatform against the API double - the platform-test workhorse. The construction-boundary casts (log, api) bridge the doubles to
+ * the production constructor's parameter types: Homebridge's Logging is a callable with prefix / success / log members, so the plain-object capturing log
+ * bridges by cast rather than being reshaped into a callable. The platform's constructor runs its full networking and MQTT setup; a test installs a
+ * MockAgent afterward to drive retrieve().
  */
 export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatformResult {
 
@@ -808,7 +812,7 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
     options: options.options ?? []
   };
 
-  // The construction-boundary casts (log, api) bridge the doubles to the production constructor's parameter types - the only casts a platform test needs.
+  // The construction-boundary casts (log, api) bridge the doubles to the production constructor's parameter types.
   const platform = new HydrawisePlatform(logger as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
     config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], apiResult.api as ConstructorParameters<typeof HydrawisePlatform>[2]);
 
@@ -825,7 +829,7 @@ export interface MockDispatcherHandle extends AsyncDisposable {
   agent: MockAgent;
 }
 
-/* Install a MockAgent as undici's global dispatcher, snapshotting the dispatcher in place so dispose restores it exactly. undici 8's request() reads the global
+/* Install a MockAgent as undici's global dispatcher, snapshotting the dispatcher in place so dispose restores it exactly. undici's request() reads the global
  * dispatcher fresh per call, so a MockAgent installed after the platform's constructor already armed a real Pool intercepts every retrieve() from that point.
  * The returned handle is an AsyncDisposable bound with `await using`, so the prior dispatcher is restored and the agent closed at scope exit regardless of throw.
  */

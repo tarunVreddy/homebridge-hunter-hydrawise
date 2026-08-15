@@ -98,8 +98,8 @@ describe("assertSameShape", () => {
 describe("declareKeysOf", () => {
 
   /* The primary contract is compile-time: a const array passed to declareKeysOf<T>() must exhaust every key of T or the call fails to compile. We can't test
-   * the compile-time failure path inside a runtime test (that would be a tsc-must-fail check, which lives in a separate negative-build test pattern not yet
-   * established here). The runtime tests below verify the trivial pass-through behavior - the function returns the array unchanged - which is the whole of its
+   * the compile-time failure path inside a runtime test - that would be a tsc-must-fail check, a build-time assertion distinct from anything node:test can
+   * express. The runtime tests below verify the trivial pass-through behavior - the function returns the array unchanged - which is the whole of its
    * runtime contract.
    */
 

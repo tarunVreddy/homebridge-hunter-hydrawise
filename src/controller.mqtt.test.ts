@@ -204,8 +204,8 @@ describe("HydrawiseController MQTT with account facts", () => {
       zones: [ [ 700001, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ], [ 700002, makeZoneV2Facts() ] ] });
   }
 
-  // One zone entry as the payload publishes it: the five wire fields this topic has always carried, and the two the account credentials add. Every field is
-  // optional because the additive pair is present only on a credentialed install whose facts are current, which is exactly what these pins are checking.
+  // One zone entry as the payload publishes it: the base wire fields this topic carries, and the fields the account credentials add. Every field is optional
+  // because the additive pair is present only on a credentialed install whose facts are current, which is exactly what these pins are checking.
   interface PublishedZone {
 
     name?: string;
@@ -266,7 +266,7 @@ describe("HydrawiseController MQTT with account facts", () => {
     assert.equal(parsed[1]?.state, "unscheduled", "its sibling reports its own state");
     assert.ok(!("suspendedUntil" in (parsed[1] ?? {})), "and carries no suspension instant at all");
 
-    // The five wire fields are untouched beneath the additions, which is what makes this sharpening additive rather than a reshaping.
+    // The zone's base wire fields are untouched beneath the additions, which is what makes this sharpening additive rather than a reshaping.
     assert.equal(parsed[0]?.name, "Alpha", "the wire name is unchanged");
     assert.equal(parsed[0]?.time, HYDRAWISE_UNSCHEDULED_SENTINEL, "and so is the wire time");
   });

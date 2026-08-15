@@ -16,7 +16,8 @@ const FAST_POLL_SECONDS = 0.05;
 
 /**
  * Build a single zone in the statusschedule wire shape. The defaults describe a zone running now (`time` of 1 with a positive remaining `run`); pass overrides
- * to model a scheduled, active-soon, or suspended zone.
+ * to model a scheduled or active-soon zone. A suspended zone is not reachable through this factory's fields alone - that state is classified from a
+ * commanded suspend-all timestamp, a v2 `facts.suspendedUntil`, or a carried-forward `priorSuspendedUntil`, none of which HydrawiseZoneConfig carries.
  *
  * @param overrides - Partial zone fields to override the running-now defaults.
  *

@@ -12,7 +12,8 @@ import { webUi } from "homebridge-plugin-utils/webUi.mjs";
 import { withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 
 // The feature-option category the controller-scope options this webUI reasons about live in. One constant anchors the category everywhere this file names it - the
-// floor-entry grammar, the catalog read, and the enable-state oracle - while the plugin's runtime names it independently in TypeScript; the two meet at the wire.
+// floor-entry grammar, the catalog read, the enable-state oracle, and the custom-name override's own option key - while the plugin's runtime names it
+// independently in TypeScript; the two meet at the wire.
 const DEVICE_CATEGORY = "Device";
 
 // The canonical lowercased key the Device feature option expands to. A controller-scope floor entry is an Enable/Disable action prefix, this key, and the serial id -
@@ -57,22 +58,22 @@ const sessionFloorSerials = new Set();
 const sessionZones = new Map();
 
 /* The bound in seconds on the shared option-catalog fetch below. The bound exists so a bridge call that never settles rejects rather than wedging the cached
- * promise for the life of the session, and it binds every consumer of that one fetch alike - the configuration wiring, the enable-state oracle, and the floor
- * scan. The trade it carries: a fetch that is legitimately slow but would eventually have settled costs a retry cycle rather than resolving, which is cheap
- * beside the permanent wedge the bound prevents, because the cache clears on rejection and a later read refetches fresh.
+ * promise for the life of the session, and it binds every consumer of that one fetch alike. The trade it carries: a fetch that is legitimately slow but would
+ * eventually have settled costs a retry cycle rather than resolving, which is cheap beside the permanent wedge the bound prevents, because the cache clears on
+ * rejection and a later read refetches fresh.
  */
 const CATALOG_DEADLINE = 5;
 
-/* The option catalog, fetched once per session from the plugin's own UI server (a local IPC to /getOptions, never a cloud call) and shared by the floor scan
- * and the enable-state oracle. The framework fetches the same endpoint for its own catalog on every show cycle; the two reads are independent by design,
- * since the framework exposes no handle to its copy - the duplication is one static local request per session. The cached promise is cleared on failure so a
- * later read retries rather than pinning a transient fault for the session, and the bound above is what makes a call that never answers a failure the clear
- * can act on.
+/* The option catalog, fetched once per session from the plugin's own UI server (a local IPC to /getOptions, never a cloud call) and shared by every reader of
+ * the catalog. The framework fetches the same endpoint for its own catalog on every show cycle; the two reads are independent by design, since the framework
+ * exposes no handle to its copy - the duplication is one static local request per session. The cached promise is cleared on failure so a later read retries
+ * rather than pinning a transient fault for the session, and the bound above is what makes a call that never answers a failure the clear can act on.
  */
 let catalogPromise = null;
 
-/* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts. The ticker serves two surfaces from one read - the sidebar's
- * zone dots and the details panel - and only the panel needs tracking here, because the dots are found by query at the moment they are painted:
+/* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts. The ticker serves every schedule-bearing surface from one
+ * read - the sidebar's zone dots and the details panel among them - and only the panel needs tracking here, because the dots are found by query at the moment
+ * they are painted:
  *
  *   - renderContext: a fresh { device, panel } object minted on every render of the details panel. Its OBJECT IDENTITY is what a tick's read compares against on
  *     resolution, which is how a read dispatched for a view the user has since left repaints no panel.
@@ -478,15 +479,6 @@ const firstRunOnSubmit = async ({ commit, config }) => {
 // The controller-as-device pseudo-entry is tagged "controller"; every other entry the server returns is a zone.
 const isController = (device) => device.kind === "controller";
 
-/* The name HomeKit last showed for a zone's valve, read from the matched cached accessory's serialized services. The valve is located the way the framework's own
- * cache reader locates a service - by the constructor name Homebridge serializes alongside it - narrowed by the subtype the runtime keys each valve on, which is
- * the zone's relay id.
- *
- * This is the LAST-FLUSHED name, not a live mirror: Homebridge rewrites the accessory cache when an accessory is registered, updated, or unregistered, never on a
- * bare characteristic write. Where name synchronization is enabled the plugin keeps each valve at its effective name, so this tracks that name closely; without
- * synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name HomeKit shows the user and
- * so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
- */
 /* One non-empty string characteristic value off a serialized cached service, located by the constructor name Homebridge serializes alongside it. Every reader of
  * the accessory cache below goes through here, so what counts as a usable value - present, a string, and not empty - is decided once rather than at each site.
  */
@@ -502,6 +494,15 @@ const cachedCharacteristic = (service, constructorName) => {
   return ((typeof value === "string") && value.length) ? value : undefined;
 };
 
+/* The name HomeKit last showed for a zone's valve, read from the matched cached accessory's serialized services. The valve is located the way the framework's own
+ * cache reader locates a service - by the constructor name Homebridge serializes alongside it - narrowed by the subtype the runtime keys each valve on, which is
+ * the zone's relay id.
+ *
+ * This is the LAST-FLUSHED name, not a live mirror: Homebridge rewrites the accessory cache when an accessory is registered, updated, or unregistered, never on a
+ * bare characteristic write. Where name synchronization is enabled the plugin keeps each valve at its effective name, so this tracks that name closely; without
+ * synchronization, a rename made in the Home app can sit here unflushed until the next write of the cache. ConfiguredName is the name HomeKit shows the user and
+ * so takes precedence over Name, matching how the plugin's own service helpers read a service's name.
+ */
 const cachedValveName = (accessory, relayId) => {
 
   const service = accessory?.services?.find((entry) => (entry?.constructorName === "Valve") && (entry?.subtype === relayId.toString()));
@@ -536,12 +537,13 @@ const cachedControllerHardware = (accessory) => {
   return { firmware, model };
 };
 
-/* Return the account's irrigation controllers for the two-level sidebar, with zero automatic cloud calls. We merge three sources into the session roster and return
- * it: (a) the denormalized controller roster every cached accessory carries in its context - any one accessory knows every sibling, enabled or not; (b) the config
- * floor, whose Disable entries name controllers the user turned off (so they have no accessory), listed by serial until a refresh names them and screened against the
- * option catalog so a global-scope option entry never reads as a controller; and (c) the session roster itself, so a controller that appeared once stays listed. A
- * controller whose floor Disable the user removed this session, with no live accessory yet, is marked as awaiting a restart. The apiKey is never consulted here - the
- * listing is answered from the local accessory cache, the local config, and the option catalog the plugin's own UI server publishes.
+/* Return the account's irrigation controllers for the two-level sidebar, with zero automatic cloud calls. We merge the following sources into the session roster
+ * and return it: (a) the denormalized controller roster every cached accessory carries in its context - any one accessory knows every sibling, enabled or not;
+ * (b) the config floor, whose Disable entries name controllers the user turned off (so they have no accessory), listed by serial until a refresh names them and
+ * screened against the option catalog so a global-scope option entry never reads as a controller; and (c) the session roster itself, so a controller that
+ * appeared once stays listed. A controller whose floor Disable the user removed this session, with no live accessory yet, is marked as awaiting a restart. The
+ * apiKey is never consulted here - the listing is answered from the local accessory cache, the local config, and the option catalog the plugin's own UI server
+ * publishes.
  *
  * The resolution carries the listing and the connection outcome together, which is the framework's contract for this hook. Reporting a failed read through the error
  * half rather than a toast is what lets the page tell "this account has no controllers configured" apart from "the controllers could not be read": the first is a
@@ -709,6 +711,13 @@ const getDevices = async (controller, { config } = {}) => {
       if(!enabled) {
 
         notice = NOTICE_DISABLED;
+
+      /* Enabled with no accessory of its own still splits in two: matched covers this controller having a live accessory whose zones simply failed to
+       * resolve, and the cache scan covers one with no accessory of its own at all. That scan is not hunting for another controller's accessory - every
+       * accessory this plugin's own writers currently produce carries one of the two well-formed shapes isZoneAccessoryLike and isControllerIdentity test
+       * for - so a cached entry matching neither shape can only be a leftover or malformed one. Even that is still evidence the plugin has written to the
+       * accessory cache before, which is why its presence favors the milder "not published yet" notice over the harsher "never discovered" one.
+       */
       } else if(matched || cached.some((accessory) => !isZoneAccessoryLike(accessory?.context) && !isControllerIdentity(accessory?.context?.controller))) {
 
         notice = NOTICE_UNPUBLISHED;
@@ -839,8 +848,8 @@ const getDevices = async (controller, { config } = {}) => {
 /* Refine which feature options a device row shows, by the scope levels the option declares. The framework's own view-kind gate has already run by the time we are
  * asked, admitting an option to a device view when it declares either the controller or the device level; this narrows that to the kind of device in hand, so the
  * controller pseudo-entry shows only controller-scopable options and a zone shows only zone-scopable ones. The optional chaining is what keeps an entry that
- * declares no scopes from throwing here - such an entry is valid at every level - and the global case returns true unconditionally because only options the
- * framework already admitted globally ever reach it.
+ * declares no scopes from throwing here - such an entry is excluded from every device-scoped view, since neither branch's includes() can find a scope in an
+ * undefined list - and the global case returns true unconditionally because only options the framework already admitted globally ever reach it.
  */
 const validOption = (device, option) => {
 
@@ -949,9 +958,9 @@ const renderDeviceDetails = ({ device, panel }) => {
 
   if(isController(device)) {
 
-    /* A controller renders as two lines inside one bordered box: an identity-and-state strip across the top, then whatever detail the schedule has to add. The
-     * framework's own status-grid modifier already expresses exactly that - it wraps the cells and sizes each to its own content - so the layout is composed from
-     * the shared classes rather than from new local CSS, and a full-width break element forces the split between the two lines.
+    /* A controller renders inside one bordered box as an identity-and-state strip across the top, then whatever detail the schedule has to add. The framework's
+     * own status-grid modifier already expresses exactly that - it wraps the cells and sizes each to its own content - so the layout is composed from the shared
+     * classes rather than from new local CSS, and a full-width break element separates the strip from the schedule detail below it.
      *
      * The hardware cells lead when real facts have landed and are absent otherwise, so an install running on the API key alone shows a shorter strip rather than
      * placeholder cells that would claim knowledge the plugin does not have.
@@ -1060,7 +1069,7 @@ const applyDotState = (dot, state) => {
  * whatever we return in place of the device name; a null return leaves the framework's default name rendering alone, which is how the controller pseudo-entry
  * keeps its plain label.
  *
- * A zone renders as three aligned columns - its state dot, its number, and its name - because a right-aligned number column is what makes every name start at one
+ * A zone renders as aligned columns - its state dot, its number, and its name - because a right-aligned number column is what makes every name start at one
  * shared edge, however many digits the numbers around it carry. A zone the configuration disables is still a real zone at Hydrawise, so it is set apart rather
  * than struck out: an italic, muted name with a tooltip saying what is different about it.
  *
@@ -1282,8 +1291,8 @@ const featureOptionsParams = {
      * own show() so the refreshed roster renders. Nothing here disables a control or repaints a view, because the framework owns the button's in-flight state, the
      * re-entry, and the toast a rejection surfaces through.
      *
-     * A refreshed roster costs one Hydrawise call, plus one request that loops server-side over the controllers with no live accessory - the disabled ones, whose
-     * zones nothing else on this page can resolve - so a successful refresh drives 1 + K upstream calls for K disabled controllers.
+     * A refreshed roster costs one Hydrawise call, plus one request that loops server-side over the controllers with no live accessory - whatever kept them from
+     * getting one, since their zones are otherwise unresolvable on this page - so a successful refresh drives 1 + K upstream calls for K such controllers.
      *
      * The failure postures differ by what has already succeeded. A failed controller fetch throws, which is what leaves the page exactly as it stands: the framework
      * declines to re-enter, so a refresh that learned nothing cannot present as one that did. The partial failures after the roster is seeded resolve instead, and

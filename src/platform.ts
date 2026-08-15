@@ -138,7 +138,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    // Initialize our network connectivity.
     this.initNetworking();
 
     /* Build the optional account-credentialed client, and only when BOTH credentials are configured. The gate is an AND rather than an OR because a grant needs the
@@ -189,7 +188,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Hydrawise API enumeration.
   public configureAccessory(accessory: HydrawiseAccessory): void {
 
-    // Add this to the accessory array so we can track it.
     this.accessories.push(accessory);
   }
 
@@ -201,10 +199,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // outside the retry, so a genuine configuration fault escapes to the supervisor's reporter rather than becoming a silent 60-second retry.
     this.account = await retry(async (): Promise<CustomerDetailsResponse> => {
 
-      // Get our list of controllers.
       const response = await this.retrieve("customerdetails.php");
 
-      // A null response is a recoverable API error (or a shutdown abort) that retrieve() already classified and logged. Throw so retry waits and tries again.
+      // A null response is either a recoverable API error retrieve() already logged, or a shutdown abort it left silent. Throw so retry waits and tries again.
       if(!response) {
 
         throw new Error("Unable to retrieve the list of controllers.");
@@ -231,7 +228,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     this.log.debug(util.inspect(this.account, { colors: true, depth: null, sorted: true }));
 
-    // Trim whitespace on irrigation controller names.
+    // Trim whitespace off each controller's wire-reported name here, once, so every downstream name comparison and the persisted identity roster this feeds
+    // compare cleanly against a value Hydrawise itself may pad.
     this.account.controllers = this.account.controllers.map(x => ({ ...x, name: x.name.trim() }));
 
     // Map the trimmed account to the persisted controller-identity shape once, so every controller we configure seeds the same denormalized roster into its accessory
@@ -324,8 +322,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.info("Successfully connected to the Hydrawise account API for enhanced features.");
     }
 
-    /* Hand each controller its own facts, matched on the id v2 and v1 agree about. The walk is over the CONFIGURED controllers rather than over the fetched map,
-     * so a controller the user disabled, or one the account reports that this plugin never built, is simply skipped rather than looked up and dropped.
+    /* Hand each controller its own facts, matched on the id v2 and v1 agree about. The walk is over the account's own controller list rather than over the
+     * fetched map, so a controller the user disabled, or one the account reports that this plugin never built, is simply skipped rather than looked up and
+     * dropped.
      */
     for(const controller of this.account.controllers) {
 
@@ -390,7 +389,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     return this.v2Client !== undefined;
   }
 
-  /* Suspend one zone until an instant, or resume it - the single per-zone write surface every controller commands through, exactly as retrieve() is the single
+  /** Suspend one zone until an instant, or resume it - the single per-zone write surface every controller commands through, exactly as retrieve() is the single
    * key-based one. The account-credentialed client stays private to this class, so what a controller ever sees is the outcome alone.
    *
    * The pre-check reads the COMMAND ceiling, which is the one a command draws, and it answers the common saturated case for FREE: a ceiling with nothing to give
@@ -457,26 +456,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // identity.
   private configureController(controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]): Nullable<HydrawiseController> {
 
-    // Generate this controller's unique identifier.
     const uuid = this.hap.uuid.generate(controller.controller_id.toString());
-
-    // See if we already know about this accessory or if it's truly new.
     let accessory = this.accessories.find(x => x.UUID === uuid);
 
-    // Check to see if the user has disabled the device.
     if(!this.isControllerEnabled(controller.serial_number)) {
 
-      // If the accessory already exists, let's remove it.
       if(accessory) {
 
         this.removeAccessory(accessory);
       }
 
-      // We're done.
       return null;
     }
 
-    // If we've already configured this device before, we're done.
     if(this.configuredDevices[uuid]) {
 
       return null;
@@ -490,10 +482,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     const nameOverride = this.featureOptions.value("Device.Name", controller.serial_number)?.trim();
 
-    // It's a new device - let's add it to HomeKit.
     accessory ??= this.addAccessory(sanitizeName(nameOverride?.length ? nameOverride : controller.name), uuid);
 
-    // Inform the user.
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
     /* Add it to our list of configured devices. The controller seeds its accessory context during construction; the flush just below persists that seed.
@@ -505,7 +495,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     this.configuredDevices[uuid] = new HydrawiseController(this, accessory as HydrawiseControllerAccessory, controller, roster);
 
-    // Refresh the accessory cache.
     this.api.updatePlatformAccessories([accessory]);
 
     return this.configuredDevices[uuid];
@@ -541,16 +530,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    // Inform the user.
     this.log.info("%s: Removing device from HomeKit.", accessory.displayName);
 
-    // Unregister the accessory and delete it's remnants from HomeKit.
+    // Unregister the accessory and delete its remnants from HomeKit.
     this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     this.accessories.splice(index, 1);
     this.api.updatePlatformAccessories(this.accessories);
   }
 
-  /* Reconcile this controller's standalone zone accessories against one poll's truth - the single chokepoint through which every zone-accessory creation, context
+  /** Reconcile this controller's standalone zone accessories against one poll's truth - the single chokepoint through which every zone-accessory creation, context
    * write, and removal passes, so the platform stays the sole registrar and the accessory roster the orphan sweep reads can never fork. The controller calls it
    * once per poll and hosts each zone's valve from the map it returns, so the hosting decision and the pruning decision read one source of truth.
    *
@@ -707,7 +695,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // onto the fresh pool through their own retry loops, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
     void this.dispatcher?.destroy();
 
-    // We want to enable the use of HTTP/2 and retry a request up to three times.
+    /* Enable HTTP/2 and bound retry attempts at maxRetries below. The statusCodes list names every status this interceptor treats as retryable, and it is kept
+     * byte-identical by hand to the serverErrors Set retrieve() builds for its own classification - a status added to or dropped from one list is expected to
+     * move in the other too, since nothing here derives one list from the other.
+     */
     this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connections: 1 })
       .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 }));
 
@@ -717,15 +708,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Communicate HTTP requests with the Hydrawise API.
   public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
-    // Catch Hydrawise server-side issues:
-    //
-    // 400: Bad request.
-    // 404: Not found.
-    // 429: Too many requests.
-    // 500: Internal server error.
-    // 502: Bad gateway.
-    // 503: Service temporarily unavailable.
-    // 504: Gateway timeout.
+    /* The status codes that share the "temporarily unavailable" message below, mirroring the retry interceptor's own statusCodes list in initNetworking() so
+     * the two stay in sync. 404 and 429 are carried here for that symmetry but never actually reach this classification - each is resolved by its own
+     * dedicated branch earlier in this method and returns before this point - so in practice only these produce the message:
+     *
+     * 400: Bad request.
+     * 500: Internal server error.
+     * 502: Bad gateway.
+     * 503: Service temporarily unavailable.
+     * 504: Gateway timeout.
+     */
     const serverErrors = new Set([ 400, 404, 429, 500, 502, 503, 504 ]);
 
     let response: Dispatcher.ResponseData<unknown>;
@@ -744,9 +736,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
        * into the classification below, whose aborted-signal branch returns the same quiet null every other teardown path returns.
        *
        * Two limits on what these budgets can promise, stated plainly. They admit LOGICAL calls and sit above undici's retry interceptor, so one admitted call can
-       * still put up to four requests on the wire during a failure storm - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is
-       * not the cause of. And they account only for this process: the Homebridge config UI runs its own server process against the same account, one
-       * customerdetails call per refresh plus one statusschedule call per controller it holds no cached context for, which an in-process window cannot see.
+       * still put more than one request on the wire during a failure storm - the initial attempt plus whatever retries the interceptor's maxRetries setting in
+       * initNetworking() allows - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is not the cause of. And they account only
+       * for this process: the Homebridge config UI runs its own server process against the same account, one customerdetails call per refresh plus one
+       * statusschedule call per controller it holds no cached context for, which an in-process window cannot see.
        */
       if(endpoint === HYDRAWISE_COMMAND_ENDPOINT) {
 
@@ -757,12 +750,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       params ??= {};
 
-      // Set our API key.
       params["api_key"] = this.config.apiKey;
 
       const queryParams = new URLSearchParams(params);
 
-      // Construct our API call.
       url = "https://api.hydrawise.com/api/v1/" + endpoint + "?" + queryParams.toString();
 
       // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
@@ -770,10 +761,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       // into the time the request itself is allowed.
       const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
 
-      // Execute the API call.
       response = await request(url, { signal });
 
-      // Bad username and password.
+      // Invalid API key.
       if(response.statusCode === 404) {
 
         this.log.error("Invalid API key. Please check your Hydrawise API key.");
@@ -829,7 +819,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         return null;
       }
 
-      // We destroyed the pool due to a reset event and our inflight connections are failing.
+      // The retry interceptor exhausted its configured retries against one of the codes in its statusCodes list (set in initNetworking()); undici wraps the
+      // exhausted attempt as RequestRetryError once maxRetries is exceeded.
       if(error instanceof errors.RequestRetryError) {
 
         this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
@@ -839,6 +830,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       if(error instanceof TypeError) {
 
+        // The cast assumes undici and Node's fetch implementation surface a Node system error as TypeError.cause for a connection failure, which is what gives
+        // it the .code property the switch below reads.
         const cause = error.cause as NodeJS.ErrnoException;
 
         switch(cause.code) {

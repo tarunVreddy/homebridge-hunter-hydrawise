@@ -38,13 +38,15 @@ export const formatMinutes = (seconds) => {
   return minutes.toString() + " minute" + ((minutes !== 1) ? "s" : "");
 };
 
-/* Render an absolute instant for a reader in THIS BROWSER's timezone, in three tiers: the clock time alone when it falls on the same calendar day as the render, a
- * short weekday ahead of it within the coming week, and a locale date beyond that, where a weekday alone would name a day months away as though it were this one.
+/* Render an absolute instant for a reader in THIS BROWSER's timezone, in escalating tiers of precision: the clock time alone when it falls on the same calendar
+ * day as the render, a short weekday when it falls within a week of the render in either direction, and a locale date beyond that week, where a weekday alone
+ * would name a day months away - ahead or behind - as though it were this one.
  * The runtime's own log line renders the wire's controller-local start string instead, so the two surfaces can legitimately differ for a user viewing from another
  * timezone - the epoch is the truth and each surface renders it honestly for its own reader.
  *
- * The third tier serves the suspension instant, which routinely sits years out, and it is an extension of this formatter rather than a sibling beside it: the
- * first two tiers are already exactly what a suspension needs, and a second formatter restating them would split the display tier's one date policy in two.
+ * The locale-date tier also serves the suspension instant, which routinely sits years out, and it is an extension of this formatter rather than a sibling beside
+ * it: the same-day and within-a-week tiers are already exactly what a suspension needs, and a second formatter restating them would split the display tier's one
+ * date policy in two.
  */
 export const formatRunTime = (epochSeconds, nowSeconds) => {
 

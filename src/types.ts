@@ -125,7 +125,7 @@ export interface SetZoneResponse {
   message_type: "error" | "info";
 }
 
-/* Hydrawise v2 API: the OAuth2 token endpoint's response, typed to the three fields the client consumes. The lifetime arrives as a duration in seconds rather than
+/* Hydrawise v2 API: the OAuth2 token endpoint's response, typed to the fields the client consumes. The lifetime arrives as a duration in seconds rather than
  * an instant, so the client turns it into an absolute expiry against its own clock at the moment it reads the response.
  *
  * Every field is optional, because this describes untrusted JSON rather than a promise the wire keeps. Each absence has its own honest handling: a grant carrying
@@ -139,8 +139,8 @@ export interface HydrawiseV2TokenResponse {
   refresh_token?: string;
 }
 
-/* Hydrawise v2 API: the envelope every GraphQL response arrives in, parameterized by the selection's own data shape. Both halves are optional because both absences
- * are real: a request that failed carries errors and no data, and a malformed answer can carry neither.
+/* Hydrawise v2 API: the envelope every GraphQL response arrives in, parameterized by the selection's own data shape. Each field is optional because each absence
+ * is real: a request that failed carries errors and no data, and a malformed answer can carry neither.
  *
  * The errors array is what makes GraphQL failure classification different from REST. The v2 endpoint answers a failed query with HTTP 200 and reports the failure in
  * the body, so a status-code check alone would read a failure as a success - which is why every consumer of this envelope inspects errors before it trusts data.
@@ -153,7 +153,7 @@ export interface HydrawiseV2GraphResponse<T> {
 
 /* Hydrawise v2 API: one entry of a controller's firmware list. A controller reports firmware as a LIST of typed components rather than a single version string -
  * the capture from a live HCC controller carries an entry of type "controller" - so reading a version means selecting the entry whose type names it, never taking
- * the first entry. Both fields are optional because a partial hardware block is a shape the wire can produce for an offline or unlinked controller.
+ * the first entry. Every field is optional because a partial hardware block is a shape the wire can produce for an offline or unlinked controller.
  */
 export interface HydrawiseV2FirmwareEntry {
 
@@ -189,7 +189,7 @@ export interface HydrawiseV2Zone {
   status?: { suspendedUntil?: Nullable<{ timestamp?: number }> };
 }
 
-/* Hydrawise v2 API: one sensor as the account query returns it, typed to the three facts a rain-class stop is read from - what kind of sensor it is, whether it
+/* Hydrawise v2 API: one sensor as the account query returns it, typed to the facts a rain-class stop is read from - what kind of sensor it is, whether it
  * is tripped right now, and which zones it covers.
  *
  * The activity flag is what v1 cannot report at all. A v1 status body carries a sensor block naming the zones a sensor covers but nothing about whether that
@@ -249,13 +249,13 @@ export interface HydrawiseV2MutationData {
 // value rather than against a list of failures nobody published.
 export const HYDRAWISE_V2_MUTATION_OK = "OK";
 
-/* The answer one per-zone suspension command gives, as a discriminated union rather than a boolean, because its outcomes ask the caller for three different things.
+/* The answer one per-zone suspension command gives, as a discriminated union rather than a boolean, because its outcomes ask the caller for different things.
  *
  * "done" means the account accepted the command, so the optimistic state the user is already looking at stands. "failed" means a genuinely attempted command did not
  * take. "rejected" means the command never reached the wire at all - the ceiling had no slot to admit it inside the beat a user will wait - which asks for a retry in
  * a moment rather than reporting a refusal that never happened.
  *
- * The failed arm's reason is ONE field for the two ways a command can fail: the account's own summary when it refused in band, and the transport's reason when the
+ * The failed arm's reason is ONE field for however a command can fail: the account's own summary when it refused in band, and the transport's reason when the
  * request itself did not land. They are one field because they answer one question the user is asking - why did my command not take - and because the layer that
  * writes the sentence should not have to know which of the two it is holding. A null reason means the failure was already reported in its own words elsewhere.
  */
@@ -264,7 +264,7 @@ export type HydrawiseV2MutationResult =
   { reason: Nullable<string>; status: "failed" } |
   { status: "rejected" };
 
-// The answer the platform's own per-zone suspension surface gives: the client's three outcomes, plus the one only the platform can know, which is that no
+// The answer the platform's own per-zone suspension surface gives: the client's own outcomes, plus the one only the platform can know, which is that no
 // account-credentialed client exists to command through.
 export type HydrawiseZoneSuspensionResult = HydrawiseV2MutationResult | { status: "unavailable" };
 
@@ -371,13 +371,13 @@ export function controllerV2Facts(controller: HydrawiseV2Controller): HydrawiseC
 
   for(const zone of controller.zones ?? []) {
 
+    // A zone whose entry cannot be completed is deliberately omitted rather than entered as a blank: an absent entry reads as "unknown" everywhere downstream,
+    // where a present one is a real answer that clears or reasserts a zone's state.
     if(zone.id === undefined) {
 
       continue;
     }
 
-    // A zone whose entry cannot be completed is deliberately omitted rather than entered as a blank: an absent entry reads as "unknown" everywhere downstream,
-    // where a present one is a real answer that clears or reasserts a zone's state.
     const covering = sensors.filter(sensor => (sensor.zones ?? []).some(covered => covered.id === zone.id));
 
     // A name is trimmed and then required to be non-empty, because an empty or whitespace-only answer is not a name the display can use - it composes null, which
@@ -398,7 +398,7 @@ export function controllerV2Facts(controller: HydrawiseV2Controller): HydrawiseC
 /* The v2 client's OAuth token state, as a discriminated union so the access token, its expiry, and any refresh in flight can never disagree with one another. One
  * shape and one mutation point is what makes that structural rather than a convention each write site has to honor.
  *
- * The three states are the whole lifecycle. "none" is no usable token, which is both the starting state and where a failed acquisition returns to. "valid" carries
+ * The states are the whole lifecycle. "none" is no usable token, which is both the starting state and where a failed acquisition returns to. "valid" carries
  * a token and the instant it expires. "refreshing" carries the in-flight acquisition, and it is the single-flight mechanism itself: both paths that reach the
  * network - a first acquisition and a renewal - transition here synchronously before their first await, so concurrent callers join the one promise rather than each
  * firing a grant of their own. There is deliberately no separate "acquiring" state; an acquisition and a renewal are the same wait to every caller.
@@ -410,7 +410,7 @@ export type HydrawiseV2TokenState =
 
 // The persisted identity of a single irrigation controller. This is the denormalized, wire-independent shape the runtime writes into the accessory context and the
 // webUI reads back from the accessory cache and the /refreshControllers response, so a stopped plugin's controller list stays answerable without any cloud call. It
-// carries only the three identity fields the webUI needs to list, scope, and refresh a controller - never any volatile status.
+// carries only the identity fields the webUI needs to list, scope, and refresh a controller - never any volatile status.
 export interface HydrawiseControllerIdentity {
 
   controllerId: number;
@@ -509,7 +509,7 @@ export type HydrawiseZoneScheduleStatus =
 // The schedule-state vocabulary, derived from the union's own arms rather than written out a second time, so the two can never disagree about which states exist.
 export type HydrawiseZoneScheduleState = HydrawiseZoneScheduleStatus["state"];
 
-/* The persisted schedule projection of a whole controller: every reported zone's schedule state ordered by relay, alongside the two facts a consumer needs to read
+/* The persisted schedule projection of a whole controller: every reported zone's schedule state ordered by relay, alongside the facts a consumer needs to read
  * them honestly. It is self-describing - activeWindowSeconds travels with the data, so no consumer has to hardcode the threshold the runtime classifies against -
  * and it is wire truth only: asOf is the WIRE's own root time from the poll that last CHANGED these facts, never a local clock read, so a consumer can tell how old
  * the facts are rather than how recently they were re-confirmed.
@@ -531,7 +531,7 @@ function carriesUnscheduledSentinel(zone: HydrawiseZoneConfig): boolean {
 }
 
 /* Whether a zone is stopped by a rain sensor: the zone carries the unscheduled shape, and a rain-class sensor whose relay list names it is evidently stopping the
- * zones it covers. Those two halves together are what tell a sensor stop from the shape's other producers, since the wire gives them all the identical zone body.
+ * zones it covers. Those conditions together are what tell a sensor stop from the shape's other producers, since the wire gives them all the identical zone body.
  *
  * The group rule is physical. A rain sensor stops every zone it covers, so a covered zone still carrying a live schedule proves that sensor is not tripping, and
  * any covered zone beside it carrying the unscheduled shape is merely without a run rather than sensor-stopped. A sensor is evidently stopping when every zone of
@@ -539,7 +539,8 @@ function carriesUnscheduledSentinel(zone: HydrawiseZoneConfig): boolean {
  *
  * A running zone sits outside the group deliberately. Forcing a manual run during a genuine rain delay is plausible, so a running zone is evidence either way and
  * settles nothing; leaving it out keeps sensor precedence - the standing tiebreak wherever this wire is ambiguous - rather than letting one manual run reclassify
- * every covered sibling.
+ * every covered sibling. The group filter recognizes a running zone by the wire's own spelling of it, time === 1, the same literal zoneScheduleStatus reads first
+ * below for the identical reason.
  *
  * Callers pass a zone drawn from the same response's relay list. A zone carrying the unscheduled shape is never running, so it always belongs to any covering
  * sensor's group and the group walk is never empty. This is the one home for the rule: the controller's own check and the schedule projection below both resolve
@@ -593,6 +594,8 @@ export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, status: StatusS
 export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusScheduleResponse, facts?: HydrawiseZoneV2Facts, priorSuspendedUntil?: number,
   commanded?: Nullable<number>): HydrawiseZoneScheduleStatus {
 
+  // The wire spells "currently running" as time === 1, the one classification this function reads directly from the literal rather than through the unscheduled
+  // sentinel that governs every branch below it.
   if(zone.time === 1) {
 
     return { endsAt: status.time + zone.run, relayId: zone.relay_id, state: "running" };
@@ -678,8 +681,8 @@ export interface HydrawiseScheduleStatusOptions {
  * suspension - a null suspendedUntil being a real answer, not an absence - while a zone the facts simply do not name keeps whatever the prior projection said.
  * Judging the carry account-wide instead would let one zone's fresh answer silently clear a sibling the same answer never covered.
  *
- * A zone's command is resolved from the map exactly as its facts entry is, and travels alongside rather than in place of either: the classifier weighs all three
- * witnesses in one precedence, which is what keeps every consumer of this projection reading one answer instead of overlaying a command on top of it themselves.
+ * A zone's command is resolved from the map exactly as its facts entry is, and travels alongside rather than in place of either: the classifier weighs every
+ * witness in one precedence, which is what keeps every consumer of this projection reading one answer instead of overlaying a command on top of it themselves.
  *
  * The controller's availability is stamped only when fresh facts actually carried one, so the persisted shape of an install without account credentials is
  * byte-identical to what it has always been.
@@ -756,9 +759,10 @@ export function isScheduleStatus(value: unknown): value is HydrawiseScheduleStat
     Array.isArray((value as HydrawiseScheduleStatus).zones) && (value as HydrawiseScheduleStatus).zones.every(entry => isZoneScheduleStatus(entry));
 }
 
-// Compare two arrays entry by entry, delegating each pair to a caller-supplied field-wise comparison. Both persisted projections are relay-ordered arrays compared
-// on change, so the walk itself lives once here and each caller supplies only what it means for two entries to match. The paired entry is tested against undefined
-// rather than for truthiness, so the walk stays correct for an element type whose legitimate values include falsy ones.
+// Compare two arrays entry by entry, delegating each pair to a caller-supplied field-wise comparison. Every persisted array this codebase compares on change walks
+// through here - the account's controller roster in its own order, and the relay-ordered zone identity and zone schedule arrays - so the walk itself lives once
+// and each caller supplies only what it means for two entries to match. The paired entry is tested against undefined rather than for truthiness, so the walk stays
+// correct for an element type whose legitimate values include falsy ones.
 export function sameEntries<T>(a: T[], b: T[], same: (x: T, y: T) => boolean): boolean {
 
   if(a.length !== b.length) {

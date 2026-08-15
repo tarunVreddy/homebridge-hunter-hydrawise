@@ -13,7 +13,8 @@ import type { Service as HapService } from "homebridge";
 import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 
-// Confine the double-to-HAP casts the real service helpers require to these adapters, so the test bodies below stay cast-free.
+// Confine the double-to-HAP casts the real service helpers require to these adapters, so most test bodies below stay cast-free; the one exception is the
+// cross-kind namespace test, which casts its own constructor argument to index it by kind name, a shape none of these adapters cover.
 function asAccessory(accessory: ReturnType<typeof makeTestAccessory>): PlatformAccessory {
 
   return accessory as unknown as PlatformAccessory;
@@ -34,7 +35,7 @@ function asHapService(service: object): HapService {
   return service as unknown as HapService;
 }
 
-// Acquire a service against a fresh accessory and hand back both views of it, since the name assertions below read it as a HAP service and inspect it as a double.
+// Acquire a service against a fresh accessory and hand back the double, which the assertions below cast through asHapService() when they need the HAP view.
 function acquireDouble(kind: typeof Service[keyof typeof Service], name: string, subtype?: string): TestService {
 
   const service = acquireService(asAccessory(makeTestAccessory()), asTarget(kind), name, subtype);

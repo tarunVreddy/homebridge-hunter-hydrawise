@@ -4,7 +4,7 @@
  * double, so the credential gate, the refresh loop's single start, and the distribution all run production code with no cloud call of any kind.
  *
  * Two things are being told apart throughout. The GATE decides whether a client exists at all, and it answers to the configured credentials; the DISTRIBUTION
- * decides which controller receives which facts, and it answers to the correlation id v1 and the account API agree about. A test that conflated them could pass
+ * decides which controller receives which facts, and it answers to the correlation id that v1 and the account API agree about. A test that conflated them could pass
  * with the wrong controller enriched.
  *
  * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. Node's test-runner timer mocking cannot advance a promisified timer at all - the
@@ -52,8 +52,8 @@ function informationValue(accessory: TestAccessory, characteristic: Characterist
   return accessory.getService(Service.AccessoryInformation)?.getCharacteristic(characteristic).value;
 }
 
-// The name carried by one of the two single-controller identities a persisted context can hold - a controller accessory's own, or a zone accessory's owner stamp
-// - read through the same confined cast every context reader in this suite's siblings uses.
+// The name carried by a single-controller identity a persisted context can hold - a controller accessory's own, or a zone accessory's owner stamp - read
+// through the same confined cast every context reader in this suite's siblings uses.
 function identityName(accessory: TestAccessory | undefined, field: "controller" | "ownerController"): string | undefined {
 
   return (accessory?.context as HydrawiseAccessoryContext | undefined)?.[field]?.name;
@@ -146,9 +146,10 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("the account's controller name reaches every persisted identity at once", async (t) => {
 
-    /* Three surfaces persist a controller's identity, each written by a different cadence: the controller's own context (the poll), the denormalized account
-     * roster every accessory carries (the refresh tick), and a standalone zone accessory's owner stamp (the poll's reconcile). They answer one question, so a
-     * name that reached only some of them would leave the webUI listing one controller under two names depending on which entry it happened to read.
+    /* Several surfaces persist a controller's identity, each written by a different cadence: the controller's own context (the poll), the denormalized
+     * account roster every accessory carries (the refresh tick), and a standalone zone accessory's owner stamp (the poll's reconcile). They answer one
+     * question, so a name that reached only some of them would leave the webUI listing one controller under two names depending on which entry it happened
+     * to read.
      */
     const { emit, platform, registered } = buildPlatform({ options: [ ...CREDENTIAL_OPTIONS, "Enable.Device.Standalone." + STANDALONE_RELAY_ID.toString() ] });
 

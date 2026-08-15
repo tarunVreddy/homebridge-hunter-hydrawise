@@ -2,10 +2,12 @@
  *
  * controller.transitions.test.ts: Multi-poll transition behavior of the HydrawiseController polling loop. Each test programs a queue of poll responses
  * and drives the live loop across them at the fast cadence, waiting on the observable each transition produces. Covers zone start / stop logging (globally and
- * per-zone by the Log.Zone feature), rain-sensor transitions, zone appearance and disappearance with valve pruning, and zone-scoped Device disable.
+ * per-zone by the Log.Zone feature), rain-sensor transitions, zone appearance and disappearance with valve pruning, zone-scoped Device disable, a suspension
+ * arriving and lifting through an account-facts refresh, the suspended-until instant formatter's rendering tiers, and rain narration that follows the sensor's
+ * own reading independent of a zone's suspension state.
  */
 
-// The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
+// The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { bareSensors, rainSensors } from "./api.fixtures.ts";
@@ -98,7 +100,7 @@ describe("HydrawiseController updateState transitions", () => {
 
   test("names each zone's own state at its first sighting", async (t) => {
 
-    // One covered zone carrying the sentinel while a covered sibling still holds a schedule, plus a zone running now, so a single first poll reports a suspended,
+    // One covered zone carrying the sentinel while a covered sibling still holds a schedule, plus a zone running now, so a single first poll reports an unscheduled,
     // a scheduled, and a running zone side by side - each of which must reach the operator in its own sentence.
     const zones = [ rainZone(), scheduledZone({ name: "Beta", relay: 2, relay_id: 700002 }), runningZone({ name: "Gamma", relay: 3, relay_id: 700003 }) ];
 
@@ -372,8 +374,8 @@ describe("HydrawiseController suspension instant rendering", () => {
 
   test("renders a suspension ending today as the clock alone, and one later in the week with its weekday", async () => {
 
-    /* The runtime formatter's three tiers, driven through the sentence a user actually reads. Every expected string is computed through the identical Intl call
-     * the formatter itself makes, so a host in another locale or timezone moves both sides together rather than reddening a correct implementation.
+    /* The runtime formatter's rendering tiers, driven through the sentence a user actually reads. Every expected string is computed through the identical Intl
+     * call the formatter itself makes, so a host in another locale or timezone moves both sides together rather than reddening a correct implementation.
      */
     const soon = Math.floor(Date.now() / 1000) + 3600;
     const soonWhen = new Date(soon * 1000);
@@ -443,9 +445,9 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
 
   test("a suspension landing while the sensor is STILL tripped narrates no rain transition", async () => {
 
-    /* The soak's exact case, and the defect this fix exists for. The sensor does not change across the two snapshots - it reports itself tripped throughout - and
-     * only the suspension arrives. A hint derived from the classified state would see the zone flip from sensor-stopped to suspended and narrate that
-     * reclassification as the sensor allowing irrigation again, one minute after a suspension, while rain was still falling.
+    /* The soak's exact case: the sensor does not change across the two snapshots - it reports itself tripped throughout - and only the suspension arrives. A hint
+     * derived from the classified state would see the zone flip from sensor-stopped to suspended and narrate that reclassification as the sensor allowing
+     * irrigation again, one minute after a suspension, while rain was still falling.
      */
     const lines = await driveFacts(facts(true, null), facts(true, SUSPENDED_UNTIL));
 
@@ -455,8 +457,8 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
 
   test("a sensor that genuinely quiets narrates the transition even on a zone that is suspended", async () => {
 
-    /* The other direction, and the reason the fix reads the sensor rather than simply ignoring suspended zones. A suspension does not make a zone deaf to its
-     * sensor: when the rain actually stops, that is a real transition and the operator is told, whatever else is true of the zone.
+    /* The other direction: rain narration reads the sensor's own reading rather than simply ignoring suspended zones. A suspension does not make a zone deaf to
+     * its sensor: when the rain actually stops, that is a real transition and the operator is told, whatever else is true of the zone.
      */
     const lines = await driveFacts(facts(true, SUSPENDED_UNTIL), facts(false, SUSPENDED_UNTIL));
 

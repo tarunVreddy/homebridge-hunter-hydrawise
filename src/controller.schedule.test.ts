@@ -138,8 +138,8 @@ describe("HydrawiseController schedule classification", () => {
     const covered = makeZone({ name: "Alpha", relay: 1, relay_id: ALPHA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
     const uncovered = makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
 
-    // The rain sensor's relay list names every zone of the shared matrix, which includes Alpha's relay id but not Beta's own sentinel-carrying identity being
-    // excluded any other way: the two zones differ only in whether a type-1 sensor claims them.
+    // Unlike the shared fixture matrix's own rain sensor, which covers every zone, this sensor's relay list names only Alpha's relay id, so Beta is excluded
+    // only by absence from that list: the two zones differ solely in whether the sensor claims them.
     const sensors: StatusScheduleResponse["sensors"] = [{ input: 0, mode: 1, relays: [{ id: ALPHA_RELAY_ID }], type: HYDRAWISE_RAIN_SENSOR_TYPE }];
     const projection = scheduleStatus(makeStatusSchedule({ relays: [ covered, uncovered ], sensors, time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
@@ -557,8 +557,8 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
   test("an absent suspension is told apart from an unknown one, and epoch zero is a real instant", () => {
 
-    /* The three cells a bare truthiness test collapses. Undefined means no facts entry reached this zone at all, null means the entry reached it and reported no
-     * suspension, and zero is a real - if implausible - instant that a truthiness test would silently discard.
+    /* Each cell a bare truthiness test would collapse into the same falsy case. Undefined means no facts entry reached this zone at all, null means the
+     * entry reached it and reported no suspension, and zero is a real - if implausible - instant that a truthiness test would silently discard.
      */
     const cells = [ { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: undefined }), label: "an undefined suspension" },
       { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: null }), label: "a null suspension" },

@@ -2,7 +2,7 @@
  *
  * clock.test.ts: Tests for the production Clock implementation. A project that only ever type-imports clock.ts never loads the module at runtime, and under
  * --strip-types the erased import leaves V8 coverage nothing to score - the file drops out of the coverage table rather than appearing with zero percent. This
- * file is the value load that puts it back: it imports realClock as a value and exercises all three members against real time.
+ * file is the value load that puts it back: it imports realClock as a value and exercises every member of Clock against real time.
  *
  * The assertions are margin-generous but still tell a real clock from a stub. Reading the clock either side of a real sleep proves now() advances, which a
  * constant-returning stub would fail, and both outcomes of the race are exercised so neither the forwarding path nor the timeout path can rot unnoticed. The

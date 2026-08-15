@@ -24,14 +24,14 @@ const LEGACY_KEY = "AAAA-BBBB-CCCC-DDD";
 const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 
 // The optional account login. The username carries an "=" deliberately - an email address does not, but the entry grammar's own value delimiter does, so a value
-// split on the first delimiter rather than the last would come back truncated here.
+// split on the last delimiter rather than the first would come back truncated here.
 const ACCOUNT_USERNAME = "gardener=test@example.com";
 const ACCOUNT_PASSWORD = "correct horse battery";
 
 // The interpreter under test, built the way the webUI builds it: the real engine class and the real served catalog.
 const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories, options: featureOptions } });
 
-// Whether an options array carries an entry addressing a given option, case-insensitively, in either the enabled or the disabled form.
+// The entries in an options array that address a given option, case-insensitively, in either the enabled or the disabled form.
 function entriesFor(options: string[] | undefined, option: string): string[] {
 
   const prefix = option.toLowerCase();
@@ -151,9 +151,9 @@ describe("hydrawise webUI config interpreters", () => {
 
     const patch = config.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
-    /* All three values have to survive the SAME patch. Each write through an engine answers its own complete snapshot of the options array, so a writer that
-     * composed them through separate engines and merged the results would keep only the last snapshot and silently drop the other two entries - which is exactly
-     * what this three-way assertion catches.
+    /* Every value withFirstRun composes has to survive the same patch. Each write through an engine answers its own complete snapshot of the options array, so
+     * a writer that split them across separate engines and merged the results would keep only the last snapshot and silently drop the rest - which is exactly
+     * what this assertion catches.
      */
     assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the key rides the patch");
     assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the username rides the same patch");
@@ -491,6 +491,8 @@ describe("hydrawise webUI retired-option rename migration", () => {
     /* The same-pass pin. Both migrations compose one options array, so neither write can clobber the other - which is exactly what two independent writers each
      * answering a whole array would do under the session's shallow merge.
      */
+    // The cast is the same honest model used for the hand-edited value above: migrate() comes from an untyped module, so the shape asserted here is where it
+    // comes from, not something the module itself declares.
     const patch = config.migrate({ apiKey: LEGACY_KEY, options: ["Enable.Device.Suspend." + SERIAL] }) as { apiKey?: string; options?: string[] } | null;
 
     assert.ok(patch, "the migration should stage a patch");
@@ -502,8 +504,8 @@ describe("hydrawise webUI retired-option rename migration", () => {
   test("the module's catalog anchoring agrees with the engine's own composition for every served option", () => {
 
     /* The matching-parity pin. The module composes its current-key set from the served catalog by hand, because it is import-free and can consume no engine
-     * export; this asserts that hand composition against the engine's own expandOption for every option the catalog declares, which is the drift this rule would
-     * otherwise be exposed to. An entry addressing a current key must always pass through, and passing through is observable as "nothing staged".
+     * export; this asserts that the hand composition agrees with the engine's own expandOption for every option the catalog declares, which is the drift this
+     * rule would otherwise be exposed to. An entry addressing a current key must always pass through, and passing through is observable as "nothing staged".
      */
     const engine = new FeatureOptions(featureOptionCategories, featureOptions, []);
     const keys = Object.entries(featureOptions).flatMap(([ category, entries ]) => entries.map((entry) => engine.expandOption(category, entry.name)));

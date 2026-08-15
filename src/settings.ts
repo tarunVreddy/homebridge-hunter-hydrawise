@@ -36,8 +36,8 @@ export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
  * file carries, so it is marked out as its own group. Everything below is optional at runtime: the v2 surface is reached only when the user has configured their
  * account credentials, and the plugin runs its whole v1 feature set without it.
  *
- * The two endpoint URLs are stated whole. The client derives the origin its connection pool is built on from the URL rather than carrying a third constant, so the
- * host a request goes to and the host the pool connects to can never disagree.
+ * The endpoint URLs below are stated whole. The client derives the origin its connection pool is built on from the URL rather than carrying a separate constant
+ * for it, so the host a request goes to and the host the pool connects to can never disagree.
  */
 export const HYDRAWISE_V2_GRAPH_ENDPOINT = "https://app.hydrawise.com/api/v2/graph";
 
@@ -101,10 +101,9 @@ export const HYDRAWISE_V2_TIMEOUT = 15;
  */
 export const HYDRAWISE_V2_REFRESH_THRESHOLD = 300;
 
-/* How often, in seconds, the whole-account read that feeds the enhanced features runs. The arithmetic against the envelope above is what fixes the value: a
- * fifteen-minute cadence spends two reads inside each thirty-minute budget window, which leaves the remaining slots of the five-call ceiling for the token grants
- * those reads carry. A brisker cadence would buy fresher facts at the cost of the headroom that keeps this optional enrichment from ever crowding out the
- * irrigation the account actually depends on.
+/* How often, in seconds, the whole-account read that feeds the enhanced features runs. The arithmetic against the envelope above is what fixes the value: the
+ * number of reads that fit inside one budget window stays under the read ceiling, leaving slots for the token grants those reads carry. A brisker cadence would
+ * buy fresher facts at the cost of the headroom that keeps this optional enrichment from ever crowding out the irrigation the account actually depends on.
  */
 export const HYDRAWISE_V2_REFRESH_INTERVAL = 900;
 
@@ -117,9 +116,9 @@ export const HYDRAWISE_V2_FACTS_TTL = HYDRAWISE_V2_REFRESH_INTERVAL * 2;
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 
-/* The beat, in MILLISECONDS - every other duration in this file is stated in seconds - between a command the Hydrawise API refused and the HomeKit characteristic
- * write that puts the optimistic state back. Every revert site schedules against this one constant, so the pause a user sees when a command fails is the same
- * wherever it failed.
+/* The beat, in MILLISECONDS - unlike this file's other durations, which are stated in seconds - between a command the Hydrawise API refused and the HomeKit
+ * characteristic write that puts the optimistic state back. Every revert site schedules against this one constant, so the pause a user sees when a command fails
+ * is the same wherever it failed.
  */
 export const HYDRAWISE_REVERT_DELAY = 50;
 
@@ -142,6 +141,11 @@ export const HOMEBRIDGE_UNKNOWN_FIRMWARE = "0";
  * lets the enrichment path leave a restored real model alone while still stamping a fresh accessory with something a user can recognize.
  */
 export const HAP_DEFAULT_MODEL = "Default-Model";
+
+/* The ceiling HomeKit itself pins on the RemainingDuration and SetDuration characteristics - hap-nodejs declares 3600 seconds as each characteristic's maximum
+ * value - so every duration written to them is capped to this first, and a longer runtime reports as the ceiling rather than tripping HAP's own value clamping.
+ */
+export const HAP_DURATION_CEILING = 3600;
 
 /* The HAP accessory category a standalone zone accessory declares - Apple's sprinkler category, so the Home app renders a lone irrigation valve as sprinkler rather
  * than as a generic accessory. The value is the Apple-defined protocol number, carried here as a typed numeric constant rather than read off the `Categories` enum:

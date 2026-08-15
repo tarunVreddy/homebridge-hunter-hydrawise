@@ -1,11 +1,11 @@
 /* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * testing.helpers.test.ts: Tests for the cross-cutting testing-helpers barrel. The barrel is the canonical import path for tests outside `src/testing/`
- * (enforce this with a project-specific ESLint rule - see `test-conventions.md` §8 Barrel-Only Import Discipline). These tests pin the barrel's runtime export
- * surface so a forgotten re-export, a renamed submodule symbol, or an unintended addition surfaces immediately at unit-tier rather than as a confusing import
- * error in some downstream test file.
+ * testing.helpers.test.ts: Tests for the cross-cutting testing-helpers barrel. The barrel is the canonical import path for tests outside `src/testing/`,
+ * and this test file is the sole mechanism that enforces that convention, since no linter rule backs it. These tests pin the barrel's runtime export
+ * surface so a forgotten re-export, a renamed submodule symbol, or an unintended addition surfaces
+ * immediately at unit-tier rather than as a confusing import error in some downstream test file.
  *
- * Three checks form a symmetric drift catch:
+ * A symmetric drift catch:
  *
  *   1. Every documented symbol IS re-exported (catches missing re-exports - a submodule export the barrel forgot to forward).
  *   2. No undocumented runtime exports exist (catches accidental additions - a submodule export that flowed through without being documented).

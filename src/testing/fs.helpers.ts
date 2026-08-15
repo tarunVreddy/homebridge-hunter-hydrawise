@@ -3,8 +3,8 @@
  * fs.helpers.ts: Filesystem-scoped test helpers. Exposes withTempDir, the canonical scope for tests that need a temporary directory with guaranteed cleanup on
  * failure or success. Equivalent to a `using` block for filesystem state.
  *
- * Customization: TMPDIR_PREFIX is the only project-specific value. Replace "test-" with "<your-project>-test-" so orphaned temp dirs in os.tmpdir() are
- * trivially identifiable.
+ * Customization: TMPDIR_PREFIX is the only project-specific value, set to "hydrawise-test-" here so orphaned temp dirs in os.tmpdir() are trivially
+ * identifiable as belonging to this project.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -31,6 +31,8 @@ export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T
     return await fn(dir);
   } finally {
 
+    // force: true keeps this cleanup from throwing an ENOENT if the directory is already gone by the time the callback returns, so a callback that
+    // manages its own temp directory's lifecycle does not turn a clean run into a spurious failure.
     await rm(dir, { force: true, recursive: true });
   }
 }

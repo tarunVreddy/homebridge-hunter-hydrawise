@@ -5,7 +5,7 @@
  * and - the pin the whole mechanism rests on - that both draws are AWAITED, by saturating a ceiling and proving the blocked call put nothing on the wire before
  * shutdown resolved it to the quiet null every caller of retrieve() expects.
  *
- * Draw ORDER (the command ceiling before the account ceiling) is deliberately not pinned here. The two budgets are independent objects, so no order between them
+ * Draw ORDER (the command ceiling before the account ceiling) is deliberately not pinned here. The budgets are independent objects, so no order between them
  * is observable from outside without a production test hook this suite refuses to add; the order is a structural property of two adjacent awaits and is verified
  * by reading the diff, while what these tests verify is that each ceiling is independently enforced by an awaited draw.
  */

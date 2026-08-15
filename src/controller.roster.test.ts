@@ -27,7 +27,9 @@ function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
   return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
 }
 
-// The identity-only projection the runtime persists for a full reported zone list, ordered by relay - the exact shape the webUI reads back from cache.
+// The identity-only projection the runtime persists for a reported zone list - the exact shape the webUI reads back from cache. This helper preserves
+// whatever order its input carries rather than sorting it itself, so callers pass an already relay-ordered zone list to match the runtime's own sorted
+// persistence.
 function zoneRoster(zones: readonly HydrawiseZoneConfig[]): HydrawiseZoneIdentity[] {
 
   return zones.map(zone => ({ name: zone.name, relay: zone.relay, relayId: zone.relay_id }));
@@ -86,7 +88,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     const zones = contextOf(h.accessory).zones;
 
-    // The persisted roster carries every reported zone in relay order, the feature-disabled 700002 included, and each entry is a strict identity triple - a
+    // The persisted roster carries every reported zone in relay order, the feature-disabled 700002 included, and each entry carries only its identity fields - a
     // deepEqual against the projection also proves no volatile wire field (run, time, timestr) leaked into the persisted context.
     assert.deepEqual(zones, zoneRoster(normalZoneMatrix), "the persisted roster is the full reported zone set projected to identity fields, ordered by relay");
     assert.equal(zones?.length, normalZoneMatrix.length, "the persisted roster length equals the full reported relay count");

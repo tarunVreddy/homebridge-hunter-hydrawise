@@ -4,7 +4,7 @@
  * responses live in api.helpers.ts.
  *
  * Provenance: the wire shapes mirror captured Hydrawise cloud API v1 responses (customerdetails.php and statusschedule.php) recorded in May 2024 and retained
- * as the repo-root development references. Every identifier here is synthesized - the controller and customer ids, the serial number, the relay ids, and every
+ * as development reference material. Every identifier here is synthesized - the controller and customer ids, the serial number, the relay ids, and every
  * zone display name are invented values that appear nowhere in those captures - so no real account data reaches the tracked test tree. The numeric field types
  * are wire-accurate: ids and timestamps are numbers, the sentinel far-future timestamp is the literal Hydrawise uses to mark a zone with no upcoming run.
  */
@@ -36,7 +36,7 @@ export const syntheticCustomerDetails: CustomerDetailsResponse = {
   customer_id: 900001
 };
 
-/* The steady-state zone matrix, mirroring the captured NORMAL response's 19-zone shape with synthetic relay ids and names. The `time` field is seconds until the
+/* The steady-state zone matrix, mirroring the captured NORMAL response's zone shape with synthetic relay ids and names. The `time` field is seconds until the
  * next scheduled run (or the running sentinel `1`): relay 1 is running now (time 1), relays 2 and 3 are queued within the active-zone window (time <= 3600, with
  * relay 3 sitting exactly on the 3600 boundary), and relay 4 sits one second past the window (time 3601). Every other zone is scheduled well beyond the window.
  */
@@ -63,7 +63,7 @@ export const normalZoneMatrix: readonly HydrawiseZoneConfig[] = [
   { name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 840, time: 114991, timestr: "Mon" }
 ];
 
-/* The all-sentinel zone matrix: the same 19 synthetic identities, each stamped with the unscheduled sentinel `time` and an empty run and schedule string. Combined
+/* The all-sentinel zone matrix: the same synthetic identities, each stamped with the unscheduled sentinel `time` and an empty run and schedule string. Combined
  * with a sensor block that does or does not reference the relay ids, this shape distinguishes a controller with nothing scheduled - a suspend-all included, since
  * the wire normalizes one to this exact shape (bare sensors) - from a rain-sensor stop (relay-referencing sensors).
  */
@@ -90,16 +90,16 @@ export const sentinelZoneMatrix: readonly HydrawiseZoneConfig[] = [
   { name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" }
 ];
 
-// The full set of synthetic relay ids, in matrix order. The rain-sensor block references these so isStoppedBySensor resolves true for the sentinel matrix.
+// The full set of synthetic relay ids, in matrix order. The rain-sensor block references these so isZoneStoppedBySensor resolves true for the sentinel matrix.
 export const allRelayIds: readonly number[] = normalZoneMatrix.map(zone => zone.relay_id);
 
-// A type-1 (rain) sensor whose relay list references every zone. On the sentinel matrix this drives isStoppedBySensor true, the rain-stop state.
+// A type-1 (rain) sensor whose relay list references every zone. On the sentinel matrix this drives isZoneStoppedBySensor true, the rain-stop state.
 export const rainSensors: StatusScheduleResponse["sensors"] = [
 
   { input: 0, mode: 1, relays: allRelayIds.map(id => ({ id })), type: 1 }
 ];
 
-// A type-1 sensor whose relay list references no zone. On the sentinel matrix this leaves isStoppedBySensor false, the all-unscheduled state distinct from a rain stop.
+// A type-1 sensor whose relay list references no zone. On the sentinel matrix this leaves isZoneStoppedBySensor false, keeping all-unscheduled distinct from a rain stop.
 export const bareSensors: StatusScheduleResponse["sensors"] = [
 
   { input: 0, mode: 1, relays: [], type: 1 }

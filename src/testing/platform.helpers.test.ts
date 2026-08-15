@@ -2,7 +2,7 @@
  *
  * platform.helpers.test.ts: Self-test for the platform harness. Pins the programmable retrieve recorder's record-and-program semantics, the MQTT recorder's
  * capture and invoke knobs, the MockAgent installer's snapshot-and-restore discipline, the API double's capture-and-invoke event contract, and the platform
- * double's mutable debug channel.
+ * double's mutable debug channel and signal lifecycle - pre-aborted by default, abortable when requested.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.

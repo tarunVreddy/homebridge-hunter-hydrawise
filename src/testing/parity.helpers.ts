@@ -14,7 +14,7 @@
  * placeholder that production would never write. The first is caught at runtime by assertSameShape; the second is caught by pinning factory defaults to
  * production formatters at the test site.
  *
- * Two utilities live here:
+ * Exported from this file:
  *
  * - assertSameShape: runtime key-set comparator with directional reporting (which keys are only in actual, which only in expected). Use this in factory
  *   tests to assert the factory's output has the same key set as a representative production value.
@@ -34,6 +34,7 @@
  * @param actual - The value under test (e.g., factory output).
  * @param expected - The reference value (e.g., a representative production value, or an object built from a complete-keys-of-T list).
  * @param description - A short label for the comparison, embedded in the failure message.
+ *
  * @throws Error when the two key sets differ, with the asymmetric difference in the message.
  */
 export function assertSameShape(actual: object, expected: object, description: string): void {
@@ -66,18 +67,18 @@ export function assertSameShape(actual: object, expected: object, description: s
 
 /**
  * Declares a const array of key names and proves at compile time that the array exhausts every key of T. Returns a tagged function so the K type parameter
- * can be inferred from the array literal alone. The technique is the standard "satisfies-with-completeness-check" pattern: the return type's conditional
- * forces TypeScript to error when keys are missing, with a hint that names the missing keys in the error message.
+ * can be inferred from the array literal alone. The return type's conditional forces TypeScript to error when keys are missing, with a hint that names the
+ * missing keys in the error message.
  *
  * Usage:
  *
- *   const STREAM_REGISTRY_ENTRY_KEYS = declareKeysOf<StreamRegistryEntry>()([
- *     "captureCodec", "channelName", ... // every key
+ *   const CONTROLLER_IDENTITY_KEYS = declareKeysOf<HydrawiseControllerIdentity>()([
+ *     "controllerId", "name", "serialNumber",
  *   ] as const);
  *
- * If StreamRegistryEntry gains a new key, the function call fails to compile with a "Type 'X' is not assignable to type" error that names the missing key,
- * forcing the array to be updated. Combine with assertSameShape to also catch drift in the factory: once the array is complete, the runtime check enforces
- * that the factory populates every key in it.
+ * If HydrawiseControllerIdentity gains a new key, the function call fails to compile with a "Type 'X' is not assignable to type" error that names the
+ * missing key, forcing the array to be updated. Combine with assertSameShape to also catch drift in the factory: once the array is complete, the runtime
+ * check enforces that the factory populates every key in it.
  *
  * @returns A function that accepts a const array and returns it unchanged when the array exhausts keyof T. Compile-time error otherwise.
  */

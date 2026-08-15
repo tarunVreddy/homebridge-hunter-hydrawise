@@ -72,9 +72,9 @@ describe("raceWithTimeout", () => {
 
   test("cleans up the timer when the inner promise wins (no leaked handles)", async () => {
 
-    // We can't directly observe the cleared timer, but the .finally(clearTimeout) guarantees no event-loop reference outlives the race. Indirect verification:
-    // running many races back-to-back must not leak handles - if the timer were leaked, Node's test runner would hang at exit. The fast pass here plus the
-    // --test-force-exit safety net in the canonical scripts provide the cleanup signal.
+    // We can't directly observe the cleared timer, but the .finally(clearTimeout) guarantees no event-loop reference outlives the race. Running many races
+    // back-to-back exercises that cleanup path at volume, but it cannot prove the absence of a leak by watching for a hang: the canonical test command runs
+    // with --test-force-exit, which forces the process to exit regardless of any pending timers, so a leaked handle would not surface here as a hang.
     const promises = Array.from({ length: 50 }, async (_, i) => raceWithTimeout(Promise.resolve(i), 10000));
 
     const results = await Promise.all(promises);

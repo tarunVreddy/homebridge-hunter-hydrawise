@@ -22,8 +22,7 @@ describe("settings", () => {
 
   test("pins the documented Hydrawise rate ceilings and the command endpoint", () => {
 
-    // Two of these four numbers are call counts and two are window durations in seconds, so each assertion says which it is - a swapped pair would otherwise read
-    // as a plausible ceiling.
+    // Each assertion below says whether it pins a call count or a window duration in seconds, so a swapped pair would otherwise read as a plausible ceiling.
     assert.equal(HYDRAWISE_API_BUDGET_CALLS, 30, "the account-wide ceiling admits 30 calls");
     assert.equal(HYDRAWISE_API_BUDGET_WINDOW, 300, "the account-wide ceiling is measured over 300 seconds");
     assert.equal(HYDRAWISE_COMMAND_BUDGET_CALLS, 3, "the zone-command ceiling admits 3 calls");

@@ -254,6 +254,10 @@ describe("HydrawiseController standalone zones", () => {
 
     assert.equal(zoneAccessory?.displayName, WIRE_RENAMED_SANITIZED, "the rename lands on the accessory's display name, sanitized");
     assert.equal(zoneAccessory?._associatedHAPAccessory.displayName, WIRE_RENAMED_SANITIZED, "and on the display-name mirror Homebridge maintains beside it");
+
+    // TestService never nominally extends HAP's Service, so getServiceName's Service-typed parameter still needs a cast; "as never" bridges that gap and the
+    // optional result from getService in one step. The cast is safe because TestService implements the two methods getServiceName actually calls at runtime,
+    // testCharacteristic and getCharacteristic.
     assert.equal(getServiceName(zoneAccessory?.getService(Service.AccessoryInformation) as never), WIRE_RENAMED_SANITIZED,
       "and on the information service's own name");
 

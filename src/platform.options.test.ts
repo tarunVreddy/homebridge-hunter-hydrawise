@@ -2,7 +2,7 @@
  *
  * platform.options.test.ts: The platform's consolidated setting resolution and its guarded MQTT construction, exercised against a REAL platform built
  * through the harness. Covers every arm of the precedence rule - option over legacy property, legacy property over catalog default, and the explicit disabled and
- * valueless option states - for the API key, the MQTT broker URL, and the MQTT topic prefix, plus the client the resolved values do or do not construct.
+ * valueless option states - for the API key, the MQTT broker URL, the MQTT topic prefix, and the debug flag, plus the client the resolved values do or do not construct.
  *
  * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass.
  */
@@ -126,7 +126,8 @@ describe("HydrawisePlatform consolidated options", () => {
 
   test("a configured debug option resolves the flag on over a legacy property that says otherwise", (t) => {
 
-    // The harness always supplies the legacy debug property, so its default false is the distinguishing input here: a resolver preferring the property answers off.
+    // The harness leaves the legacy debug property unset by default, so a resolver preferring it would fall through to the catalog's own default of false rather
+    // than reading a configured value.
     const { emit, lines, platform } = buildPlatform({ options: ["Enable.Log.Debug"] });
 
     t.after(() => emit(SHUTDOWN));

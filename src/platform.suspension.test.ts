@@ -31,7 +31,8 @@ const SHUTDOWN = "shutdown";
 // The configured-option entries that carry an account login, which is the only home those credentials have and the whole of what the client gate reads.
 const CREDENTIAL_OPTIONS = [ "Enable.Account.Password=test-password", "Enable.Account.Username=test-user" ];
 
-// The v2 origin and the two paths every account-credentialed request targets, derived from the endpoint constants exactly as the client derives its own.
+// The v2 origin and the paths every account-credentialed request targets (GRAPH_PATH and TOKEN_PATH), derived from the endpoint constants exactly as the client
+// derives its own.
 const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
 
 const GRAPH_PATH = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname;
@@ -47,13 +48,16 @@ const ZONE_ID = 6940181;
 // A far-future instant to suspend until, which is the shape a real command carries.
 const SUSPEND_UNTIL = 1903928399;
 
-/* Replace the platform's own client with a REAL one over a MockAgent, sharing BOTH of the platform's rate budgets so the pre-check and the admission phase are
+/** Replace the platform's own client with a REAL one over a MockAgent, sharing BOTH of the platform's rate budgets so the pre-check and the admission phase are
  * reading the same ceilings production has them read. The agent refuses to connect out, so a request that escaped an intercept fails loudly rather than reaching
  * the account.
  *
  * The client's log is CAPTURED rather than silenced, because the one line it writes about a command - the debug sentence its admission phase emits when the window
  * closes on it - is how a test tells a command the platform refused for free from one the client took in and then turned away. That absence is the only witness
  * with no clock in it.
+ *
+ * @param platform - The HydrawisePlatform whose client field this installs the double onto.
+ * @param program  - Callback that programs the agent's replies, calling record() for each request the fixture serves so the returned served() reader counts them.
  *
  * @returns Readers for the requests the agent served and the lines the client wrote, which is what an absence pin reads.
  */

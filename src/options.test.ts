@@ -1,7 +1,8 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * options.test.ts: The feature-option catalog and its documentation hook. Pins the catalog defaults, the scope-set drift between the catalog's declared
- * scopes and the compile-time controller/zone option-name unions the runtime narrows against, and the describeOptionScope prose the docs renderer consumes.
+ * scopes and the compile-time controller/zone option-name unions the runtime narrows against, that the account credentials declare themselves secret where
+ * the settings page must mask them, and the describeOptionScope prose the docs renderer consumes.
  */
 import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
 import type { HydrawiseControllerOption, HydrawiseZoneOption } from "./options.ts";
@@ -98,7 +99,7 @@ describe("hydrawise feature options", () => {
     assert.ok(name, "the name option should exist");
 
     /* The scopes array itself, pinned as a value rather than only through the derived sets above. The two levels are what the whole naming contract rests on: the
-     * webUI renders the row on a controller view because "controller" is declared here, the runtime's two readers each address one of these grains, and the global
+     * webUI renders the row on a controller view because "controller" is declared here, the runtime's readers each address one of these grains, and the global
      * level is deliberately absent because one name cannot be right for everything on an account.
      */
     assert.deepEqual(name.scopes, [ "controller", "device" ], "a custom name is configurable at a controller and at a zone, and nowhere else");

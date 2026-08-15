@@ -33,7 +33,8 @@ const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hard
 // here, so the operator sees the same words whichever of them failed.
 const READ_FAILURE_SENTENCE = "Unable to retrieve enhanced controller details";
 
-// The sentence a failed sign-in is reported under, on the same terms. A suspension command has no sentence of its own here: its failures travel back to the
+// The sentence a sign-in failure is reported under once it reaches classification as a thrown error; the two response-shape failures acquireToken() checks
+// directly state their own sentences without drawing on this constant. A suspension command has no sentence of its own here: its failures travel back to the
 // controller, which is the layer that knows which zone the user just touched and speaks the one sentence naming it.
 const TOKEN_FAILURE_SENTENCE = "Unable to sign in to your Hydrawise account for enhanced features";
 
@@ -58,7 +59,7 @@ const MUTATION_OFFSET_SECONDS = -5 * 60 * 60;
 
 const MUTATION_OFFSET_LABEL = "-0500";
 
-/* One transport failure, in the two parts a caller needs in order to report it: the reason in the operator's own terms, and the punctuation that joins that reason
+/* One transport failure, in the parts a caller needs in order to report it: the reason in the operator's own terms, and the punctuation that joins that reason
  * onto whatever sentence the caller states about what it was doing.
  *
  * The punctuation is not decoration. A reason that is this client's OWN sentence about what happened follows the caller's with a period; text quoted from the API,
@@ -72,11 +73,11 @@ interface HydrawiseV2Failure {
 
 /* What the shared transport answers with: the data a successful call carried, or the failure a caller reports in its own voice.
  *
- * It is a discriminated union rather than a nullable value because the two callers do different things with a failure. The read reports it under its own sentence,
+ * It is a discriminated union rather than a nullable value because each caller does different things with a failure. The read reports it under its own sentence,
  * while a command carries it back to the controller, which names the zone the user touched. Neither can do its job with a bare null, and a transport that logged on
  * their behalf is what made a failed command narrate itself twice - once in the transport's words and once in the controller's.
  *
- * The failure is itself nullable, for the two cases that leave nothing to add: one already reported in its own words, such as a sign-in that failed, and one that
+ * The failure is itself nullable, for the cases that leave nothing to add: one already reported in its own words, such as a sign-in that failed, and one that
  * is simply teardown.
  */
 type HydrawiseV2TransportResult<T> =
@@ -107,9 +108,10 @@ export interface HydrawiseV2ClientOptions {
 /* The Hydrawise v2 client: an OAuth2-authenticated GraphQL endpoint, kept separate from the v1 REST transport the platform owns.
  *
  * A separate transport rather than another endpoint on the v1 path, because the two are unlike in every dimension a client cares about. They address different
- * hosts, authenticate differently (an account grant against an API key), fail differently (a body-level error array against a status code), and tolerate wildly
- * different call rates. One shared path would mean one retry policy and one classification serving two contracts, which is how a change made for one silently
- * breaks the other.
+ * hosts, authenticate differently (an account grant against an API key), and tolerate wildly different call rates. They also classify failure differently: this
+ * transport checks a body-level errors array on every call it makes, mutations included, on top of the status code, where the v1 transport classifies uniformly
+ * by status code alone and leaves any body-level failure field - the command endpoint's own message_type among them - for the caller to read for itself. One
+ * shared path would mean one retry policy and one classification serving two contracts, which is how a change made for one silently breaks the other.
  *
  * Everything here is optional at runtime. The platform builds this client only when the user has configured account credentials, so an install without them never
  * constructs it, never opens a connection, and never spends a call.
@@ -138,7 +140,8 @@ export class HydrawiseV2Client {
     this.username = options.username;
 
     // The default factory builds a keep-alive HTTP/2 pool against the v2 origin, derived from the endpoint constant so the pool and the requests it carries can
-    // never target different hosts.
+    // never target different hosts. The one-minute client TTL recycles that connection periodically rather than holding it open for the plugin's whole session,
+    // the same choice the v1 transport makes for its own pool.
     this.dispatcherFactory = options.dispatcherFactory ??
       ((): Dispatcher => new Pool(new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin, { allowH2: true, clientTtl: 60 * 1000, connections: 1 }));
     this.currentDispatcher = this.dispatcherFactory();
@@ -218,7 +221,7 @@ export class HydrawiseV2Client {
     return facts;
   }
 
-  /* Suspend a single zone until an absolute instant, or resume it, and answer what became of the command - the plugin's one WRITE against the account API.
+  /** Suspend a single zone until an absolute instant, or resume it, and answer what became of the command - the plugin's one WRITE against the account API.
    *
    * The shape is admission, then transport, and the split is the point. Everything that decides whether this command may be ATTEMPTED happens here, outside the
    * transport method entirely, so a command the ceiling never admitted cannot be mistaken downstream for a request that reached the wire and failed. Both admission
@@ -231,8 +234,8 @@ export class HydrawiseV2Client {
    *
    * Step two waits for a usable token, and RACES the window rather than cancelling on it. The grant is shared - a scheduled read may be waiting on the very same
    * promise - so threading this command's deadline into it would impose one caller's impatience on another's unbounded patience. Abandoning the race leaves the
-   * grant running untouched for everyone else, and a grant an abandoned admission started is kept rather than wasted: it primes the client for the next caller. The
-   * race's three outcomes are exhaustive and each has its own exit, because falling through here is what would put a duplicate grant on the wire.
+   * grant running untouched for everyone else, and a grant an abandoned admission started is kept rather than wasted: it primes the client for the next caller.
+   * Every outcome of that race has its own exit, so nothing falls through here to put a duplicate grant on the wire.
    *
    * A grant is shared infrastructure, so it draws the READ ceiling wherever it was triggered from, and that is what puts one corner of the command path outside the
    * separation above: a command needing a token while the read ceiling is drained gives up inside its window even though its own ceiling had room. The reads renew
@@ -310,9 +313,10 @@ export class HydrawiseV2Client {
   /* Execute one GraphQL query and answer its data, or null on any failure. The ordering here is the contract: the rate budget is drawn FIRST, ahead of the token
    * chokepoint and ahead of the request, so a call the ceiling is not ready to admit waits rather than reaching the wire - the same shape the v1 transport uses.
    *
-   * The wait is deliberately unbounded, which is what a scheduled read wants: it has all the patience in the world, and the sleep between refreshes is longer than
-   * any wait the window could impose. The try envelopes BOTH the wait and the transport, so a shutdown reaching a caller still queued for a slot resolves to the
-   * same quiet null every other teardown path answers with rather than escaping as a rejection this method promises never to produce.
+   * The wait is deliberately unbounded, which is what a scheduled read wants: it has no deadline of its own to answer by, so waiting out whatever the shared
+   * budget's window imposes costs it nothing a bounded wait would spare. The try envelopes BOTH the wait and the transport, so a shutdown reaching a caller still
+   * queued for a slot resolves to the same quiet null every other teardown path answers with rather than escaping as a rejection this method promises never to
+   * produce.
    */
   private async graph<T>(query: string): Promise<Nullable<T>> {
 
@@ -372,6 +376,7 @@ export class HydrawiseV2Client {
         return { failure: { joiner: ".", reason: "The Hydrawise API answered with status " + response.statusCode.toString() + "." }, outcome: "failed" };
       }
 
+      // Every field on this shape is optional by design, so the cast cannot manufacture a field this method or a caller would wrongly trust as present.
       const body = await response.body.json() as HydrawiseV2GraphResponse<T>;
 
       if(body.errors?.length) {
@@ -386,8 +391,8 @@ export class HydrawiseV2Client {
     }
   }
 
-  // Report one transport failure under the caller's own sentence, saying nothing when the failure carries nothing to add. This is the single place a sentence and a
-  // reason are joined, so every failure any caller does report reads the same way.
+  // Join one transport failure onto the caller's own sentence, saying nothing when the failure carries nothing to add. This is the one place that pairs a sentence
+  // with a reason drawn from classifyFailure() or the transport's own result, so every failure reported that way reads in the same voice.
   private report(sentence: string, failure: Nullable<HydrawiseV2Failure>): void {
 
     if(!failure) {
@@ -474,6 +479,7 @@ export class HydrawiseV2Client {
         return this.resetToken();
       }
 
+      // Every field on this shape is optional, for the same reason the GraphQL envelope's are: an untrusted OAuth response cannot promise the wire keeps its shape.
       const grant = await response.body.json() as HydrawiseV2TokenResponse;
 
       if(!grant.access_token?.length) {

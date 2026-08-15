@@ -42,8 +42,8 @@ const FREE_FORM_OVERRIDE = "Front Lawn 2.0 = North Bed";
 const FREE_FORM_SANITIZED = "Front Lawn 2.0 North Bed";
 
 // The name the account API reports for the same zone, longer than the key-based API can express. That length difference is the whole feature, so every name here
-// differs from every other and no assertion can pass by coincidence. It deliberately EXTENDS the wire name, which is the shape a truncated name and its full
-// form actually stand in and the only shape under which the name carry offers anything at all.
+// differs from every other and no assertion can pass by coincidence. It deliberately EXTENDS the wire name, which is the only relationship the name-carry
+// feature responds to: a truncated name and its untruncated form.
 const ACCOUNT_NAME = "Front Lawn North Border Drip";
 
 // A wire-side rename that lands OUTSIDE the truncation relationship: the held account name is not an extension of it, so it is what a genuine rename looks like
@@ -53,8 +53,8 @@ const WIRE_UNRELATED = "Side Yard Beds";
 // A second account name for the same zone, so a scenario can show a real facts answer REPLACING a carried one rather than merely coinciding with it.
 const ACCOUNT_RENAMED = "Front Lawn South Border Drip";
 
-/* The controller's own three names, one per source, on the same all-different terms: what the key-based wire reports (the synthetic controller's own), what the
- * account API calls it, and what a user configures. The suffix the suspend-all switch composes is stated once here rather than at each assertion.
+/* The controller's own names, one per source and each on different terms: what the key-based wire reports (the synthetic controller's own), what the account
+ * API calls it, and what a user configures. The suffix the suspend-all switch composes is stated once here rather than at each assertion.
  */
 const CONTROLLER_WIRE_NAME = "Test Controller";
 
@@ -554,7 +554,7 @@ describe("the zone name option's declared scope", () => {
 
     /* Identity and display are different jobs, which this codebase already separates: what a zone IS goes to the roster and out over MQTT, while what HomeKit
      * SHOWS carries the user's private override on top. The account's name is the zone's own, so it belongs on both sides of that line; the override belongs only
-     * on the display side, which is also what keeps an install with no credentials publishing exactly what it always has.
+     * on the display side, which is also why an install with no credentials publishes the same key-based shape regardless of the override.
      */
     const h = buildController({ hasV2Client: true, mqtt: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,

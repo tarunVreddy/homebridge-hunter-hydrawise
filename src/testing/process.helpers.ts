@@ -1,8 +1,8 @@
 /* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * process.helpers.ts: Process-level test helpers. Exposes assertNoUnhandledRejections and expectAt. Both bridge between the test body and the surrounding Node
- * process surface - one captures unhandled rejections via the process's emitter, the other yields to the microtask queue while waiting for a predicate to
- * become true.
+ * process.helpers.ts: Process-level test helpers. Exposes assertNoUnhandledRejections and expectAt. Each bridges between the test body and the surrounding
+ * Node process surface - one captures unhandled rejections via the process's emitter, the other yields to the microtask queue while waiting for a predicate
+ * to become true.
  */
 import type { EventEmitter } from "node:events";
 
@@ -52,6 +52,7 @@ export function assertNoUnhandledRejections(emitter: EventEmitter = process): ()
  * @param predicate - Function returning the awaited value, or undefined when not yet available.
  * @param options - Optional iteration budget override.
  * @returns The first non-undefined value the predicate returns.
+ *
  * @throws If the predicate never returns a value within the iteration budget.
  */
 export async function expectAt<T>(predicate: () => T | undefined, options: { iterations?: number } = {}): Promise<T> {

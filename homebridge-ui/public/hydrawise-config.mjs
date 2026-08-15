@@ -29,7 +29,7 @@ const CONSOLIDATED_SETTINGS = {
   mqttUrl: "Mqtt.Url"
 };
 
-/* The account login the optional enhanced features authenticate with, as the two feature options that carry it. These are kept apart from the table above because
+/* The account login the optional enhanced features authenticate with, as the feature options that carry it. These are kept apart from the table above because
  * they answer a different question: that table pairs a setting with the legacy configuration property it supersedes, and these have no property to supersede.
  * There has never been a config.json home for them, so there is nothing to migrate, nothing to read as a fallback, and nothing to delete on a write.
  */
@@ -61,7 +61,8 @@ const RETIRED_OPTION_RENAMES = new Map([[ "device.suspend", "Device.Suspend.All"
  * @param injected.FeatureOptions - The feature-option engine class.
  * @param injected.catalog        - The served catalog, carrying its categories and its options record.
  *
- * @returns The interpreter: the effective API key, the legacy-settings migration, and the first-run key write.
+ * @returns The interpreter: readers for the effective API key, account password, and account username, the legacy-settings migration, and the first-run
+ *          write that commits all of them at once.
  */
 export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
 
@@ -207,6 +208,10 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
 
     /* Move any legacy configuration properties into their feature options, as a patch for the session to stage. This is transitional work with a planned end:
      * once a configuration has been through it, there is nothing left to find and every later pass answers null.
+     *
+     * Ahead of that property scan, every pass also rewrites any configured entry addressing a RETIRED option name to the name that superseded it. That
+     * rewrite runs unconditionally rather than only when a legacy property is present, so a configuration carrying no legacy properties at all still gets
+     * any retired name brought current.
      *
      * A property that is present with a defined value always leaves, carried on the patch as an explicitly undefined key so the shallow-merge commit deletes
      * it rather than skipping it. Whether its value additionally becomes an option entry depends on which kind of option it addresses, and the kind is read
@@ -356,7 +361,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
  * no catalog to validate it against is how a webUI corrupts a config, writing the property instead is always safe, and the next healthy session migrates it
  * forward on its own. The account credentials have no legacy property at all, so that safety valve does not exist for them - a property write would land somewhere
  * nothing ever reads - and they compose the canonical option entry directly. That is a narrow, well-understood exception: the entry form is one line of grammar
- * shared with the reader below, and these two options are known to be value-centric without consulting any catalog.
+ * shared with the reader below, and the password and username options are known to be value-centric without consulting any catalog.
  *
  * @returns The degraded-mode interpreter.
  */

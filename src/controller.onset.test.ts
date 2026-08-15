@@ -237,7 +237,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
 
-    // The null command schedules a 50ms revert that flips the optimistic ACTIVE back to INACTIVE.
+    // The null command schedules a HYDRAWISE_REVERT_DELAY revert that flips the optimistic ACTIVE back to INACTIVE.
     await waitFor(() => (valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE) ? true : undefined);
 
     assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a failed run should revert the valve to inactive");

@@ -9,7 +9,7 @@ import { HYDRAWISE_API_TIMEOUT, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECR
 import { featureOptionCategories, featureOptions } from "../dist/options.js";
 import { HomebridgePluginUiServer } from "@homebridge/plugin-ui-utils";
 
-// The base URL for every Hydrawise cloud API call this server makes.
+// The base URL for every v1 REST call this server makes. The account-login validation below reaches the v2 API through its own endpoint constants instead.
 const HYDRAWISE_API_BASE = "https://api.hydrawise.com/api/v1/";
 
 /* The account-login validation this server performs is a SECOND implementation of the OAuth grant and graph call the plugin's own v2 client runs, and that is a

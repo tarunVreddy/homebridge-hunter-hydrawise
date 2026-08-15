@@ -3,8 +3,8 @@
  * controller.ts: Base class for all Hydrawise irrigation controllers.
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
-import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
-  HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
+  HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isControllerIdentity, isScheduleStatus, isSuspendZoneSubtype,
   isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameEntries, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
   zoneIdentity, zoneScheduleStatus } from "./types.ts";
@@ -51,8 +51,8 @@ interface HydrawiseZoneHints {
   isSuspended: boolean;
 }
 
-/* The one owner of the zone hints a controller keeps. The map is private to this class, and every change to it arrives as a named intent - seed, mark, clear,
- * observe, refresh, prune - rather than as a field write somewhere out in the poll walk or a set handler.
+/* The one owner of the zone hints a controller keeps. The map is private to this class, and every change to it arrives as a named, single-purpose method
+ * rather than as a field write somewhere out in the poll walk or a set handler.
  *
  * Single ownership is what lets the relationships between those hints be enforced here instead of resting on the order call sites happen to run in. A zone the
  * wire reports as not running is not manually activated, so the observation clears the manual flag itself, and an entry exists only for a zone the current
@@ -188,6 +188,18 @@ interface HydrawiseZoneSuspendCommand {
   commandedUntil: Nullable<number>;
 }
 
+/* One Hydrawise irrigation controller as HomeKit sees it: the accessory or accessories this class projects onto, the endless polling loop that keeps their
+ * characteristics current, and the commands a user's actions in the Home app turn into wire requests.
+ *
+ * The polling loop runs as two halves under one supervised envelope, started from the constructor: pollStatus() is the wire generator that fetches the account
+ * API's status on the interval the API itself sets, and applyStatus() is the HomeKit projection that reads each completed poll and updates services,
+ * characteristics, and accessory context from it. The same class also owns a standalone zone accessory's valve, when the plugin is configured to promote one,
+ * so a zone's state is projected consistently regardless of which accessory hosts it.
+ *
+ * Every command HomeKit issues - a zone run or stop, an account-wide suspend-all, a per-zone suspension - is sent from here through sendCommand(), and the
+ * confirmed result is folded back into the same projection a poll would update, so a change made in the Home app and one made in the Hydrawise app converge on
+ * the same displayed state.
+ */
 export class HydrawiseController {
 
   private readonly accessory: HydrawiseControllerAccessory;
@@ -249,9 +261,15 @@ export class HydrawiseController {
 
     this.accessory = accessory;
     this.api = platform.api;
+
+    // The pre-first-poll placeholder: nextpoll -1 is the isFirstRun sentinel pollStatus() reads on its first pass, and every field here is fully replaced
+    // once that first fetch resolves.
     this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
     this.enabledZones = [];
     this.hap = this.api.hap;
+
+    // Populated synchronously by configureDevice(), called at the end of this constructor, which runs configureHints() first among its steps and so sets
+    // this.hints.suspendAll before any external reader can observe this.hints - that ordering is what makes the empty-object cast safe.
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
     this.platform = platform;
@@ -339,17 +357,17 @@ export class HydrawiseController {
    * controller's own accessory and its wire serial with no hardware named. A standalone zone accessory has no wire serial of its own, so its caller synthesizes
    * one, and it names no hardware either: model and firmware describe the controller, not one valve hanging off it.
    *
-   * The manufacturer and the serial always write. What happens to the model and the firmware depends on who owns those two values right now, and there are exactly
-   * three cases.
+   * The manufacturer and the serial always write. What happens to the model and the firmware depends on which of the following combinations holds.
    *
    * Called WITH hardware, this writes it - that is the enrichment landing, and it writes unconditionally, comparing nothing first. HAP already drops a write whose
    * value matches what the characteristic holds, so a compare here would only duplicate the library's own work and add a second place for the two answers to
    * disagree.
    *
-   * Called WITHOUT hardware while the account credentials are configured, it leaves BOTH alone. Those characteristics are the store: HAP restored real values from
-   * a previous session into them, and the fetch that will refresh those values is already on its way, so writing a placeholder over them would blank a correct
-   * display for the length of a network round trip. The single exception is an accessory that has never been stamped at all, which still carries HAP's own default
-   * model - there is nothing to preserve there, and leaving it would show the user a library-internal string, so the placeholder is written.
+   * Called WITHOUT hardware on the controller's OWN accessory while the account credentials are configured, it leaves BOTH alone. Those characteristics are the
+   * store: HAP restored real values from a previous session into them, and the fetch that will refresh those values is already on its way, so writing a
+   * placeholder over them would blank a correct display for the length of a network round trip. The single exception is an accessory that has never been
+   * stamped at all, which still carries HAP's own default model - there is nothing to preserve there, and leaving it would show the user a library-internal
+   * string, so the placeholder is written.
    *
    * Called WITHOUT hardware and with no credentials configured, both write unconditionally: the product-line placeholder, and the firmware returned to the
    * unknown-firmware marker Homebridge itself stamps on a restored accessory. That reset is what makes removing the credentials a clean revert - the
@@ -513,9 +531,9 @@ export class HydrawiseController {
     this.lastKnownOnline = online;
   }
 
-  /* The account-credentialed facts if and only if they can still be trusted, and null otherwise. This is the single freshness judgment in the class, and the
-   * three ways there is nothing to trust - none ever arrived, the last ones have aged past their lifetime, and no credentials are configured at all - all answer
-   * the same null, so no consumer has to tell them apart.
+  /* The account-credentialed facts if and only if they can still be trusted, and null otherwise. This is the single freshness judgment in the class, and every
+   * way there is nothing to trust - none ever arrived, the last ones have aged past their lifetime, or no credentials are configured at all - answers the same
+   * null, so no consumer has to tell them apart.
    *
    * It hands back the WHOLE snapshot rather than the zones map alone, because every gated consumer draws the same judgment: the per-zone classifier inputs, the
    * projection's availability stamp, the MQTT payload's additive fields, and the fault characteristic. Returning the map alone would force a second, parallel
@@ -577,8 +595,8 @@ export class HydrawiseController {
 
   /* Drop every per-zone suspension command this pass supersedes, so that what remains is exactly the set that still speaks for its zone.
    *
-   * A command retires on either of the two things that can make it moot: facts that postdate it, which is the freshness rule's other face, and its zone leaving
-   * the wire report, which leaves nothing for the command to speak for.
+   * A command retires when facts postdate it, which is the freshness rule's other face, or when its zone leaves the wire report, which leaves nothing for the
+   * command to speak for.
    *
    * This runs at the head of a pass rather than beside any one consumer, because the surviving set is what the classifier is handed: a stale entry reaching
    * composition would resurrect a command the account has already answered, and it would do so in the persisted projection where every surface would read it.
@@ -598,9 +616,9 @@ export class HydrawiseController {
 
   /* Show every companion switch what its zone now reads as.
    *
-   * Both cadences that can move a zone's suspension arrive here - the poll, which brings fresh wire truth, and the refresh tick, which brings the account facts a
-   * suspension is actually reported on - so a suspension made in the Hydrawise app reaches its switch with the refresh that learned of it rather than waiting for a
-   * poll that cannot see it.
+   * Every cadence that can move a zone's suspension arrives here through applyProjection: the poll, which brings fresh wire truth, a refresh tick, which brings
+   * the account facts a suspension is actually reported on, and a successful suspension command, whose acceptance is itself a fact about the zone it named - so
+   * a suspension made in the Hydrawise app reaches its switch with the refresh that learned of it rather than waiting for a poll that cannot see it.
    */
   private refreshZoneSuspendSwitches(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
@@ -731,7 +749,8 @@ export class HydrawiseController {
         setServiceName(labelService, effectiveName);
       }
 
-      // The accessory's own display pair - the Home app's tile and the information service's name - through the library helper that owns every write in it.
+      // The accessory's own display pair - the Home app's tile and the information service's name - is written here through the library helper that owns every
+      // write in it.
       setAccessoryName(this.accessory, effectiveName);
 
       renamed = true;
@@ -755,8 +774,8 @@ export class HydrawiseController {
   }
 
   /* Whether a suspension command still speaks for what it was issued against, which it does exactly while no fresher truth has arrived to supersede it. This is
-   * the one comparison home for the guard at BOTH grains - the two readers, the sweep that clears retired entries, and through that sweep the composition itself
-   * all ask here - so what "still standing" means cannot be answered two ways, and the switches and the projection cannot disagree about it.
+   * the one comparison home for the guard at BOTH grains - every reader of a standing command, plus the sweep that clears retired entries and, through that
+   * sweep, the composition itself - so what "still standing" means cannot be answered two ways, and the switches and the projection cannot disagree about it.
    *
    * Only a STRICTLY newer snapshot retires a command, which is the account-wide guard's own rule at the zone grain. Both instants are whole seconds, so a fetch
    * stamped in the same second as the command could have been dispatched either side of it, and the tie goes to the user: holding their command costs at most one
@@ -794,7 +813,7 @@ export class HydrawiseController {
   /* Project whether Hydrawise can currently reach this controller onto the irrigation system's fault characteristic, which exists only where the plugin can
    * actually learn the answer.
    *
-   * The three readings are distinct on purpose. A live "reachable" clears the fault and a live "unreachable" raises it. A refresh that carried no reading at all
+   * Each reading is handled on its own terms. A live "reachable" clears the fault and a live "unreachable" raises it. A refresh that carried no reading at all
    * leaves whatever is displayed standing, because overwriting a real answer with a guess is worse than a moment of staleness. And no trustworthy snapshot -
    * never arrived, or aged out because the refresh loop has stopped - clears the fault, since an unknown state is not a fault and freezing an offline reading on
    * display forever would be a lie the user cannot clear.
@@ -877,16 +896,12 @@ export class HydrawiseController {
     // Set the state of a given irrigation zone.
     this.platform.mqtt?.subscribeSet(this.mqttTopic("controller"), "controller", async (value: string): Promise<void> => {
 
-      // Parse the command.
       const action = value.split(" ");
-
-      // Parse the zone number.
       const zoneValue = parseInt(action[1] ?? "");
-
-      // Let's find the zone, if it exists.
       const zone = this.status.relays.find(x => x.relay === zoneValue);
 
-      // No zone. We throw so HBPU's subscribeSet convention logs the error, rather than logging locally and emitting a spurious success line alongside it.
+      // No zone found for the parsed number. We throw so HBPU's subscribeSet convention logs the error, rather than logging locally and emitting a spurious
+      // success line alongside it.
       if(!zone) {
 
         throw new Error("MQTT: Invalid zone specified.");
@@ -1106,9 +1121,9 @@ export class HydrawiseController {
     const nameChanged = this.applyControllerName(facts);
 
     /* Persist the identity roster, the schedule projection, and this controller's own identity, each on change, through one flush: whichever moved this poll rides
-     * a single updatePlatformAccessories call, so a poll costs at most one cache write no matter how many projections it advanced. All three run before the
-     * enablement projection below, so what is persisted covers every reported zone, feature-disabled or not - the complete listing and schedule the webUI reads
-     * back from cache with no cloud call.
+     * a single updatePlatformAccessories call, so a poll costs at most one cache write no matter how many projections it advanced. Every one of these runs before
+     * the enablement projection below, so what is persisted covers every reported zone, feature-disabled or not - the complete listing and schedule the webUI
+     * reads back from cache with no cloud call.
      *
      * The self-identity carries the controller's TRUE name rather than the label HomeKit shows, which is the same line the zone roster draws: a user's private
      * override is display, and what the webUI lists and the account roster denormalizes is what the controller actually is.
@@ -1392,12 +1407,14 @@ export class HydrawiseController {
 
         irrigationRemaining += duration;
 
-        // Update the duration of the remaining runtime of this valve, in seconds.
-        valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, 3600));
+        // Update the duration of the remaining runtime of this valve, in seconds, capped at HomeKit's own RemainingDuration maximum, so a longer run reports as
+        // the ceiling rather than its true remaining time.
+        valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, HAP_DURATION_CEILING));
       } else {
 
-        // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
-        valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
+        // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime, capped at HomeKit's own SetDuration
+        // maximum.
+        valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, HAP_DURATION_CEILING));
       }
 
       // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
@@ -1453,10 +1470,10 @@ export class HydrawiseController {
       }
     }
 
-    // Update the irrigation system state.
+    // Update the irrigation system state. The RemainingDuration cap is the same HomeKit-pinned maximum as each valve's own RemainingDuration above.
     irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse,
       (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
-    irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
+    irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, HAP_DURATION_CEILING));
 
     // Update the irrigation system's program mode when no enabled zone is manually running: if every enabled zone is currently stopped by a rain sensor,
     // no program is scheduled; otherwise we're on our normal scheduled program.
@@ -1631,14 +1648,14 @@ export class HydrawiseController {
 
     let command, zone;
 
-    // We've been called as sendCommand("suspendall", duration)
+    // We've been called as sendCommand("suspendall", duration).
     if(typeof zoneOrCmd === "string") {
 
       command = zoneOrCmd;
       duration = cmdOrDur as number;
     } else {
 
-      // We've been called as sendCommand(zone, "run" | "stop", [duration])
+      // We've been called as sendCommand(zone, "run" | "stop", [duration]).
       zone = zoneOrCmd;
       command = cmdOrDur as "run" | "stop";
     }
@@ -1688,6 +1705,8 @@ export class HydrawiseController {
         params["custom"] = duration.toString();
         params["period_id"] = "999";
 
+        // The current overload set never reaches this branch with a zone in hand - a suspendall call is always the zoneOrCmd-is-a-string branch above, so
+        // params["relay_id"] was never set - but the delete stays as a safety net should a future signature change ever let one through.
         delete params["relay_id"];
 
         break;
@@ -1906,7 +1925,7 @@ export class HydrawiseController {
     return isZoneStoppedBySensor(zone, this.status);
   }
 
-  // Utility to conver the duration from seconds to minutes, with the correct plural marker.
+  // Utility to convert the duration from seconds to minutes, with the correct plural marker.
   private getMinutes(duration: number): string {
 
     const minutes = Math.round(duration / 60);
@@ -1942,7 +1961,7 @@ export class HydrawiseController {
   /* Utility for reading a zone-scoped value option. The zone id rides the device position ALONE, and an unset, empty, or whitespace-only value normalizes to
    * undefined so callers can default with ??.
    *
-   * Presenting exactly one id is the rule both value readers keep, and here it is what makes a controller-level entry unreachable from a zone's read: the Name
+   * Presenting exactly one id is the rule every value reader keeps, and here it is what makes a controller-level entry unreachable from a zone's read: the Name
    * option resolves at the controller as well as the zone, so a read that also presented the serial would answer a zone with its controller's name whenever the
    * zone had no entry of its own. A probe against the real engine records both polarities - the serial-bearing read resolves the controller's entry, the
    * serial-free read does not - and the pair is why the argument is absent rather than merely unused.
@@ -1990,7 +2009,7 @@ export class HydrawiseController {
    * as the wire heuristic reads. Nothing about the command's age is asked here, because the one standing judgment above has already asked it.
    *
    * Otherwise the wire heuristic stands. Every zone carrying the unscheduled sentinel with no sensor stop is the strongest evidence the key-based wire offers for
-   * a suspend-all, and it is what the API itself normalizes a suspend-all command to. It carries two documented ambiguities: it cannot tell a suspend-all from an
+   * a suspend-all, and it is what the API itself normalizes a suspend-all command to. It carries documented ambiguities of its own: it cannot tell a suspend-all from an
    * account whose every zone merely sits between runs, so the switch can read on with nothing commanded; and on a controller whose rain sensor covers every zone
    * it reads OFF during a genuine suspend-all, because the sensor classification claims those zones first - a 2026-08-04 live capture recorded exactly that. The
    * facts path above is what resolves the second; the heuristic remains the honest fallback for an install that cannot reach it.

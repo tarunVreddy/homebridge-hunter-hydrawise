@@ -15,14 +15,16 @@
  *
  * Consumed surface (swept from homebridge-plugin-utils/src/service.ts and the plugin source): a service exposes UUID, subtype, displayName (mutable),
  * characteristics (the public array getCharacteristicConstructor destructures), optionalCharacteristics, addOptionalCharacteristic, testCharacteristic,
- * getCharacteristic, updateCharacteristic, and removeService's target shape; a characteristic exposes UUID, value, updateValue, onGet, onSet, and
- * the triggerGet / triggerSet test knobs; an accessory exposes context, displayName, _associatedHAPAccessory, services, addService, getService,
- * getServiceById, and removeService.
+ * getCharacteristic, updateCharacteristic, removeCharacteristic, and removeService's target shape; a characteristic exposes UUID, value, updateValue,
+ * onGet, onSet, and the triggerGet / triggerSet test knobs; an accessory exposes context, displayName, updateDisplayName, _associatedHAPAccessory,
+ * services, addService, getService, getServiceById, and removeService.
  */
 
-// Identity classes for the HAP Characteristic kinds the plugin touches. Each kind is its own marker class carrying a hapKind property (so a failure surfaces the
-// kind in inspect output), the UUID identity string HAP exposes on every characteristic, and, where production compares against named constants, the HAP integer
-// constants as statics. Production passes the class itself as a key into getCharacteristic / updateCharacteristic; the value is looked up by class identity.
+// Identity classes for the HAP Characteristic kinds the plugin touches. Each kind is its own marker class carrying the UUID identity string HAP exposes on
+// every characteristic, and, where production compares against named constants, the HAP integer constants as statics. A hapKind field names the kind for
+// readability in source, but these classes are never constructed - production passes the class itself as a key into getCharacteristic / updateCharacteristic,
+// and the value is looked up by class identity - so hapKind never materializes on a live instance here the way it does on the service markers below, which
+// acquireService constructs directly and so surface their kind in inspect output on failure.
 class ActiveCharacteristicType {
 
   public static readonly ACTIVE = 1;
@@ -148,7 +150,10 @@ class ValveTypeCharacteristicType {
   public readonly hapKind = "ValveType" as const;
 }
 
-// The HAP Characteristic namespace as the test-double exposes it. Alphabetical per the house property-order style. Add a kind here when production reaches for one.
+/**
+ * The HAP Characteristic namespace as the test-double exposes it. Alphabetical per the house property-order style. Add a kind here when production
+ * reaches for one.
+ */
 export const Characteristic = {
 
   Active: ActiveCharacteristicType,
@@ -178,18 +183,25 @@ export type ServiceType = abstract new (...args: never[]) => object;
 // A service kind as the real helpers' name-set initializer consumes it: a marker carrying the identity string it looks the kind up by.
 type ServiceKindMarker = ServiceType & { readonly UUID: string };
 
-// One recorded characteristic write: the kind that was written and the value it received. Assertions filter a service's log by kind, because a service takes
-// routine writes on every polling pass and a claim about one characteristic must not be disturbed by them.
+/**
+ * One recorded characteristic write: the kind that was written and the value it received. Assertions filter a service's log by kind, because a service
+ * takes routine writes on every polling pass and a claim about one characteristic must not be disturbed by them.
+ */
 export interface CharacteristicWrite {
 
   readonly type: CharacteristicType;
   readonly value: unknown;
 }
 
-// One characteristic backing instance, owned by a TestService. Holds the last value written plus the optional onGet / onSet handlers production installs.
-// triggerGet / triggerSet are the test-side knobs that exercise the bound handlers without a real HAP request path. This is the ONLY characteristic class the
-// double instantiates, so it is what the real getCharacteristicConstructor recovers from a service's first characteristic - which is why the name-characteristic
-// kinds hang off it as statics, mirroring how HAP's Characteristic base class exposes its namespace.
+/**
+ * One characteristic backing instance, owned by a TestService. Holds the last value written plus the optional onGet / onSet handlers production installs.
+ * triggerGet / triggerSet are the test-side knobs that exercise the bound handlers without a real HAP request path. This is the ONLY characteristic class
+ * the double instantiates, so it is what the real getCharacteristicConstructor recovers from a service's first characteristic - which is why the
+ * name-characteristic kinds hang off it as statics, mirroring how HAP's Characteristic base class exposes its namespace.
+ *
+ * @param type        - the characteristic kind marker this instance backs.
+ * @param recordWrite - callback invoked with each written value, so the owning service can log it against this kind.
+ */
 export class TestCharacteristic {
 
   public static readonly ConfiguredName = ConfiguredNameCharacteristicType;
@@ -207,9 +219,9 @@ export class TestCharacteristic {
     this.type = type;
 
     /* Seed the value HAP itself constructs this kind with, mirrored from the kind's own static. Only the AccessoryInformation string characteristics declare one -
-     * every other kind starts null, exactly as before - and modeling them is not decoration: production READS the model characteristic and branches on whether it
-     * still holds HAP's default, which is how it tells a brand-new accessory from one restored out of the cache. A double that started every characteristic at
-     * null would send that branch down the wrong arm and let a broken implementation pass.
+     * every other kind starts null, matching HAP's own uninitialized default - and modeling them is not decoration: production READS the model characteristic
+     * and branches on whether it still holds HAP's default, which is how it tells a brand-new accessory from one restored out of the cache. A double that
+     * started every characteristic at null would send that branch down the wrong arm and let a broken implementation pass.
      */
     this.currentValue = (type as { DEFAULT_VALUE?: unknown }).DEFAULT_VALUE ?? null;
   }
@@ -222,7 +234,8 @@ export class TestCharacteristic {
     return (this.type as { UUID?: string }).UUID ?? "unidentified-characteristic-kind";
   }
 
-  // The most recently written value. Production reads this after updateCharacteristic to confirm its own write landed.
+  // The most recently written value. Production reads this to decide behavior on its next pass - whether a characteristic still holds a sentinel default,
+  // or what a prior write left cached - rather than to confirm a write it just made.
   public get value(): unknown {
 
     return this.currentValue;
@@ -278,11 +291,17 @@ export class TestCharacteristic {
   }
 }
 
-/* One service instance attached to a TestAccessory. Holds a Map of characteristic-kind -> TestCharacteristic so getCharacteristic returns the same instance
- * across calls (production binds onGet / onSet once and expects the binding to persist). characteristics is a PUBLIC ARRAY view because acquireService's
- * getCharacteristicConstructor destructures the first element to recover the Characteristic constructor and throws when none exists - which is why each
- * constructible service marker seeds one characteristic. displayName is MUTABLE because setServiceName assigns it on every acquire. UUID mirrors the marker's
- * static and is never empty, so no service collides with the empty-string entry the helpers' name sets carry for the HAP kinds this double does not model.
+/**
+ * One service instance attached to a TestAccessory. Holds a Map of characteristic-kind -> TestCharacteristic so getCharacteristic returns the same
+ * instance across calls (production binds onGet / onSet once and expects the binding to persist). characteristics is a PUBLIC ARRAY view because
+ * acquireService's getCharacteristicConstructor destructures the first element to recover the Characteristic constructor and throws when none exists -
+ * which is why each constructible service marker seeds one characteristic. displayName is MUTABLE because setServiceName assigns it on every acquire.
+ * UUID mirrors the marker's static and is never empty, so no service collides with the empty-string entry the helpers' name sets carry for the HAP kinds
+ * this double does not model.
+ *
+ * @param type        - the service kind marker this instance backs.
+ * @param displayName - the service's initial display name.
+ * @param subtype     - the service's subtype, when the kind is instantiated more than once on an accessory.
  */
 export class TestService {
 
@@ -387,8 +406,11 @@ export class TestService {
     return this;
   }
 
-  // Declare an optional characteristic, mirroring HAP's Service.addOptionalCharacteristic. HAP lazily materializes a permitted characteristic on first access, so
-  // the double records it in the optional set and materializes it now, keeping a later getCharacteristic / onGet bind against the SAME instance.
+  // Declare an optional characteristic, mirroring HAP's Service.addOptionalCharacteristic. HAP lazily materializes a permitted characteristic on first
+  // access, but testCharacteristic is a pure has() check with no creation side effect of its own, so without materializing it here the double would
+  // report the characteristic absent until some later getCharacteristic / onGet call created it. Materializing it now makes testCharacteristic report
+  // it present immediately after this call, matching HAP's own behavior; getCharacteristic's own memoization is what guarantees any later access
+  // returns this same instance, regardless of when it was first created.
   public addOptionalCharacteristic(charType: CharacteristicType): void {
 
     this.optionalTypes.add(charType);
@@ -435,9 +457,10 @@ export class TestService {
   }
 }
 
-// The service marker classes. Each is a CONSTRUCTIBLE subclass of TestService carrying HAP's (displayName?, subtype?) constructor, because the real acquireService
-// instantiates the namespace entry directly on its create branch and recovers the Characteristic constructor from the new service's first characteristic. Every
-// marker therefore seeds exactly one characteristic at construction: the kind's primary required characteristic.
+// The service marker classes. Each is a CONSTRUCTIBLE subclass of TestService carrying HAP's (displayName?, subtype?) constructor, because the real
+// acquireService instantiates the namespace entry directly on its create branch and recovers the Characteristic constructor from the new service's first
+// characteristic. Every marker therefore seeds at least its primary required characteristic at construction, so the first element always exists for
+// getCharacteristicConstructor to recover.
 class AccessoryInformationServiceType extends TestService {
 
   public static readonly UUID = "AccessoryInformation";
@@ -503,7 +526,9 @@ class ValveServiceType extends TestService {
   }
 }
 
-// The HAP Service namespace as the test-double exposes it. Alphabetical per the house property-order style. Add a kind here when production touches one.
+/**
+ * The HAP Service namespace as the test-double exposes it. Alphabetical per the house property-order style. Add a kind here when production touches one.
+ */
 export const Service = {
 
   AccessoryInformation: AccessoryInformationServiceType,
@@ -513,10 +538,15 @@ export const Service = {
   Valve: ValveServiceType
 } as const;
 
-/* One accessory. Carries an AccessoryInformation service from construction (every HomeKit accessory has one); subsequent addService calls append more. getService
- * / getServiceById mirror HAP's distinction between "the bare service of this type" and "the service of this type with a specific subtype". The mutable context
- * and displayName are the fields the production controller path reads and writes; the _associatedHAPAccessory mirror is retained for HAP-shape parity because the
- * display-name write assigns through it.
+/**
+ * One accessory. Carries an AccessoryInformation service from construction (every HomeKit accessory has one); subsequent addService calls append more.
+ * getService / getServiceById mirror HAP's distinction between "the bare service of this type" and "the service of this type with a specific subtype".
+ * The mutable context and displayName are the fields the production controller path reads and writes; the _associatedHAPAccessory mirror is retained for
+ * HAP-shape parity because the display-name write assigns through it.
+ *
+ * @param displayName - the accessory's initial display name.
+ * @param uuid        - the accessory's UUID.
+ * @param category    - the accessory's HAP category, mirroring the real PlatformAccessory's optional third constructor argument.
  */
 export class TestAccessory {
 

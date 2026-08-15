@@ -45,10 +45,9 @@ describe("HydrawiseController updateState defect pins", () => {
 
     t.after(() => h.abort());
 
-    // The valve appears on poll 1 and is pruned once the zone vanishes. The program-mode aggregate projects over the current poll's enabled zones only, so a
-    // vanished zone's retained state never feeds it. This is a deliberate, owner-blessed divergence from v1, which recomputed the aggregate every poll but over all
-    // retained zone state, and so could select a program mode off a deleted zone's frozen flags in a multi-zone controller. Here, with one zone, the empty
-    // projection's 0 === 0 equality selects NO_PROGRAM_SCHEDULED.
+    // The valve appears on poll 1 and is pruned once the zone vanishes. The program-mode aggregate projects over the current poll's enabled zones only, rather
+    // than over all retained zone state, so a vanished zone's frozen flags can never select the program mode for a multi-zone controller. Here, with one zone,
+    // the empty projection's 0 === 0 equality selects NO_PROGRAM_SCHEDULED.
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
     await waitFor(() => (h.accessory.getServiceById(Service.Valve, "700001") === undefined) ? true : undefined);
 
@@ -251,8 +250,8 @@ describe("HydrawiseController updateState defect pins", () => {
     const cleanup = assertNoUnhandledRejections();
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { kind: "null" }), signalAborted: false });
 
-    // The very first poll returns null, so getStatus throws and retry evaluates the isFirstRun-true fixed backoff (60s) synchronously before suspending. A prompt
-    // abort ends that wait; because backoff() ran before delay() suspended, the arm is exercised without any real 60-second wait.
+    // The very first poll returns null, so getStatus throws and retry evaluates the isFirstRun-true fixed backoff (HYDRAWISE_API_RETRY_INTERVAL) synchronously
+    // before suspending. A prompt abort ends that wait; because backoff() ran before delay() suspended, the arm is exercised without waiting out that interval.
     await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 1) ? true : undefined);
 
     h.abort();
@@ -309,7 +308,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
   test("a zone forced into a manual run reads the switch OFF, even with every zone suspended", async (t) => {
 
     /* The case that makes reading the CLASSIFIED states right where reading the raw suspension facts would be wrong. The wire outranks the facts for a running
-     * zone, so water actually flowing means the account is not all-suspended - exactly what the key-based heuristic has always answered.
+     * zone, so water actually flowing means the account is not all-suspended - the key-based heuristic answers OFF here.
      */
     const running = makeZone({ name: "Vegetable Garden", relay: 34, relay_id: 700019, run: 600, time: 1, timestr: "" });
     const relays = [ ...sentinelZoneMatrix.filter(zone => zone.relay_id !== 700019).map(zone => ({ ...zone })), running ];
@@ -382,7 +381,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
   test("the two key-based topology pins are untouched by an install without credentials", async (t) => {
 
-    // The parity restatement: with no credentials nothing above applies at all, and the heuristic answers exactly as it always has for both topologies.
+    // The parity restatement: with no credentials nothing above applies at all, and the heuristic answers from the wire alone for both topologies.
     const suspended = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()),
       kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
@@ -399,9 +398,10 @@ describe("HydrawiseController program mode reads the sensor, not the classificat
 
   test("a suspended zone a tripped sensor still covers counts toward the stopped aggregate", async (t) => {
 
-    /* The aggregate half of the rain-hint fix. Every zone is covered by a tripped sensor and one of them is also suspended, so a hint derived from the classified
-     * state would drop that zone out of the stopped count - suspension outranks the sensor for DISPLAY - and lift the whole controller back to program-scheduled
-     * while rain was still falling. Reading the sensor keeps the aggregate honest, which is also what it reported before the account facts existed at all.
+    /* The aggregate reads the sensor, not the classified per-zone state. Every zone is covered by a tripped sensor and one of them is also suspended, so a hint
+     * derived from the classified state would drop that zone out of the stopped count - suspension outranks the sensor for DISPLAY - and lift the whole
+     * controller back to program-scheduled while rain is still falling. Reading the sensor instead keeps the aggregate honest regardless of whether account
+     * facts are configured.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }), signalAborted: false });

@@ -13,8 +13,8 @@
  * because the barrel re-exports verbatim. The optional exec.helpers.ts submodule is omitted here: this plugin has no execFile-shaped adapter port.
  *
  * Add additional thematic submodules as the project grows (e.g., a `network.helpers.ts` for HTTP-fake utilities), keeping the one-concern-per-file discipline.
- * The plugin-specific HAP, platform, MQTT, and wire doubles live in their own submodules under src/testing/ and are imported directly rather than through this
- * canonical barrel.
+ * The plugin-specific HAP double lives in src/testing/hap.helpers.ts, and the platform double, the recording MQTT client, and the retrieve recorder live
+ * together in src/testing/platform.helpers.ts; both files are imported directly rather than through this canonical barrel.
  */
 export type { CapturedLogLine, TestLogger } from "./testing/loggers.helpers.ts";
 export { assertNoUnhandledRejections, expectAt } from "./testing/process.helpers.ts";

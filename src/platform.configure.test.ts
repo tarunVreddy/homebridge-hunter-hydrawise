@@ -321,8 +321,9 @@ describe("HydrawisePlatform configure", () => {
 
   test("shutdown destroys the account-credentialed dispatcher too, and aborts before it", (t) => {
 
-    /* The v2 twin of the two pins above. Its own transport keeps its own keep-alive pool, so it owns a teardown registration of its own, and without this pin
-     * deleting that registration reds nothing: the pool simply outlives the plugin, holding a connection nothing will ever use again.
+    /* The account-credentialed twin of the v1 dispatcher-teardown pins above. Its own transport keeps its own keep-alive pool, so it owns a teardown
+     * registration of its own, and without this pin deleting that registration reds nothing: the pool simply outlives the plugin, holding a connection
+     * nothing will ever use again.
      *
      * No wire traffic is needed. The client's pool is constructed with the platform and destroyed by the shutdown handler whether or not a request ever crossed it,
      * which is precisely the leak a missing defer would cause on an install that never spent a v2 call.

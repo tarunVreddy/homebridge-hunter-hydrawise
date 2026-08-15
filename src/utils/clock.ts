@@ -7,23 +7,22 @@
  *
  * Why this exists. Node's built-in node:test mock.timers exposes only synchronous tick() and runAll() - it has never shipped a tickAsync/runAllAsync variant
  * on any version. Synchronous tick advances the fake clock but does not drain microtask chains across nested Promise.race / .finally / await delay() patterns;
- * the promises stay pending past the tick. retryOperation is the canonical case: its internal raceWithTimeout -> Promise.race -> .finally -> await delay()
- * chain is exactly the shape mock.timers cannot deterministically resolve. Injecting a Clock sidesteps the runtime gap entirely - tests provide a sleep() that
- * resolves immediately and a raceWithTimeout() that forwards or rejects on demand.
+ * the promises stay pending past the tick. A raceWithTimeout -> Promise.race -> .finally chain nested inside a retry loop's await delay() backoff is exactly
+ * the shape mock.timers cannot deterministically resolve. Injecting a Clock sidesteps the runtime gap entirely - tests provide a sleep() that resolves
+ * immediately and a raceWithTimeout() that forwards or rejects on demand.
  *
  * When to use a Clock vs. a direct delay()/raceWithTimeout() import. Use the direct imports when the production code's tests can fake time with mock.timers
  * and the call sites are shallow enough for synchronous tick() to drain. Reach for Clock injection only when nested async chains break that pattern, or when
  * the test surface needs to assert on the *schedule* (number and durations of sleeps) rather than just the eventual outcome.
  *
- * Project setup: this file expects a sibling `delay.ts` exporting `delay(ms: number): Promise<void>` and `raceWithTimeout<T>(promise: Promise<T>, timeoutMs:
- * number, timeoutError?: Error): Promise<T>`. If the project does not yet have those primitives, create them (they're 5-10 lines each) before adopting this
- * port.
+ * This file depends on the sibling `delay.ts`, which exports `delay(ms: number): Promise<void>` and `raceWithTimeout<T>(promise: Promise<T>, timeoutMs:
+ * number, timeoutError?: Error): Promise<T>`.
  */
 import { delay, raceWithTimeout } from "./delay.ts";
 
 /**
- * The time-dependent capability set: sleep, race-with-timeout, and read-the-clock. Decision logic that consumes a Clock is a pure function of this shape -
- * production wires it from real I/O via realClock, tests pass a fake clock literal.
+ * The time-dependent capability set: sleep, race-with-timeout, and read-the-clock. Decision logic that consumes a Clock is a pure function of this shape,
+ * ready for a production caller to wire from real I/O via realClock and for tests to pass a fake clock literal instead.
  */
 export interface Clock {
 
@@ -43,7 +42,7 @@ export interface Clock {
 
 /**
  * The default Clock implementation. Delegates to performance.now() for current time, to raceWithTimeout() in delay.ts for promise-vs-timeout races, and to
- * delay() in delay.ts for sleeps. Production callers consume this via the default-arg pattern; tests bypass it by passing a fake-clock literal.
+ * delay() in delay.ts for sleeps. A production caller would consume this via the default-arg pattern; tests bypass it by passing a fake-clock literal.
  */
 export const realClock: Clock = {
 

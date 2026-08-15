@@ -118,8 +118,9 @@ describe("HydrawiseController hardware display with credentials", () => {
 
   test("the preserve arm is decided by HAP's default alone, not by the credentials", () => {
 
-    // Stated as its own pin because the two arms above could both pass against an implementation that keyed on something else entirely. A model that is neither
-    // HAP's default nor a real controller name - the placeholder a previous unenriched session wrote - is still a value the plugin put there, so it is preserved.
+    // Stated as its own pin because an implementation that keyed on something other than HAP's default could still pass the warm-restart and fresh-accessory
+    // tests above it. A model that is neither HAP's default nor a real controller name - the placeholder a previous unenriched session wrote - is still a
+    // value the plugin put there, so it is preserved.
     const { accessory } = buildController({ hasV2Client: true,
       seedContext: (seed) => { seed.getService(Service.AccessoryInformation)?.updateCharacteristic(Characteristic.Model, PLACEHOLDER_MODEL); } });
 
