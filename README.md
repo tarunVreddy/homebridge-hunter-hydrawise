@@ -19,7 +19,7 @@
 `homebridge-hunter-hydrawise` is a [Homebridge](https://homebridge.io) plugin that makes your Hunter Hydrawise irrigation controller available to [Apple's](https://www.apple.com) [HomeKit](https://www.apple.com/ios/home) smart home platform.
 
 ## Why use this plugin for Hunter Hydrawise support in HomeKit?
-In a nutshell, the aim of this plugin for things to *just work* with minimal required configuration by users. The goal is to provide as close to a streamlined experience as you would expect from a first-party or native HomeKit solution. For the adventurous, those additional granular options are, of course, available to support more esoteric use cases or other unique needs.
+In a nutshell, the aim of this plugin is for things to *just work* with minimal required configuration by users. The goal is to provide as close to a streamlined experience as you would expect from a first-party or native HomeKit solution. For the adventurous, those additional granular options are, of course, available to support more esoteric use cases or other unique needs.
 
 What does *just work* mean in practice? It means that this plugin will discover all of the Hydrawise controllers connected to your Hydrawise account without the need for additional configuration beyond entering your account-specific API key. This plugin will expose those controllers and their zones as an irrigation system in HomeKit.
 
@@ -31,14 +31,18 @@ I've developed a full-featured Homebridge plugin that enables the following feat
   * Suspend watering across your entire controller from a single switch in HomeKit.
   * Display when your irrigation system is off due to a rain sensor preventing watering (the irrigation system will show as *off* in HomeKit).
   * Show, at a glance, all the zones that are queued up to run in the next 60 minutes on your controller (each individual zone will appear active in HomeKit when it's queued to run).
+  * Name your zones and controllers whatever you like, with names synchronized to HomeKit automatically.
+  * Expose any zone as its own standalone HomeKit accessory, assignable to any room in your home.
   * Optional enhanced features when you sign in with your Hydrawise account: accurate rain and suspension state for every zone, a suspend switch for each individual zone, the full zone and controller names your account carries, whether each controller is reachable, and each controller's real model and firmware.
-  * A rich webUI for configuration.
+  * A rich webUI for configuration that shows zone and controller schedule status at a glance.
   * MQTT support.
 
 ## <A NAME="plugin-configuration"></A>Installation
+`homebridge-hunter-hydrawise` requires Homebridge 2.0 or later, running on Node.js 22.20 or later.
+
 To get started with `homebridge-hunter-hydrawise`:
 
-  * [Generate a Hydrawise API key](https://app.hydrawise.com/config/account-details), should you need one.</li>
+  * [Generate a Hydrawise API key](https://app.hydrawise.com/config/account-details), should you need one.
   * Install `homebridge-hunter-hydrawise` using the Homebridge webUI. Make sure you make `homebridge-hunter-hydrawise` a child bridge for the best experience.
   * Configure `homebridge-hunter-hydrawise` and enter your API key. Optionally, sign in with your Hydrawise account to unlock the enhanced features.
   * That's it. Enjoy!
