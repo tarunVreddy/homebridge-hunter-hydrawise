@@ -2,7 +2,7 @@
  *
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, MatterAPI, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName,
   superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
@@ -18,6 +18,7 @@ import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sam
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
+import { HydrawiseMatterController } from "./matter-controller.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
@@ -34,8 +35,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly featureOptions: FeatureOptions;
   public config: HydrawiseOptions;
   public readonly configuredDevices: Record<string, HydrawiseController | undefined>;
+  public readonly configuredMatterDevices: Record<string, HydrawiseMatterController | undefined>;
   public readonly hap: HAP;
   public readonly log: Logging;
+  public readonly matterAccessories: MatterAccessory[];
   public readonly mqtt: Nullable<MqttClient>;
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
@@ -82,10 +85,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
     this.configuredDevices = {};
+    this.configuredMatterDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
     this.hap = api.hap;
     this.log = log;
     this.log.debug = this.debug.bind(this);
+    this.matterAccessories = [];
     this.mqtt = null;
 
     // Scope an AbortController to the platform's lifetime. We assign it and its signal at the top of the constructor, before the missing-API-key early return below,
@@ -189,6 +194,26 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public configureAccessory(accessory: HydrawiseAccessory): void {
 
     this.accessories.push(accessory);
+  }
+
+  // This gets called when homebridge restores cached Matter accessories at startup.
+  public configureMatterAccessory(accessory: MatterAccessory): void {
+
+    this.matterAccessories.push(accessory);
+  }
+
+  // Retrieve the Homebridge Matter API if enabled.
+  public getMatterApi(): Nullable<MatterAPI> {
+
+    const api = this.api as API & { isMatterEnabled?(): boolean; matter?: MatterAPI };
+    const isEnabled = (typeof api.isMatterEnabled === "function") ? api.isMatterEnabled() : Boolean(api.matter);
+
+    if(!isEnabled || !api.matter) {
+
+      return null;
+    }
+
+    return api.matter;
   }
 
   // Configure and connect to the Hydrawise API.
@@ -493,11 +518,21 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * controller UUID space and the zone UUID space cannot collide and an accessory found or created under a controller UUID can only be a controller
      * accessory. The controller writes its own context fields one at a time, which the arm's mutable interface is what allows.
      */
-    this.configuredDevices[uuid] = new HydrawiseController(this, accessory as HydrawiseControllerAccessory, controller, roster);
+    const hapController = new HydrawiseController(this, accessory as HydrawiseControllerAccessory, controller, roster);
+
+    this.configuredDevices[uuid] = hapController;
+
+    if(this.getMatterApi() && this.featureOptions.test("Matter", controller.serial_number)) {
+
+      const matterController = new HydrawiseMatterController(this, controller, hapController);
+
+      this.configuredMatterDevices[matterController.uuid] = matterController;
+      hapController.matterController = matterController;
+    }
 
     this.api.updatePlatformAccessories([accessory]);
 
-    return this.configuredDevices[uuid];
+    return hapController;
   }
 
   /* The one creation path for every accessory this platform registers: construct it, register it with Homebridge, and track it. Every creation cadence -

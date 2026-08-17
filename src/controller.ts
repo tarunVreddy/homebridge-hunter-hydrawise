@@ -16,6 +16,7 @@ import type { HydrawiseControllerOption, HydrawiseControllerValueOption, Hydrawi
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setAccessoryName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
+import type { HydrawiseMatterController } from "./matter-controller.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
@@ -43,7 +44,7 @@ interface HydrawisePollUpdate {
 }
 
 // Per-zone state we track across polling cycles so we can detect and report start, stop, rain-sensor, and suspension transitions.
-interface HydrawiseZoneHints {
+export interface HydrawiseZoneHints {
 
   isManual: boolean;
   isOn: boolean;
@@ -61,7 +62,7 @@ interface HydrawiseZoneHints {
  * The views handed back are the LIVE stored entries, never defensive copies. The poll walk holds one for the rest of its pass and has to observe the writes
  * that same pass makes through the ledger; a copy would hand it pre-write reads and quietly break the start, stop, and rain-sensor comparisons that follow.
  */
-class HydrawiseZoneHintLedger {
+export class HydrawiseZoneHintLedger {
 
   private readonly hints = new Map<number, HydrawiseZoneHints>();
 
@@ -229,6 +230,7 @@ export class HydrawiseController {
   private suspendAllCommand: HydrawiseZoneSuspendCommand | undefined;
 
   public readonly log: HomebridgePluginLogging;
+  public matterController: Nullable<HydrawiseMatterController> = null;
   private readonly platform: HydrawisePlatform;
   private status: StatusScheduleResponse;
 
@@ -1490,6 +1492,10 @@ export class HydrawiseController {
     // lands in the log instead of floating as an unhandled rejection.
     guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
       label: "MQTT publish (controller)", log: this.log });
+
+    // Update Matter state if enabled.
+    guardedDispatch({ handler: async (): Promise<void> => { await this.matterController?.updateZoneStates(this.enabledZones, this.zoneHints); },
+      label: "Matter zone state update", log: this.log });
   }
 
   /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.
@@ -1640,10 +1646,10 @@ export class HydrawiseController {
   }
 
   // Send a command to the Hydrawise API.
-  private async sendCommand(zone: HydrawiseZoneConfig, command: "run", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(zone: HydrawiseZoneConfig, command: "stop"): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(command: "suspendall", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(zoneOrCmd: HydrawiseZoneConfig | "suspendall", cmdOrDur: (number | "run" | "stop"), duration?: number):
+  public async sendCommand(zone: HydrawiseZoneConfig, command: "run", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
+  public async sendCommand(zone: HydrawiseZoneConfig, command: "stop"): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
+  public async sendCommand(command: "suspendall", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
+  public async sendCommand(zoneOrCmd: HydrawiseZoneConfig | "suspendall", cmdOrDur: (number | "run" | "stop"), duration?: number):
   Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
     let command, zone;

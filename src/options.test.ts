@@ -46,8 +46,8 @@ describe("hydrawise feature options", () => {
 
   test("declares the expected categories", () => {
 
-    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Account", "Device", "Log", "Mqtt" ],
-      "the catalog should declare the account, device, logging, and MQTT categories");
+    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Account", "Device", "Log", "Matter", "Mqtt" ],
+      "the catalog should declare the account, device, logging, Matter, and MQTT categories");
   });
 
   test("carries the catalog defaults for each option", () => {
@@ -58,8 +58,9 @@ describe("hydrawise feature options", () => {
     const suspendZone = optionEntry("Device", "Suspend.Zone");
     const syncName = optionEntry("Device", "SyncName");
     const logZone = optionEntry("Log", "Zone");
+    const matter = optionEntry("Matter", "");
 
-    assert.ok(device && name && suspend && suspendZone && syncName && logZone, "every catalog entry the runtime names should exist");
+    assert.ok(device && name && suspend && suspendZone && syncName && logZone && matter, "every catalog entry the runtime names should exist");
     assert.equal(device.default, true, "the base Device option defaults to enabled");
     assert.equal(name.default, false, "the name option defaults to disabled, so an unconfigured controller or zone resolves no override at all");
     assert.equal(name.defaultValue, "", "the name option is value-centric and defaults to empty, which the runtime reads as no override");
@@ -67,6 +68,7 @@ describe("hydrawise feature options", () => {
     assert.equal(suspendZone.default, false, "the per-zone suspension switches default to disabled");
     assert.equal(syncName.default, true, "name synchronization defaults to enabled");
     assert.equal(logZone.default, true, "zone logging defaults to enabled");
+    assert.equal(matter.default, false, "Matter integration defaults to disabled");
 
     /* The account login is a prose requirement rather than a gate - no mechanism withholds this option from an install without credentials - so the description
      * is the only place a user learns that the switches need one. Losing that sentence would leave the option silently doing nothing for them.
@@ -81,7 +83,7 @@ describe("hydrawise feature options", () => {
      * not mirrored in either surfaces here.
      */
     assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName",
-      "Log.Zone" ], "every controller-scoped option should be named in one of the controller unions");
+      "Log.Zone", "Matter" ], "every controller-scoped option should be named in one of the controller unions");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
@@ -110,7 +112,7 @@ describe("hydrawise feature options", () => {
     // A globally-scoped option applies across every controller on the account. The name override is deliberately absent: one name cannot be right for every
     // controller and zone at once, so it resolves at those grains alone.
     assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
-      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
+      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Matter", "Mqtt.Topic", "Mqtt.Url" ],
     "the name override is the only option that does not resolve globally");
   });
 

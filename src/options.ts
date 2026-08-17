@@ -43,7 +43,7 @@ export interface HydrawiseFeatureOption extends Omit<FeatureOptionEntry, "scopes
 // type covers only the boolean half of the controller-scoped catalog. This is the runtime's narrowed lookup key: a call to hasFeature must name one of
 // these, so passing a zone-only option to the controller-level lookup is a type error. A catalog this small makes a derived mapping overkill, so we keep
 // this compile-time mirror explicit and bind it by convention to the entries' scopes declarations below.
-export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone";
+export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone" | "Matter";
 
 // The zone-scopable boolean option names, mirroring at compile time the boolean-tested entries whose scopes declaration includes "device" - the level this
 // plugin projects as a zone. The value-centric Name entry carries "device" too, but it resolves instead through the value-centric HydrawiseZoneValueOption
@@ -83,6 +83,7 @@ export const featureOptionCategories = [
   { description: "Account feature options.", name: "Account" },
   { description: "Device feature options.", name: "Device" },
   { description: "Logging feature options.", name: "Log" },
+  { description: "Matter integration feature options.", name: "Matter" },
   mqtt.category
 ];
 
@@ -127,6 +128,12 @@ const logOptions: HydrawiseFeatureOption[] = [
   { default: true, description: "Log zone start and stop events in Homebridge.", name: "Zone", scopes: [ "controller", "device", "global" ] }
 ];
 
+// Matter options.
+const matterOptions: HydrawiseFeatureOption[] = [
+
+  { default: false, description: "Expose this controller and its zones as a Matter WaterValve accessory.", name: "", scopes: [ "controller", "global" ] }
+];
+
 /* eslint-enable @stylistic/max-len */
 
 /* The full option catalog, assembled from the categories this plugin authors and the group the library contributes. Each authored entry declares the scope
@@ -142,6 +149,7 @@ export const featureOptions: Record<string, FeatureOptionEntry[]> = {
   "Account": accountOptions,
   "Device": deviceOptions,
   "Log": logOptions,
+  "Matter": matterOptions,
   [mqtt.category.name]: mqtt.options
 };
 

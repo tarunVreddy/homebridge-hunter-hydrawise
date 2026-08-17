@@ -909,3 +909,10 @@ export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;
 // A controller accessory specifically: the same PlatformAccessory over the controller arm alone. The controller's own accessory takes this alias because that is
 // where the field writes live - seeding one roster field at a time is legal on the arm's mutable interface and nowhere else.
 export type HydrawiseControllerAccessory = PlatformAccessory<HydrawiseControllerAccessoryContext>;
+
+// The persisted context of a Matter accessory: the controller's id and serial.
+export interface HydrawiseMatterAccessoryContext {
+
+  controllerId: number;
+  serialNumber: string;
+}
