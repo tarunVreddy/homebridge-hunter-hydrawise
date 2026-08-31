@@ -121,4 +121,5 @@ The topics that `homebridge-hunter-hydrawise` subscribes to are:
 
 * Advanced Topics
   * [Feature Options](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/FeatureOptions.md): granular options to allow you to show or hide specific irrigation controllers, and more.
+  * [Matter](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/Matter.md): how to expose your zones over Matter, in addition to HomeKit.
 <!-- DOCUMENTATION:END -->

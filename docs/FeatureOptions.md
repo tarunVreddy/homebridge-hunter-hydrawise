@@ -40,6 +40,7 @@ Feature options provide a rich mechanism for tailoring your `homebridge-hunter-h
  * [Account](#account): Account feature options.
  * [Device](#device): Device feature options.
  * [Log](#log): Logging feature options.
+ * [Matter](#matter): Matter feature options.
  * [Mqtt](#mqtt): MQTT
 
 Options whose key ends in `=<value>` take a value - replace `=<value>` with your setting; all other options are simple on/off toggles. The default shown for each option is what applies when you leave it unset.
@@ -70,6 +71,13 @@ Options whose key ends in `=<value>` take a value - replace `=<value>` with your
 | <A NAME="Log.Debug"></A>`Log.Debug`  | Enable debug logging. **(default: disabled)**. <BR>*Configurable at globally, across every controller.*
 | <A NAME="Log.Zone"></A>`Log.Zone`    | Log zone start and stop events in Homebridge. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
 
+#### <A NAME="matter"></A>Matter feature options.
+
+| Option                                     | Description
+|--------------------------------------------|-------------------------------------------------------------
+| <A NAME="Matter"></A>`Matter`              | Expose this controller's zones over Matter, in addition to HomeKit. Requires Matter to be enabled on the bridge or child bridge this plugin runs in. **(default: disabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| <A NAME="Matter.Valve"></A>`Matter.Valve`  | Expose zones using Matter's WaterValve device type rather than an on/off outlet. Alexa, Google Home, and Apple Home do not currently support WaterValve, so zones will likely not appear at all - enable this only for an ecosystem you have confirmed supports it. Changing this rebuilds each zone's Matter endpoint, so it must be re-commissioned. **(default: disabled)**. <BR>*Configurable at the whole controller and globally, across every controller.*
+
 #### <A NAME="mqtt"></A>MQTT
 
 | Option                                         | Description
@@ -89,5 +97,6 @@ Options whose key ends in `=<value>` take a value - replace `=<value>` with your
   * [Changelog](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/Changelog.md): changes and release history of this plugin.
 
 * Advanced Topics
+  * [Matter](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/Matter.md): how to expose your zones over Matter, in addition to HomeKit.
   * [MQTT](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/MQTT.md): how to configure MQTT support.
 <!-- DOCUMENTATION:END -->

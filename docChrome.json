@@ -87,6 +87,12 @@
           "title": "Feature Options"
         },
         {
+          "blurb": "how to expose your zones over Matter, in addition to HomeKit.",
+          "file": "docs/Matter.md",
+          "kind": "doc",
+          "title": "Matter"
+        },
+        {
           "blurb": "how to configure MQTT support.",
           "file": "docs/MQTT.md",
           "kind": "doc",
