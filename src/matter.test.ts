@@ -49,7 +49,11 @@ function makeMatter(options: { failRegistration?: boolean; failUpdate?: (uuid: s
 
   const matter = {
 
-    deviceTypes: { OnOffOutlet: { name: "OnOffOutlet" }, WaterValve: { name: "WaterValve" } },
+    /* The names here are matter.js's own, which are NOT the keys Homebridge selects by: the plug-in-unit type is keyed "OnOffOutlet" and named
+     * "OnOffPlugInUnit". That difference is load-bearing for the cache rebuild, so the double reproduces it rather than smoothing it over - a double that
+     * echoed the key back would let a key-versus-name comparison bug pass here and only fail on a user's second restart.
+     */
+    deviceTypes: { OnOffOutlet: { name: "OnOffPlugInUnit" }, WaterValve: { name: "WaterValve" } },
     registerPlatformAccessories: async (plugin: string, platform: string, accessories: MatterAccessory[]): Promise<void> => {
 
       assert.equal(plugin, PLUGIN_NAME, "registration names this plugin");
@@ -148,7 +152,7 @@ describe("Matter zone registration", () => {
     assert.equal(accessory.displayName, "Front Lawn", "the accessory is named with the effective name the controller resolved");
     assert.equal(accessory.serialNumber, "ABC123-101", "each endpoint reports its own serial rather than sharing the controller's");
     assert.equal(accessory.manufacturer, "Hunter", "the manufacturer is reported");
-    assert.equal((accessory.deviceType as unknown as { name: string }).name, "OnOffOutlet", "the default device type is the one every ecosystem handles");
+    assert.equal((accessory.deviceType as unknown as { name: string }).name, "OnOffPlugInUnit", "the default device type is the one every ecosystem handles");
     assert.deepEqual(accessory.clusters?.onOff, { onOff: true }, "a zone that is running registers already open, so it never reads idle for a poll");
   });
 
@@ -364,7 +368,7 @@ describe("Matter cache rebuilding", () => {
      * that ride along with it. Re-registering this object is the thing the rebuild exists to prevent.
      */
     const cached = { UUID: matterZoneUuid(matter, SERIAL, 101), _eventEmitter: { on: (): void => undefined }, _parts: [],
-      context: { controllerId: 7167, relayId: 101, serialNumber: SERIAL }, deviceType: { name: "OnOffOutlet" },
+      context: { controllerId: 7167, relayId: 101, serialNumber: SERIAL }, deviceType: { name: "OnOffPlugInUnit" },
       displayName: "Front Lawn" } as unknown as MatterAccessory;
 
     const rebuilt = rebuildCachedMatterAccessory({ cached, command, deviceTypeFor, matter });
@@ -383,7 +387,7 @@ describe("Matter cache rebuilding", () => {
     const { matter } = makeMatter();
 
     const cached = { UUID: matterZoneUuid(matter, SERIAL, 101), context: { controllerId: 7167, relayId: 101, serialNumber: SERIAL },
-      deviceType: { name: "OnOffOutlet" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
+      deviceType: { name: "OnOffPlugInUnit" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
 
     const rebuilt = rebuildCachedMatterAccessory({ cached, command, deviceTypeFor, matter });
 
@@ -412,7 +416,7 @@ describe("Matter cache rebuilding", () => {
 
     for(const context of entries) {
 
-      const cached = { UUID: "whatever", context, deviceType: { name: "OnOffOutlet" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
+      const cached = { UUID: "whatever", context, deviceType: { name: "OnOffPlugInUnit" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
 
       assert.equal(rebuildCachedMatterAccessory({ cached, command, deviceTypeFor, matter }), null,
         "a context of " + JSON.stringify(context) + " cannot address a zone, so it is declined");
@@ -425,7 +429,7 @@ describe("Matter cache rebuilding", () => {
     const commands: RecordedCommand[] = [];
 
     const cached = { UUID: matterZoneUuid(matter, SERIAL, 101), context: { controllerId: 7167, relayId: 101, serialNumber: SERIAL },
-      deviceType: { name: "OnOffOutlet" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
+      deviceType: { name: "OnOffPlugInUnit" }, displayName: "Front Lawn" } as unknown as MatterAccessory;
 
     const record: HydrawiseMatterCommand = async (context, action, duration) => void commands.push({ action, duration, relayId: context.relayId });
     const rebuilt = rebuildCachedMatterAccessory({ cached, command: record, deviceTypeFor, matter });

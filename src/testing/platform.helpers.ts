@@ -581,7 +581,11 @@ export function makeTestApi(): TestApiResult {
    */
   const matter = {
 
-    deviceTypes: { OnOffOutlet: { name: "OnOffOutlet" }, WaterValve: { name: "WaterValve" } },
+    /* The device-type names are matter.js's own, which are NOT the keys Homebridge selects them by - the plug-in-unit type is keyed "OnOffOutlet" and names
+     * itself "OnOffPlugInUnit". The cache rebuild compares names on both sides, so the double has to reproduce that mismatch or a key-versus-name confusion
+     * would pass every test here and only surface on a user's SECOND restart, as a silently empty Matter bridge.
+     */
+    deviceTypes: { OnOffOutlet: { name: "OnOffPlugInUnit" }, WaterValve: { name: "WaterValve" } },
     registerPlatformAccessories: async (_plugin: string, _platform: string, accessories: MatterAccessory[]): Promise<void> => {
 
       matterRegistered.push(...accessories);

@@ -43,7 +43,7 @@ function cachedZone(options: { controllerId?: number; deviceType?: string; relay
 
   return { UUID: zoneUuid(options.relayId, serialNumber),
     context: { controllerId: options.controllerId ?? syntheticController.controller_id, relayId: options.relayId, serialNumber },
-    deviceType: { name: options.deviceType ?? "OnOffOutlet" }, displayName: "Zone " + options.relayId.toString() } as unknown as MatterAccessory;
+    deviceType: { name: options.deviceType ?? "OnOffPlugInUnit" }, displayName: "Zone " + options.relayId.toString() } as unknown as MatterAccessory;
 }
 
 describe("HydrawisePlatform Matter capability gate", () => {
@@ -160,7 +160,7 @@ describe("HydrawisePlatform Matter cold boot", () => {
      * declined one's absence meaningful rather than a rebuild that simply never happened.
      */
     const { emit, matterRegistered, updated } = buildPlatform({ matter: true,
-      matterCached: [ cachedZone({ deviceType: "WaterValve", relayId: 700001 }), cachedZone({ deviceType: "OnOffOutlet", relayId: 700002 }) ],
+      matterCached: [ cachedZone({ deviceType: "WaterValve", relayId: 700001 }), cachedZone({ deviceType: "OnOffPlugInUnit", relayId: 700002 }) ],
       options: MATTER_ON });
 
     t.after(() => emit(SHUTDOWN));

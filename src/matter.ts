@@ -183,9 +183,20 @@ export function rebuildCachedMatterAccessory(options: { cached: MatterAccessory;
 
   const deviceType = deviceTypeFor(context.serialNumber);
 
-  // The cached device type is read as the plain string JSON preserved it as, never as a live device type - the object it came back on has no prototype and none
-  // of the behavior the name implies. It is evidence about what shape the endpoint was last registered in, and that is all it is used for.
-  if((cached.deviceType as { name?: string } | undefined)?.name !== deviceType) {
+  /* Whether the cache holds the same device type the options now ask for.
+   *
+   * The comparison is between two MATTER.JS NAMES, never between a name and the key we select the type by. Those are not the same string: Homebridge publishes
+   * the plug-in-unit type under the key "OnOffOutlet", while matter.js names it "OnOffPlugInUnit", and it is the matter.js name that JSON preserves on disk.
+   * Comparing the cached name against our key would therefore reject every outlet endpoint on the second boot - silently, since declining is a legitimate
+   * outcome - and that is exactly the cold-boot registration this whole path exists to perform. Asking the live type for its own name keeps the two sides
+   * speaking one vocabulary whatever matter.js chooses to call anything.
+   *
+   * The cached side is read as the plain string JSON preserved it as, never as a live device type: the object it came back on has no prototype and none of the
+   * behavior the name implies. It is evidence about what shape the endpoint was last registered in, and that is all it is used for.
+   */
+  const cachedTypeName = (cached.deviceType as { name?: string } | undefined)?.name;
+
+  if(cachedTypeName !== (matter.deviceTypes[deviceType] as unknown as { name: string }).name) {
 
     return null;
   }
