@@ -46,7 +46,10 @@
     "irrigation controller",
     "irrigation system",
     "lawn",
+    "matter",
     "sprinkler",
+    "supports-hap",
+    "supports-matter",
     "water"
   ],
   "devDependencies": {

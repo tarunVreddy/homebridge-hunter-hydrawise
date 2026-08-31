@@ -23,8 +23,10 @@ import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "../controller.ts";
+import type { HydrawiseMatterZone } from "../matter.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
+import type { MatterAccessory } from "homebridge";
 import { capturingLog } from "../testing.helpers.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { syntheticController } from "../api.fixtures.ts";
@@ -242,11 +244,23 @@ export interface TestPlatform {
   hasV2Client: boolean;
   log: HomebridgePluginLogging;
   mqtt: Nullable<TestMqttClient>;
+
+  // The Matter transport's publish surface, typed by indexed access against the real method so a signature drift is a compile error here rather than a controller
+  // test silently exercising a shape production no longer speaks.
+  publishMatter: HydrawisePlatform["publishMatter"];
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
   setZoneSuspension: HydrawisePlatform["setZoneSuspension"];
   signal: AbortSignal;
   timers: TimerRegistry;
+}
+
+// One recorded Matter publish the controller made: the controller it named and the zone projection it handed over. A controller test asserts on these to pin what
+// the projection says without any Matter machinery being involved - which is the point of the controller handing over a flat shape in the first place.
+export interface RecordedMatterPublish {
+
+  controllerId: number;
+  zones: HydrawiseMatterZone[];
 }
 
 // One recorded per-zone suspension command the controller issued: the whole argument object it passed. Typed by indexed access against the real method, so a
@@ -284,6 +298,9 @@ export interface MakeTestPlatformResult {
   abort: (reason?: string) => void;
   flushes: TestAccessory[][];
   lines: () => CapturedLogLine[];
+
+  // Every Matter publish the controller made, in order.
+  matterPublishes: RecordedMatterPublish[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
 
@@ -328,6 +345,11 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const zoneAccessories = new Map<number, TestAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
   const suspensions: RecordedSuspensionCall[] = [];
+  const matterPublishes: RecordedMatterPublish[] = [];
+
+  // A pure recorder rather than a double of anything: production's publishMatter forwards to a transport that may not exist, so the honest stand-in records the
+  // projection and does nothing else. What a controller test cares about is what the controller SAID, not what a Matter server did with it.
+  const publishMatter: HydrawisePlatform["publishMatter"] = async (controllerId, zones) => void matterPublishes.push({ controllerId, zones });
 
   /* A recording stand-in for the platform's per-zone suspension surface. It is a DOUBLE rather than a thin executor because what it stands in for is the network:
    * the real method reaches the account-credentialed client, which no controller test may ever touch. The programmed answer is what drives the controller's own
@@ -408,6 +430,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     hasV2Client: options.hasV2Client ?? false,
     log: logger,
     mqtt,
+    publishMatter,
     reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
     setZoneSuspension,
@@ -415,8 +438,8 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     timers
   };
 
-  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, reconciles, retrieve,
-    signalController, suspensions, zoneAccessories };
+  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, matterPublishes, mqtt, platform, reconciles,
+    retrieve, signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -498,6 +521,17 @@ export interface TestApiResult {
   // production's promotion undo. Empty by default, which leaves every flush recording exactly as before.
   failUpdateUuids: Set<string>;
   makeAccessory: (displayName: string, uuid: string, category?: number) => TestAccessory;
+
+  /* The Matter half of the double, mirroring the HAP buffers above. `matterEnabled` is the lever a test throws to make the bridge answer that Matter is
+   * configured - it is false by default, so every existing platform test constructs a Matter-less bridge and exercises the degrade path exactly as it always
+   * did. `matterCached` is the seeding hook: entries placed here before DID_FINISH_LAUNCHING are what Homebridge hands back through configureMatterAccessory,
+   * which is how a test drives the cold-boot rebuild without a Matter server anywhere in the process.
+   */
+  matterCached: MatterAccessory[];
+  matterEnabled: { value: boolean };
+  matterRegistered: MatterAccessory[];
+  matterUnregistered: MatterAccessory[];
+  matterUpdates: { attributes: Record<string, unknown>; cluster: string; uuid: string }[];
   registered: TestAccessory[];
   unregistered: TestAccessory[];
   updated: TestAccessory[][];
@@ -506,6 +540,10 @@ export interface TestApiResult {
 /* Build the API double for real-platform construction. hap carries the double namespaces and the deterministic uuid generator; platformAccessory is the
  * constructable accessory double; register / update / unregister record their accessories; on captures each handler by event name so a test fires
  * DID_FINISH_LAUNCHING (to run the private configureHydrawise) and SHUTDOWN (to drive teardown) explicitly. emit invokes every handler registered for an event.
+ *
+ * The Matter surface is built alongside, and the isMatter probes answer from a mutable lever so a test can decide before construction whether this bridge has
+ * Matter at all. Both probes are present unconditionally, which is the realistic shape for the Homebridge releases this plugin targets; production's own
+ * typeof guards against their absence are exercised by their absence from the CONTROLLER double instead.
  */
 export function makeTestApi(): TestApiResult {
 
@@ -531,9 +569,40 @@ export function makeTestApi(): TestApiResult {
     }
   };
 
+  const matterCached: MatterAccessory[] = [];
+  const matterEnabled = { value: false };
+  const matterRegistered: MatterAccessory[] = [];
+  const matterUnregistered: MatterAccessory[] = [];
+  const matterUpdates: { attributes: Record<string, unknown>; cluster: string; uuid: string }[] = [];
+
+  /* The Matter API double, on the same terms as the HAP recorders beside it: it mirrors only the surface the platform touches and records what it was handed.
+   * The UUID generator is testHap's, which is what production shares too - api.matter.uuid is declared as HAP's own generator - so a UUID derived through either
+   * transport in a test agrees with the other exactly as it does in production.
+   */
+  const matter = {
+
+    deviceTypes: { OnOffOutlet: { name: "OnOffOutlet" }, WaterValve: { name: "WaterValve" } },
+    registerPlatformAccessories: async (_plugin: string, _platform: string, accessories: MatterAccessory[]): Promise<void> => {
+
+      matterRegistered.push(...accessories);
+    },
+    unregisterPlatformAccessories: async (_plugin: string, _platform: string, accessories: MatterAccessory[]): Promise<void> => {
+
+      matterUnregistered.push(...accessories);
+    },
+    updateAccessoryState: async (uuid: string, cluster: string, attributes: Record<string, unknown>): Promise<void> => {
+
+      matterUpdates.push({ attributes, cluster, uuid });
+    },
+    uuid: testHap.uuid
+  };
+
   const api = {
 
     hap: testHap,
+    isMatterAvailable: (): boolean => true,
+    isMatterEnabled: (): boolean => matterEnabled.value,
+    matter,
     on: (event: string, handler: ApiEventHandler): unknown => {
 
       const list = handlers.get(event) ?? [];
@@ -568,8 +637,8 @@ export function makeTestApi(): TestApiResult {
   };
 
   return { api, emit, failRegistrationUuids, failUpdateUuids,
-    makeAccessory: (displayName: string, uuid: string, category?: number): TestAccessory => new TestPlatformAccessory(displayName, uuid, category), registered,
-    unregistered, updated };
+    makeAccessory: (displayName: string, uuid: string, category?: number): TestAccessory => new TestPlatformAccessory(displayName, uuid, category), matterCached,
+    matterEnabled, matterRegistered, matterUnregistered, matterUpdates, registered, unregistered, updated };
 }
 
 /**
@@ -778,6 +847,12 @@ export interface BuildPlatformOptions {
 
   apiKey?: string;
   debug?: boolean;
+
+  // Whether this bridge has Matter enabled. Defaults to false, which is what every test that predates Matter constructs and what the plugin degrades to.
+  matter?: boolean;
+
+  // The Matter accessories Homebridge restores from its own cache, handed to the platform after construction exactly as Homebridge hands them over.
+  matterCached?: MatterAccessory[];
   mqttTopic?: string;
   mqttUrl?: string;
   options?: string[];
@@ -812,9 +887,21 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
     options: options.options ?? []
   };
 
+  // Decide whether this bridge has Matter BEFORE construction, because the platform reads the probes from the moment discovery runs.
+  apiResult.matterEnabled.value = options.matter ?? false;
+
   // The construction-boundary casts (log, api) bridge the doubles to the production constructor's parameter types.
   const platform = new HydrawisePlatform(logger as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
     config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], apiResult.api as ConstructorParameters<typeof HydrawisePlatform>[2]);
+
+  /* Hand back the cached Matter accessories exactly where Homebridge does: after construction and before DID_FINISH_LAUNCHING. That ordering is the whole
+   * subject of the cold-boot rebuild, so a harness that seeded them anywhere else would test a sequence production never sees.
+   */
+  for(const cached of options.matterCached ?? []) {
+
+    apiResult.matterCached.push(cached);
+    platform.configureMatterAccessory(cached);
+  }
 
   return { lines, platform, ...apiResult };
 }

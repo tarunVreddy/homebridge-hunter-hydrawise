@@ -46,8 +46,8 @@ describe("hydrawise feature options", () => {
 
   test("declares the expected categories", () => {
 
-    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Account", "Device", "Log", "Mqtt" ],
-      "the catalog should declare the account, device, logging, and MQTT categories");
+    assert.deepEqual(featureOptionCategories.map(category => category.name).toSorted(), [ "Account", "Device", "Log", "Matter", "Mqtt" ],
+      "the catalog should declare the account, device, logging, Matter, and MQTT categories");
   });
 
   test("carries the catalog defaults for each option", () => {
@@ -81,14 +81,14 @@ describe("hydrawise feature options", () => {
      * not mirrored in either surfaces here.
      */
     assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName",
-      "Log.Zone" ], "every controller-scoped option should be named in one of the controller unions");
+      "Log.Zone", "Matter", "Matter.Valve" ], "every controller-scoped option should be named in one of the controller unions");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
 
     // The framework's "device" level is the zone level in this plugin's projection, so this set is the mirror of HydrawiseZoneOption plus the value-centric
     // HydrawiseZoneValueOption. The account-wide suspend option is controller-only and stays out of it; its per-zone sibling is exactly the opposite case.
-    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.Zone", "Device.SyncName", "Log.Zone" ],
+    assert.deepEqual(scopedOptions("device"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.Zone", "Device.SyncName", "Log.Zone", "Matter" ],
       "every zone-scoped option should be named in one of the zone unions");
   });
 
@@ -110,7 +110,7 @@ describe("hydrawise feature options", () => {
     // A globally-scoped option applies across every controller on the account. The name override is deliberately absent: one name cannot be right for every
     // controller and zone at once, so it resolves at those grains alone.
     assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
-      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
+      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Matter", "Matter.Valve", "Mqtt.Topic", "Mqtt.Url" ],
     "the name override is the only option that does not resolve globally");
   });
 

@@ -43,13 +43,14 @@ export interface HydrawiseFeatureOption extends Omit<FeatureOptionEntry, "scopes
 // type covers only the boolean half of the controller-scoped catalog. This is the runtime's narrowed lookup key: a call to hasFeature must name one of
 // these, so passing a zone-only option to the controller-level lookup is a type error. A catalog this small makes a derived mapping overkill, so we keep
 // this compile-time mirror explicit and bind it by convention to the entries' scopes declarations below.
-export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone";
+export type HydrawiseControllerOption = "Device" | "Device.Standalone" | "Device.Suspend.All" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone" | "Matter" |
+  "Matter.Valve";
 
 // The zone-scopable boolean option names, mirroring at compile time the boolean-tested entries whose scopes declaration includes "device" - the level this
 // plugin projects as a zone. The value-centric Name entry carries "device" too, but it resolves instead through the value-centric HydrawiseZoneValueOption
 // union below, so this type covers only the boolean half of the zone-scoped catalog. A call to hasZoneFeature must name one of these, so passing
 // Device.Suspend.All (controller-only) with a zone id is a type error rather than a latent scope violation.
-export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone";
+export type HydrawiseZoneOption = "Device" | "Device.Standalone" | "Device.Suspend.Zone" | "Device.SyncName" | "Log.Zone" | "Matter";
 
 // The zone-scopable value-centric option names, mirroring at compile time the value-bearing entries the zone level admits. The value accessor narrows against this,
 // so asking for a boolean option's value, or for a value option the zone level does not admit, is a type error.
@@ -83,6 +84,7 @@ export const featureOptionCategories = [
   { description: "Account feature options.", name: "Account" },
   { description: "Device feature options.", name: "Device" },
   { description: "Logging feature options.", name: "Log" },
+  { description: "Matter feature options.", name: "Matter" },
   mqtt.category
 ];
 
@@ -127,6 +129,23 @@ const logOptions: HydrawiseFeatureOption[] = [
   { default: true, description: "Log zone start and stop events in Homebridge.", name: "Zone", scopes: [ "controller", "device", "global" ] }
 ];
 
+/* Matter options. This group is the plugin's SECOND transport rather than an alternative to the first: HomeKit continues to be served over HAP exactly as it
+ * always has, and everything here is additive on top of it. It is off by default for that reason - an install that never opens this group behaves identically to
+ * one built before Matter existed - and it does nothing at all unless Matter is also enabled on the bridge or child bridge this plugin runs in, which is
+ * Homebridge's setting to own, not ours.
+ *
+ * The device-type choice needs explaining rather than just offering. Matter's own irrigation device type is WaterValve, which is the semantically correct model
+ * and the one this plugin would use if the ecosystems supported it - but as of this writing Alexa, Google Home, and Apple Home all decline it, which leaves a
+ * correctly-modeled zone invisible in every ecosystem a user is likely to be commissioning into. So the default is an on/off outlet, which every ecosystem
+ * handles, and the correct model is the opt-in. That is the reverse of how these two would be ranked on the merits, and the option exists so the ranking can be
+ * flipped back the day the ecosystems catch up without anyone having to reinstall anything.
+ */
+const matterOptions: HydrawiseFeatureOption[] = [
+
+  { default: false, description: "Expose this controller's zones over Matter, in addition to HomeKit. Requires Matter to be enabled on the bridge or child bridge this plugin runs in.", name: "", scopes: [ "controller", "device", "global" ] },
+  { default: false, description: "Expose zones using Matter's WaterValve device type rather than an on/off outlet. Alexa, Google Home, and Apple Home do not currently support WaterValve, so zones will likely not appear at all - enable this only for an ecosystem you have confirmed supports it. Changing this rebuilds each zone's Matter endpoint, so it must be re-commissioned.", name: "Valve", scopes: [ "controller", "global" ] }
+];
+
 /* eslint-enable @stylistic/max-len */
 
 /* The full option catalog, assembled from the categories this plugin authors and the group the library contributes. Each authored entry declares the scope
@@ -142,6 +161,7 @@ export const featureOptions: Record<string, FeatureOptionEntry[]> = {
   "Account": accountOptions,
   "Device": deviceOptions,
   "Log": logOptions,
+  "Matter": matterOptions,
   [mqtt.category.name]: mqtt.options
 };
 

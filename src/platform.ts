@@ -2,7 +2,7 @@
  *
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, MatterAPI, MatterAccessory, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName,
   superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
@@ -12,12 +12,15 @@ import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_
   HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
   PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
+import { HydrawiseMatterController, rebuildCachedMatterAccessory } from "./matter.ts";
+import type { HydrawiseMatterDeviceType, HydrawiseMatterZone } from "./matter.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
+import type { HydrawiseMatterAccessoryContext } from "./types.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
@@ -36,6 +39,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly configuredDevices: Record<string, HydrawiseController | undefined>;
   public readonly hap: HAP;
   public readonly log: Logging;
+
+  /* Every Matter accessory Homebridge restored from its own cache at startup, keyed by UUID, as it was found on disk. It is populated by configureMatterAccessory
+   * below and consumed exactly once, by the boot-time rebuild, which is why entries are removed as they are claimed: what remains after discovery has run is by
+   * definition an endpoint no live zone stands behind, and the orphan sweep retires it.
+   */
+  private readonly matterAccessories = new Map<string, MatterAccessory>();
+
+  // The Matter transport built for each controller that has one, keyed by controller id. Controllers without the Matter option, and every controller when Matter
+  // is not enabled on this bridge at all, are simply absent - there is no disabled state to check for, only a lookup that finds nothing.
+  private readonly matterDevices = new Map<number, HydrawiseMatterController>();
+
   public readonly mqtt: Nullable<MqttClient>;
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
@@ -161,10 +175,20 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     this.log.debug("Debug logging on. Expect a lot of data.");
 
-    // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each. We supervise the
-    // discovery loop so a genuine configuration fault surfaces once through the reporter, while a shutdown abort unwinds it silently.
-    api.on(APIEvent.DID_FINISH_LAUNCHING, () => void superviseLoop({ loop: () => this.configureHydrawise(), onError: loopFaultReporter(this.log, "controller discovery"),
-      signal: this.signal }));
+    /* Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each. We supervise the
+     * discovery loop so a genuine configuration fault surfaces once through the reporter, while a shutdown abort unwinds it silently.
+     *
+     * The Matter rebuild runs FIRST, ahead of every network call discovery makes, and that ordering is load-bearing rather than incidental. A Matter bridge
+     * advertises the endpoints it holds at the moment it comes up; if this waited for Hydrawise to answer, the bridge would come up empty and each zone would
+     * arrive afterwards as an addition, which a commissioned ecosystem reads as a device appearing for the first time - so every restart would announce two
+     * dozen new devices and, in some ecosystems, leave the old ones behind as duplicates. Rebuilding from cache costs no network at all, so there is nothing to
+     * trade away by doing it before anything else.
+     */
+    api.on(APIEvent.DID_FINISH_LAUNCHING, () => void superviseLoop({ loop: async (): Promise<void> => {
+
+      await this.restoreMatterAccessories();
+      await this.configureHydrawise();
+    }, onError: loopFaultReporter(this.log, "controller discovery"), signal: this.signal }));
 
     // Tear ourselves down cleanly when Homebridge shuts down. This is the single owner of platform shutdown, and it is one call: disposing the stack runs every
     // registered teardown, synchronously, inside this frame.
@@ -189,6 +213,123 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public configureAccessory(accessory: HydrawiseAccessory): void {
 
     this.accessories.push(accessory);
+  }
+
+  // The Matter twin of configureAccessory above, called by Homebridge for each Matter accessory it restores from its own separate cache. It does as little as its
+  // HAP counterpart: hold the entry until the rebuild below can claim it.
+  public configureMatterAccessory(accessory: MatterAccessory): void {
+
+    this.matterAccessories.set(accessory.UUID, accessory);
+  }
+
+  /* The Matter API, when this bridge has one, and null otherwise - the single gate every Matter cadence in this plugin passes through.
+   *
+   * Matter is a property of the BRIDGE, not of the plugin: a user enables it on the bridge or child bridge this platform runs in, and Homebridge answers here.
+   * So this is not a capability we can assume from a Homebridge version, and everything downstream degrades to doing nothing rather than to failing - a plugin
+   * running on a bridge without Matter behaves exactly as it did before any of this existed.
+   */
+  private get matter(): Nullable<MatterAPI> {
+
+    /* Both probes are called through a typeof guard rather than directly. Our declared engines floor admits Homebridge releases predating the Matter API, and a
+     * plugin that hard-crashes on a method a host has not got is worse in every way than one that reads the absence as "no Matter here" - which is exactly what
+     * it means. The api.matter check closes the same question from the other side, since the API declares it optional.
+     */
+    const isAvailable = (typeof this.api.isMatterAvailable === "function") && this.api.isMatterAvailable();
+    const isEnabled = (typeof this.api.isMatterEnabled === "function") && this.api.isMatterEnabled();
+
+    return (isAvailable && isEnabled && this.api.matter) ? this.api.matter : null;
+  }
+
+  // The Matter device type a controller's zones are currently configured to be exposed as. It is resolved from the serial alone so the boot-time rebuild, which
+  // has a cached context and no controller object, can ask the same question the poll-time registration asks.
+  private matterDeviceType(serialNumber: string): HydrawiseMatterDeviceType {
+
+    return this.featureOptions.test("Matter.Valve", undefined, serialNumber) ? "WaterValve" : "OnOffOutlet";
+  }
+
+  /* Rebuild and register every cached Matter endpoint, before discovery makes its first call. See the ordering note at the DID_FINISH_LAUNCHING registration for
+   * why this runs first.
+   *
+   * An entry the rebuild declines is left in the map rather than registered, which is exactly what the orphan sweep at the end of discovery then retires. That is
+   * the self-healing direction: a zone whose cached endpoint we could not honor is registered fresh moments later by its controller's first poll, and the entry
+   * that could not be honored goes away.
+   */
+  private async restoreMatterAccessories(): Promise<void> {
+
+    const matter = this.matter;
+
+    if(!matter || !this.matterAccessories.size) {
+
+      return;
+    }
+
+    const rebuilt: MatterAccessory<HydrawiseMatterAccessoryContext>[] = [];
+
+    for(const cached of this.matterAccessories.values()) {
+
+      const accessory = rebuildCachedMatterAccessory({ cached, command: this.matterCommand.bind(this),
+        deviceTypeFor: (serialNumber: string): HydrawiseMatterDeviceType => this.matterDeviceType(serialNumber), matter });
+
+      if(accessory) {
+
+        rebuilt.push(accessory);
+      }
+    }
+
+    if(!rebuilt.length) {
+
+      return;
+    }
+
+    try {
+
+      await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, rebuilt);
+
+      // Replace each cached entry with the live object we just registered, so the controller that claims it below adopts something whole rather than the
+      // prototype-less shell Homebridge handed us.
+      for(const accessory of rebuilt) {
+
+        this.matterAccessories.set(accessory.UUID, accessory);
+      }
+
+      this.log.info("Restored %s Matter accessor%s from cache.", rebuilt.length.toString(), (rebuilt.length === 1) ? "y" : "ies");
+    } catch(error) {
+
+      this.log.error("Unable to restore Matter accessories from cache: %s", error);
+    }
+  }
+
+  /* The one path from a Matter endpoint back to the Hydrawise API, resolved when a command fires rather than when its endpoint was built.
+   *
+   * The window this covers is real and short: endpoints are live from the moment the bridge comes up, while the controller that can act on them exists only once
+   * discovery has answered. A command in that window is refused with a reason rather than silently dropped, because a user pressing a button and seeing nothing
+   * happen deserves a line in the log saying why.
+   */
+  private async matterCommand(context: HydrawiseMatterAccessoryContext, action: "run" | "stop", duration?: number): Promise<void> {
+
+    const controller = this.configuredDevices[this.hap.uuid.generate(context.controllerId.toString())];
+
+    if(!controller) {
+
+      this.log.warn("Matter command for zone %s arrived before its controller was ready. Please try again in a moment.", context.relayId);
+
+      throw new Error("The Hydrawise controller is not ready yet.");
+    }
+
+    await controller.commandZone(context.relayId, action, duration);
+  }
+
+  /** Publish one poll's settled reading of a controller's zones to Matter, or do nothing where that controller has no Matter transport.
+   *
+   * The controller calls this rather than holding a transport of its own, which is what keeps controller.ts free of any Matter type beyond the shape of the
+   * projection it hands over - the lookup, the enablement, and the lifetime all stay here with the other registration concerns.
+   *
+   * @param controllerId - The controller whose zones these are.
+   * @param zones        - Every enabled zone, as that controller's reading of this poll projects it.
+   */
+  public async publishMatter(controllerId: number, zones: HydrawiseMatterZone[]): Promise<void> {
+
+    await this.matterDevices.get(controllerId)?.publish(zones);
   }
 
   // Configure and connect to the Hydrawise API.
@@ -254,6 +395,42 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.zoneAccessoryGrace.delete(accessory.UUID);
       this.removeAccessory(accessory);
     }
+
+    await this.removeOrphanedMatterAccessories();
+  }
+
+  /* Retire every cached Matter endpoint no controller claimed, once discovery has configured them all.
+   *
+   * By this point the cache map holds only what is genuinely orphaned: a controller that left the account, one whose Matter option was turned off, and any entry
+   * the boot rebuild declined. Each of those is an endpoint an ecosystem is still showing and nothing will ever update again, so unregistering is the honest
+   * outcome - leaving it would strand a dead device in the user's home, and leaving it in the cache would resurrect it on the next boot.
+   *
+   * A zone that merely went missing from a poll is NOT swept here, and cannot be: this cadence sees controllers only, and zone-level absence is the poll's
+   * question to answer.
+   */
+  private async removeOrphanedMatterAccessories(): Promise<void> {
+
+    const matter = this.matter;
+
+    if(!matter || !this.matterAccessories.size) {
+
+      return;
+    }
+
+    const orphans = [...this.matterAccessories.values()];
+
+    try {
+
+      await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, orphans);
+
+      this.log.info("Removed %s Matter accessor%s that no longer correspond%s to an enabled controller.", orphans.length.toString(),
+        (orphans.length === 1) ? "y" : "ies", (orphans.length === 1) ? "s" : "");
+    } catch(error) {
+
+      this.log.error("Unable to remove orphaned Matter accessories: %s", error);
+    }
+
+    this.matterAccessories.clear();
   }
 
   /* Start the endless loop that refreshes every controller's account-credentialed facts, once, and only for an install that configured the credentials making it
@@ -497,7 +674,47 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     this.api.updatePlatformAccessories([accessory]);
 
+    this.configureMatter(controller);
+
     return this.configuredDevices[uuid];
+  }
+
+  /* Stand up this controller's Matter transport, where the bridge offers Matter and the user has asked for it.
+   *
+   * Zones are deliberately not enumerated here. Discovery reports controllers and nothing beneath them - customerdetails.php carries no relays at all - so the
+   * zone roster does not exist until the first poll returns it, and the transport registers each endpoint on the poll that first names its zone. What this does
+   * is hand the transport the endpoints the boot rebuild already registered, so it updates them rather than registering them a second time.
+   */
+  private configureMatter(controller: HydrawiseControllerConfig): void {
+
+    const matter = this.matter;
+
+    // The controller-wide gate is read on the same terms as the Device gate above: the serial in the controller position, the device slot empty. A zone may still
+    // opt out individually, which the controller resolves per zone as it projects each poll.
+    if(!matter || !this.featureOptions.test("Matter", undefined, controller.serial_number)) {
+
+      return;
+    }
+
+    const transport = new HydrawiseMatterController({ command: this.matterCommand.bind(this), controllerId: controller.controller_id,
+      deviceType: this.matterDeviceType(controller.serial_number), log: this.log, matter, serialNumber: controller.serial_number });
+
+    this.matterDevices.set(controller.controller_id, transport);
+
+    // Claim every cached endpoint that belongs to this controller. A claimed entry leaves the cache map, so what remains there once every controller has been
+    // configured is precisely the set the orphan sweep should retire.
+    for(const [ uuid, accessory ] of this.matterAccessories) {
+
+      const context = accessory.context as Partial<HydrawiseMatterAccessoryContext>;
+
+      if(context.controllerId !== controller.controller_id) {
+
+        continue;
+      }
+
+      transport.adopt(accessory as MatterAccessory<HydrawiseMatterAccessoryContext>);
+      this.matterAccessories.delete(uuid);
+    }
   }
 
   /* The one creation path for every accessory this platform registers: construct it, register it with Homebridge, and track it. Every creation cadence -

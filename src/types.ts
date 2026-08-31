@@ -909,3 +909,34 @@ export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;
 // A controller accessory specifically: the same PlatformAccessory over the controller arm alone. The controller's own accessory takes this alias because that is
 // where the field writes live - seeding one roster field at a time is legal on the arm's mutable interface and nowhere else.
 export type HydrawiseControllerAccessory = PlatformAccessory<HydrawiseControllerAccessoryContext>;
+
+/* The persisted context of one Matter zone accessory. It is deliberately separate from the HAP context union above and carries IDENTITY ALONE - the owning
+ * controller, the zone's relay, and the serial the two were derived from - because it answers exactly one question: which zone does this cached endpoint stand
+ * for. That is what a cold boot needs in order to rebuild an accessory from cache before any Hydrawise call has been made.
+ *
+ * Nothing projected is stored here. Matter cluster state is Homebridge's to persist and ours to republish from the next poll, so keeping state out of this shape
+ * is what makes a cache entry safe to rebuild from unconditionally rather than something a reader has to judge the freshness of.
+ */
+export interface HydrawiseMatterAccessoryContext {
+
+  controllerId: number;
+  relayId: number;
+  serialNumber: string;
+}
+
+/* Whether a cached Matter accessory's context is one this plugin wrote and can still read. Homebridge round-trips the context through JSON on disk, so a
+ * hand-edited, truncated, or version-skewed entry can carry any shape at all; a cache entry that fails this is dropped rather than rebuilt, and the zone it stood
+ * for is registered fresh from discovery instead. Every field is checked, because a half-formed identity is not a weaker identity - it is the wrong endpoint.
+ */
+export function isMatterAccessoryContext(context: unknown): context is HydrawiseMatterAccessoryContext {
+
+  if((typeof context !== "object") || (context === null)) {
+
+    return false;
+  }
+
+  const candidate = context as Partial<HydrawiseMatterAccessoryContext>;
+
+  return Number.isInteger(candidate.controllerId) && Number.isInteger(candidate.relayId) && (typeof candidate.serialNumber === "string") &&
+    (candidate.serialNumber.length > 0);
+}

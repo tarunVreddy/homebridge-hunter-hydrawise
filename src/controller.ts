@@ -16,6 +16,7 @@ import type { HydrawiseControllerOption, HydrawiseControllerValueOption, Hydrawi
 import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setAccessoryName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
+import type { HydrawiseMatterZone } from "./matter.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
@@ -1490,6 +1491,46 @@ export class HydrawiseController {
     // lands in the log instead of floating as an unhandled rejection.
     guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
       label: "MQTT publish (controller)", log: this.log });
+
+    // Publish the same settled reading to Matter, on identical terms to MQTT above: a second transport fed from the projection this walk has just finished, at the
+    // one point in the poll where every zone's state is known and nothing further will change it.
+    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.publishMatter(this.controller.controller_id, this.matterZones(effectiveNames)); },
+      label: "Matter publish (controller)", log: this.log });
+  }
+
+  /* Project this poll's enabled zones into the flat shape the Matter transport consumes.
+   *
+   * The projection lives here, in the controller, rather than in the transport, because everything it needs to be right is here: the hint ledger's settled view
+   * of what is running - which is a better witness than the wire alone, since it has already reconciled a manual start against the report that had not yet caught
+   * up with it - the effective name a zone is displayed under, and the schedule classifier's reading of when a run ends. A transport that re-derived any of that
+   * would be a second opinion about a question this class has already answered, and the two would drift.
+   *
+   * Zones opted out of Matter individually are filtered here, which is what makes the option a real per-zone gate rather than a controller-wide one: an endpoint
+   * for an excluded zone is never registered, and one that already exists stops being updated and is left to the sweep.
+   *
+   * @param effectiveNames - The display names this walk already resolved, so a zone reads the same in the Home app and in every Matter ecosystem.
+   */
+  private matterZones(effectiveNames: Map<number, string>): HydrawiseMatterZone[] {
+
+    return this.enabledZones.filter(zone => this.hasZoneFeature("Matter", zone.relay_id.toString())).map(zone => {
+
+      const state = zoneScheduleStatus(zone, this.status);
+
+      /* Whether the zone is open, asked of the ledger first and the classifier second.
+       *
+       * The ledger is the better witness where it has an opinion, because it has already reconciled a manual start against a report that had not yet caught up
+       * with it - the poll immediately after a user starts a zone can still describe it as idle, and the ledger knows better. The classifier answers for a zone
+       * the ledger has not yet seen, which is every zone on the first poll after startup.
+       */
+      const isOpen = this.zoneHints.get(zone.relay_id)?.isOn ?? (state.state === "running");
+
+      // Remaining time is only ever claimed from the classifier's own running arm, which carries the instant the run ends against the WIRE's clock - the same
+      // clock the poll that produced it was stamped with. Subtracting one from the other keeps the answer free of any local clock read, and the floor at zero
+      // covers the poll that arrives a moment after a run was due to finish.
+      const remainingSeconds = (state.state === "running") ? Math.max(0, state.endsAt - this.status.time) : 0;
+
+      return { isOpen, name: effectiveNames.get(zone.relay_id) ?? zone.name, relayId: zone.relay_id, remainingSeconds, runSeconds: Math.max(0, zone.run) };
+    });
   }
 
   /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.
@@ -1637,6 +1678,54 @@ export class HydrawiseController {
 
         return "Enhanced features are not configured.";
     }
+  }
+
+  /** Run or stop one zone on behalf of a transport that is not HomeKit - the narrow command surface Matter reaches this controller through.
+   *
+   * It exists rather than the Matter transport calling sendCommand directly because sending the request is only half of what commanding a zone means here. The
+   * other half is the hint ledger: the ledger is what tells the next poll that this zone's state was changed by a person rather than by the schedule, and it is
+   * what keeps the irrigation system's program mode honest. A caller that sent the request and skipped the ledger would work, and would quietly report the wrong
+   * program mode until the following poll corrected it.
+   *
+   * HomeKit's own characteristics are deliberately NOT written here. A Matter-originated run reaches HomeKit on the next poll like any other change made outside
+   * the Home app - which is a beat later than a HomeKit-originated one, and the same beat an app-initiated or scheduled run already takes.
+   *
+   * @param relayId  - The zone to command.
+   * @param action   - Whether to run the zone or stop it.
+   * @param duration - How long to run for, in seconds. Defaults to the zone's own configured run time, which is what the zone would have run for on its own
+   *                   schedule and the only sensible answer for a transport whose vocabulary carries no duration at all.
+   *
+   * @throws When the zone is unknown to this controller, or the Hydrawise API refused the command.
+   */
+  public async commandZone(relayId: number, action: "run" | "stop", duration?: number): Promise<void> {
+
+    const zone = this.status.relays.find(x => x.relay_id === relayId);
+
+    if(!zone) {
+
+      throw new Error("Unknown zone: " + relayId.toString());
+    }
+
+    const runFor = duration ?? zone.run;
+    const response = (action === "run") ? await this.sendCommand(zone, "run", runFor) : await this.sendCommand(zone, "stop");
+
+    if(!response) {
+
+      throw new Error("The Hydrawise API refused the command.");
+    }
+
+    // The ledger is addressed by relay id at invocation time, exactly as the HomeKit set handler addresses it, so it always acts on the current entry and a zone
+    // with no entry is the no-op the ledger states.
+    if(action === "run") {
+
+      this.zoneHints.markManual(relayId);
+    } else {
+
+      this.zoneHints.clearManual(relayId);
+    }
+
+    this.log.info("%s: Manually %s%s.", this.zoneLabel(zone), (action === "run") ? "started" : "stopped",
+      (action === "run") ? " (duration: " + this.getMinutes(runFor) + ")" : "");
   }
 
   // Send a command to the Hydrawise API.
