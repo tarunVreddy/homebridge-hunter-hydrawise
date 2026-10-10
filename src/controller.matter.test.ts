@@ -83,31 +83,32 @@ describe("HydrawiseController Matter projection", () => {
     assert.equal(beta?.remainingSeconds, 0, "a zone that is not running has no remaining time to report");
   });
 
-  test("a zone the user excludes from Matter is not projected, while its siblings still are", async (t) => {
+  test("the projection carries every enabled zone whatever the Matter options say, because exposure is the transport's decision", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([ runningZone(), idleZone() ]),
-      kind: "response" }), signalAborted: false, userOptions: [ MATTER_ON, "Disable.Matter.700002" ] });
+      kind: "response" }), signalAborted: false, userOptions: ["Disable.Matter.700002"] });
 
     t.after(() => h.abort());
 
+    /* Matter is off for this controller and zone 700002 is excluded besides, and both zones are still projected. The transport has to decide exposure from the
+     * options alone at boot, before any controller exists, so it decides it on every poll too - one answer to one question, rather than a filter here that the
+     * boot path would have to repeat and could drift from.
+     */
     const publish = await lastPublish(h);
 
-    // The per-zone gate is a real exclusion rather than a display filter: an excluded zone never reaches the transport, so no endpoint is ever registered for it.
-    assert.deepEqual(publish.zones.map(zone => zone.relayId), [700001], "only the zone that is still opted in reaches the transport");
+    assert.deepEqual(publish.zones.map(zone => zone.relayId), [ 700001, 700002 ], "every enabled zone is projected");
   });
 
-  test("a controller with Matter off publishes an empty projection rather than nothing at all", async (t) => {
+  test("a zone hidden from HomeKit is not projected, since it is not one of the controller's enabled zones", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" }),
-      signalAborted: false });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([ runningZone(), idleZone() ]),
+      kind: "response" }), signalAborted: false, userOptions: [ MATTER_ON, "Disable.Device.700002" ] });
 
     t.after(() => h.abort());
 
-    // The publish is unconditional and the projection is empty, which keeps the decision about whether Matter is live in one place - the platform - rather than
-    // splitting it between the controller and the transport.
     const publish = await lastPublish(h);
 
-    assert.deepEqual(publish.zones, [], "no zone is opted in, so the projection carries none");
+    assert.deepEqual(publish.zones.map(zone => zone.relayId), [700001], "only the enabled zone is projected");
   });
 
   test("a zone that the schedule reports as unscheduled still projects, closed", async (t) => {

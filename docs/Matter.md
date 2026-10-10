@@ -97,7 +97,11 @@ Add it from your ecosystem's app the way you would add any Matter device. Treat 
 
   * **Matter must be enabled on the bridge.** With the feature option on but Matter not enabled in Homebridge, the plugin logs nothing and behaves exactly as it did before — this is a quiet no-op, not an error.
   * **Restarts are non-disruptive.** Zones are registered from the Matter cache at startup, before this plugin makes its first Hydrawise API call, so your ecosystem does not see them come and go across a restart. A zone's Matter identity is derived from its controller's serial number and its relay id and nothing else, so renaming a zone does not replace the device.
-  * **Turning the option off removes the devices.** Zones that are no longer exposed are unregistered rather than merely left un-updated, so they disappear from your ecosystem instead of lingering as unresponsive devices.
+  * **Renaming a zone does not rename its Matter device.** A zone's Matter name is set when it is first exposed. If you rename the zone in Hydrawise, rename it in your ecosystem's app as well.
+  * **Zones that are no longer exposed are removed.** They are unregistered rather than left un-updated, so they disappear from your ecosystem instead of lingering as unresponsive devices:
+    * Turning `Matter` off for a controller or a zone, hiding a zone, or changing `Matter.Valve` takes effect at startup, before this plugin makes its first Hydrawise API call.
+    * A controller that is no longer in your Hydrawise account is removed once the plugin has discovered your controllers.
+    * A zone deleted in Hydrawise is removed once it has been missing from three consecutive polls. A poll that reports no zones at all is ignored, so a bad response from Hydrawise never removes your devices.
   * **Homebridge owns the Matter runtime.** This plugin bundles no Matter library. The Matter server, its storage, port allocation, and commissioning are all Homebridge's, which means Matter behavior tracks your Homebridge version. Homebridge v2.0 or later is required.
 
 ---

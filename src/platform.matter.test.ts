@@ -1,7 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.matter.test.ts: The Matter lifecycle the platform owns - the capability gate, the cold-boot cache rebuild and its ORDERING against discovery, the
- * per-controller transport, the late-bound command surface, and the orphan sweep.
+ * platform.matter.test.ts: The Matter lifecycle as the platform drives it - the capability gate, the cold-boot cache rebuild and its ORDERING against discovery,
+ * the late-bound command surface, the controller sweep, and the retirements a poll performs - run through the real platform, discovery, and polling loop.
  *
  * The ordering pin in this file is the important one. Everything else here is bookkeeping; the reason the boot rebuild exists at all is that a Matter bridge
  * advertises whatever endpoints it holds at the moment it comes up, so a plugin that registers after its first network call comes up empty and every restart
@@ -11,7 +11,7 @@
 
 import { buildPlatform, installMockDispatcher, loggedAt, programJsonReply, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
+import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import type { HydrawiseMatterAccessoryContext } from "./types.ts";
 import type { MatterAccessory } from "homebridge";
 import assert from "node:assert/strict";
@@ -153,21 +153,46 @@ describe("HydrawisePlatform Matter cold boot", () => {
     assert.ok(dispatcher.agent, "discovery is left unanswered, which is what keeps the controller absent");
   });
 
-  test("a cache entry whose device type no longer matches the option is declined while its matching sibling is restored", async (t) => {
+  test("a cache entry whose device type no longer matches the option is unregistered at boot, and the first poll registers it in the new shape", async (t) => {
 
     /* Two cached endpoints for the same controller, differing only in the device type the cache remembers. The options ask for an outlet, so one matches and one
-     * does not - which is what the boot after flipping Matter.Valve off looks like. Both are in the same run deliberately: the restored sibling is what makes the
-     * declined one's absence meaningful rather than a rebuild that simply never happened.
+     * does not - which is what the boot after flipping Matter.Valve off looks like. The restored sibling is what makes the declined one's handling meaningful.
      */
-    const { emit, matterRegistered, updated } = buildPlatform({ matter: true,
+    const { emit, matterRegistered, matterUnregistered, matterUpdates, updated } = buildPlatform({ matter: true,
       matterCached: [ cachedZone({ deviceType: "WaterValve", relayId: 700001 }), cachedZone({ deviceType: "OnOffPlugInUnit", relayId: 700002 }) ],
       options: MATTER_ON });
 
     t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
 
-    // Discovery is left unanswered so the only thing that has run when these assertions fire is the boot rebuild. Letting discovery complete would let each
-    // controller's first poll register its whole zone roster, which is correct behavior - the declined zone IS rebuilt a moment later - but it would drown the
-    // one distinction this test exists to draw.
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (updated.length >= 1) ? true : undefined);
+    await waitFor(() => matterRegistered.some(accessory => accessory.UUID === zoneUuid(700001)) ? true : undefined);
+
+    assert.deepEqual(matterUnregistered.map(accessory => accessory.UUID), [zoneUuid(700001)], "the endpoint whose clusters are changing was retired at boot");
+    assert.equal(matterRegistered[0]?.UUID, zoneUuid(700002), "while its matching sibling was restored, ahead of discovery");
+
+    const reregistered = matterRegistered.find(accessory => accessory.UUID === zoneUuid(700001));
+
+    assert.equal((reregistered?.deviceType as { name?: string } | undefined)?.name, "OnOffPlugInUnit", "the first poll registered the zone again, as an outlet");
+
+    // Every update went to an endpoint registered in this session. The unit suite pins the ordering; this pins that the retired entry was never treated as live.
+    const live = new Set(matterRegistered.map(accessory => accessory.UUID));
+
+    assert.ok(matterUpdates.every(update => live.has(update.uuid)), "nothing was published to an endpoint that was not registered");
+  });
+
+  test("a cache entry for a zone excluded from Matter is unregistered at boot rather than left frozen", async (t) => {
+
+    const { emit, matterRegistered, matterUnregistered } = buildPlatform({ matter: true, matterCached: [ cachedZone({ relayId: 700001 }),
+      cachedZone({ relayId: 700002 }) ], options: [ ...MATTER_ON, "Disable.Matter.700002" ] });
+
+    t.after(() => emit(SHUTDOWN));
+
+    // Discovery is left unanswered: this is decided from the options alone, before any network call.
     await using dispatcher = installMockDispatcher();
 
     assert.ok(dispatcher.agent, "the dispatcher is installed but silent");
@@ -175,13 +200,31 @@ describe("HydrawisePlatform Matter cold boot", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitFor(() => (matterRegistered.length >= 1) ? true : undefined);
 
-    assert.deepEqual(matterRegistered.map(accessory => accessory.UUID), [zoneUuid(700002)],
-      "the endpoint whose clusters are changing is left for its controller to rebuild, while the one that still matches is restored");
-    assert.equal(updated.length, 0, "and discovery has not run, so this is the boot rebuild's decision alone");
+    assert.deepEqual(matterUnregistered.map(accessory => accessory.UUID), [zoneUuid(700002)], "the excluded zone is retired");
+    assert.deepEqual(matterRegistered.map(accessory => accessory.UUID), [zoneUuid(700001)], "and only its sibling is restored");
+  });
+
+  test("a cache entry for a zone Hydrawise no longer reports is retired once its absence is sustained", async (t) => {
+
+    // Relay 799999 is not in the schedule fixture: the zone was deleted in Hydrawise while the plugin was stopped.
+    const { emit, matterRegistered, matterUnregistered } = buildPlatform({ matter: true, matterCached: [cachedZone({ relayId: 799999 })], options: MATTER_ON });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", fastPolling(normalSchedule()));
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitFor(() => (matterUnregistered.length >= 1) ? true : undefined);
+
+    // Nothing at boot can tell a deleted zone from a live one, so it is restored like any other and retired by the polls that stop naming it.
+    assert.equal(matterRegistered[0]?.UUID, zoneUuid(799999), "the endpoint was restored at boot");
+    assert.deepEqual(matterUnregistered.map(accessory => accessory.UUID), [zoneUuid(799999)], "and retired once the polls had sustained its absence");
   });
 });
 
-describe("HydrawisePlatform Matter orphan sweep", () => {
+describe("HydrawisePlatform Matter controller sweep", () => {
 
   test("a cached endpoint no live controller claims is unregistered once discovery has run", async (t) => {
 
@@ -219,22 +262,22 @@ describe("HydrawisePlatform Matter orphan sweep", () => {
     assert.equal(matterUnregistered.length, 0, "an endpoint a live, enabled controller adopted is left alone");
   });
 
-  test("turning the Matter option off retires that controller's endpoints", async (t) => {
+  test("turning the Matter option off retires that controller's endpoints at boot", async (t) => {
 
-    const { emit, matterUnregistered, updated } = buildPlatform({ matter: true, matterCached: [cachedZone({ relayId: 700001 })] });
+    const { emit, matterRegistered, matterUnregistered, updated } = buildPlatform({ matter: true, matterCached: [cachedZone({ relayId: 700001 })] });
 
     t.after(() => emit(SHUTDOWN));
+
+    // Discovery is left unanswered: the options alone say this controller is not exposed, so nothing waits for the network.
     await using dispatcher = installMockDispatcher();
 
-    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
-    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+    assert.ok(dispatcher.agent, "the dispatcher is installed but silent");
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (updated.length >= 1) ? true : undefined);
     await waitFor(() => (matterUnregistered.length >= 1) ? true : undefined);
 
-    // No controller builds a transport with the option off, so nothing claims the entry and the sweep finds it - which is how turning the feature off actually
-    // removes the devices rather than merely stopping their updates.
     assert.equal(firstOf(matterUnregistered).UUID, zoneUuid(700001), "the endpoint is removed rather than left behind un-updated");
+    assert.equal(matterRegistered.length, 0, "and it was never registered on the way");
+    assert.equal(updated.length, 0, "before discovery had answered at all");
   });
 });

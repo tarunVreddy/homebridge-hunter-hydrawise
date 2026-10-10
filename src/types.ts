@@ -910,23 +910,35 @@ export type HydrawiseAccessory = PlatformAccessory<HydrawiseAccessoryContext>;
 // where the field writes live - seeding one roster field at a time is legal on the arm's mutable interface and nowhere else.
 export type HydrawiseControllerAccessory = PlatformAccessory<HydrawiseControllerAccessoryContext>;
 
+/* The device types a zone's Matter endpoint can be built on, named by the keys Homebridge publishes them under in api.matter.deviceTypes. OnOffOutlet is Matter's
+ * OnOffPlugInUnit, which every ecosystem in wide use handles; WaterValve is the semantically correct irrigation type that, as of this writing, none of Alexa,
+ * Google Home, or Apple Home accepts. The Matter.Valve feature option chooses between them.
+ */
+export type HydrawiseMatterDeviceType = "OnOffOutlet" | "WaterValve";
+
 /* The persisted context of one Matter zone accessory. It is deliberately separate from the HAP context union above and carries IDENTITY ALONE - the owning
- * controller, the zone's relay, and the serial the two were derived from - because it answers exactly one question: which zone does this cached endpoint stand
- * for. That is what a cold boot needs in order to rebuild an accessory from cache before any Hydrawise call has been made.
+ * controller, the zone's relay, the serial the two were derived from, and the device type the endpoint was registered as - because it answers exactly one
+ * question: which zone does this cached endpoint stand for, and in what shape. That is what a cold boot needs in order to rebuild an accessory from cache before
+ * any Hydrawise call has been made.
  *
  * Nothing projected is stored here. Matter cluster state is Homebridge's to persist and ours to republish from the next poll, so keeping state out of this shape
  * is what makes a cache entry safe to rebuild from unconditionally rather than something a reader has to judge the freshness of.
+ *
+ * The device type is recorded by the key we SELECT it by, so the cold boot compares one of our own keys against another. It is optional only because entries
+ * written before it was recorded lack it; those are matched by matter.js type name instead, and every endpoint registered from then on carries it.
  */
 export interface HydrawiseMatterAccessoryContext {
 
   controllerId: number;
+  deviceType?: HydrawiseMatterDeviceType;
   relayId: number;
   serialNumber: string;
 }
 
 /* Whether a cached Matter accessory's context is one this plugin wrote and can still read. Homebridge round-trips the context through JSON on disk, so a
- * hand-edited, truncated, or version-skewed entry can carry any shape at all; a cache entry that fails this is dropped rather than rebuilt, and the zone it stood
- * for is registered fresh from discovery instead. Every field is checked, because a half-formed identity is not a weaker identity - it is the wrong endpoint.
+ * hand-edited, truncated, or version-skewed entry can carry any shape at all; a cache entry that fails this is retired rather than rebuilt, and the zone it stood
+ * for is registered fresh by its controller's next poll instead. Every field is checked, because a half-formed identity is not a weaker identity - it is the wrong
+ * endpoint.
  */
 export function isMatterAccessoryContext(context: unknown): context is HydrawiseMatterAccessoryContext {
 
@@ -935,8 +947,8 @@ export function isMatterAccessoryContext(context: unknown): context is Hydrawise
     return false;
   }
 
-  const candidate = context as Partial<HydrawiseMatterAccessoryContext>;
+  const candidate = context as Partial<Record<keyof HydrawiseMatterAccessoryContext, unknown>>;
 
   return Number.isInteger(candidate.controllerId) && Number.isInteger(candidate.relayId) && (typeof candidate.serialNumber === "string") &&
-    (candidate.serialNumber.length > 0);
+    (candidate.serialNumber.length > 0) && [ undefined, "OnOffOutlet", "WaterValve" ].includes(candidate.deviceType as string | undefined);
 }

@@ -18,12 +18,12 @@ import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-u
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
+import type { HydrawiseMatter, HydrawiseMatterZone } from "../matter.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "../controller.ts";
-import type { HydrawiseMatterZone } from "../matter.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
 import type { MatterAccessory } from "homebridge";
@@ -247,7 +247,7 @@ export interface TestPlatform {
 
   // The Matter transport's publish surface, typed by indexed access against the real method so a signature drift is a compile error here rather than a controller
   // test silently exercising a shape production no longer speaks.
-  publishMatter: HydrawisePlatform["publishMatter"];
+  matter: Pick<HydrawiseMatter, "publish">;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
   setZoneSuspension: HydrawisePlatform["setZoneSuspension"];
@@ -347,9 +347,9 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const suspensions: RecordedSuspensionCall[] = [];
   const matterPublishes: RecordedMatterPublish[] = [];
 
-  // A pure recorder rather than a double of anything: production's publishMatter forwards to a transport that may not exist, so the honest stand-in records the
+  // A pure recorder rather than a double of anything: production's transport decides what, if anything, a projection becomes, so the honest stand-in records the
   // projection and does nothing else. What a controller test cares about is what the controller SAID, not what a Matter server did with it.
-  const publishMatter: HydrawisePlatform["publishMatter"] = async (controllerId, zones) => void matterPublishes.push({ controllerId, zones });
+  const matter: Pick<HydrawiseMatter, "publish"> = { publish: async (controller, zones) => void matterPublishes.push({ controllerId: controller.controller_id, zones }) };
 
   /* A recording stand-in for the platform's per-zone suspension surface. It is a DOUBLE rather than a thin executor because what it stands in for is the network:
    * the real method reaches the account-credentialed client, which no controller test may ever touch. The programmed answer is what drives the controller's own
@@ -429,8 +429,8 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     hap: testHap,
     hasV2Client: options.hasV2Client ?? false,
     log: logger,
+    matter,
     mqtt,
-    publishMatter,
     reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
     setZoneSuspension,

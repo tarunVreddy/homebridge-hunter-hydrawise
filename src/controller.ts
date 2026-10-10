@@ -1494,7 +1494,7 @@ export class HydrawiseController {
 
     // Publish the same settled reading to Matter, on identical terms to MQTT above: a second transport fed from the projection this walk has just finished, at the
     // one point in the poll where every zone's state is known and nothing further will change it.
-    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.publishMatter(this.controller.controller_id, this.matterZones(effectiveNames)); },
+    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.matter.publish(this.controller, this.matterZones(effectiveNames)); },
       label: "Matter publish (controller)", log: this.log });
   }
 
@@ -1505,14 +1505,14 @@ export class HydrawiseController {
    * up with it - the effective name a zone is displayed under, and the schedule classifier's reading of when a run ends. A transport that re-derived any of that
    * would be a second opinion about a question this class has already answered, and the two would drift.
    *
-   * Zones opted out of Matter individually are filtered here, which is what makes the option a real per-zone gate rather than a controller-wide one: an endpoint
-   * for an excluded zone is never registered, and one that already exists stops being updated and is left to the sweep.
+   * Every enabled zone is projected. Whether a zone is exposed over Matter at all is the transport's question, because it has to answer the same question at boot,
+   * from the feature options alone, before any controller exists.
    *
    * @param effectiveNames - The display names this walk already resolved, so a zone reads the same in the Home app and in every Matter ecosystem.
    */
   private matterZones(effectiveNames: Map<number, string>): HydrawiseMatterZone[] {
 
-    return this.enabledZones.filter(zone => this.hasZoneFeature("Matter", zone.relay_id.toString())).map(zone => {
+    return this.enabledZones.map(zone => {
 
       const state = zoneScheduleStatus(zone, this.status);
 
